@@ -35,7 +35,10 @@ class TagAdapterTests(unittest.TestCase):
         self.bin.mkdir()
         self.core = self.home / ".local/bin/claude-switch.sh"
         self.core.parent.mkdir(parents=True)
-        self.core.write_bytes(SOURCE.read_bytes())
+        source = SOURCE.read_text(encoding="utf-8")
+        source, count = re.subn(r'(?m)^PROXY_MODE="clash-verge"', 'PROXY_MODE="tag"', source, count=1)
+        self.assertEqual(count, 1)
+        self.core.write_text(source, encoding="utf-8")
         self.core.chmod(0o700)
         self.env = dict(os.environ, HOME=str(self.home),
                         PATH=str(self.bin) + ":/usr/bin:/bin:/usr/sbin:/sbin",
@@ -108,15 +111,18 @@ class TagAdapterTests(unittest.TestCase):
         old = self.core.read_bytes()
         backup = self.core.with_suffix(".sh.bak")
         backup.write_text("existing file")
-        for args in (("update",), ("update", "--auto")):
-            with self.subTest(args=args):
-                run = self.run_core(*args)
-                self.assertNotEqual(run.returncode, 0)
-                self.assertIn("不能直接安装原版更新", run.stdout)
-                self.assertNotIn("unbound variable", run.stdout + run.stderr)
-                self.assertEqual(self.core.read_bytes(), old)
-                self.assertEqual(backup.read_text(), "existing file")
-                self.assertFalse((self.home / "curl-called").exists())
+        for mode in ("tag", "clash-verge"):
+            self.core.write_bytes(old.replace(b'PROXY_MODE="tag"', ('PROXY_MODE="' + mode + '"').encode(), 1))
+            before = self.core.read_bytes()
+            for args in (("update",), ("update", "--auto"), ("update", "--unknown")):
+                with self.subTest(mode=mode, args=args):
+                    run = self.run_core(*args)
+                    self.assertNotEqual(run.returncode, 0)
+                    self.assertIn("不能直接安装原版更新", run.stdout)
+                    self.assertNotIn("unbound variable", run.stdout + run.stderr)
+                    self.assertEqual(self.core.read_bytes(), before)
+                    self.assertEqual(backup.read_text(), "existing file")
+                    self.assertFalse((self.home / "curl-called").exists())
 
     def prepare_remote(self, content, manifest="valid"):
         archive = self.root / "remote.zip"
@@ -158,11 +164,13 @@ esac''')
         ):
             with self.subTest(manifest=manifest, success=success):
                 self.prepare_remote(content, manifest)
-                run = self.run_core("update-check")
-                self.assertEqual(run.returncode == 0, success, run.stdout + run.stderr)
-                self.assertIn(expected, run.stdout)
-                self.assertEqual(self.core.read_bytes(), before)
-                self.assertFalse(self.core.with_suffix(".sh.bak").exists())
+                for args in (("update-check",), ("update", "--check")):
+                    with self.subTest(args=args):
+                        run = self.run_core(*args)
+                        self.assertEqual(run.returncode == 0, success, run.stdout + run.stderr)
+                        self.assertIn(expected, run.stdout)
+                        self.assertEqual(self.core.read_bytes(), before)
+                        self.assertFalse(self.core.with_suffix(".sh.bak").exists())
 
     def test_guard_accepts_tag_and_fails_closed_for_missing_or_spoofed_process(self):
         marker = self.home / "kill-called"

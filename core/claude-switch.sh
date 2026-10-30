@@ -895,11 +895,11 @@ PY_CLASH_RULES
 fi
 
 # ============ 安装时可配置项(安装程序会自动改写) ============
-PROXY_MODE="tag"               # 代理客户端: tag|clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto
-PROXY_GROUP=""                 # Clash 代理组名(安装时自动探测)
-COUNTRY_TARGET="JP"            # 目标出口国家(安装时按出口自动识别)
-TZ_TARGET="Asia/Tokyo"         # 锁定时区,应与出口IP所在城市一致
-LOCALE_TARGET="ja_JP"          # 锁定地区格式
+PROXY_MODE="clash-verge"       # 代理客户端: tag|clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto
+PROXY_GROUP="IpEqual"          # Clash 代理组名(安装时自动探测)
+COUNTRY_TARGET="US"            # 目标出口国家(安装时按出口自动识别)
+TZ_TARGET="America/New_York"   # 锁定时区,应与出口IP所在城市一致
+LOCALE_TARGET="en_US"          # 锁定地区格式
 # ============================================================
 
 # 此适配版所基于的上游核心 SHA-256；更新检查不能把本地适配误判为上游更新。
@@ -1781,11 +1781,7 @@ ASEOF
 }
 
 # 本机 TAG 适配版只检查上游核心；原版覆盖会丢失适配，不能直接安装。
-self_update() {
-    case "${1:-}" in
-        --check) ;;
-        *) echo "FAIL:本机 TAG 适配版不能直接安装原版更新；请先适配并验证新版"; return 1 ;;
-    esac
+tag_update_check() {
     local tmpd NEW bad sum rel saw_core remote_hash
     tmpd=$(mktemp -d) || { echo "FAIL:无法创建临时目录"; return 1; }
     if ! curl -sL --max-time 30 "https://codeload.github.com/YOURSJEYO/claude-switcher/zip/refs/heads/main" -o "$tmpd/main.zip" \
@@ -1820,6 +1816,116 @@ self_update() {
         echo "INFO:上游核心有变化；需重新适配 TAG 并验证后才能安装"
     fi
     rm -rf "$tmpd"
+    return 0
+}
+
+# 自动更新:拉取 main 分支最新代码,SHA256 校验+配置注入+自检+失败回滚
+# --check 只检查不写入;--auto 供 LaunchAgent 每12小时调用(静默写 update.log)
+self_update() {
+    # 适配分支禁止原版覆盖；保留上游实现以便后续合并。
+    case "${1:-}" in
+        --check) tag_update_check; return $? ;;
+        *) echo "FAIL:本机 TAG 适配版不能直接安装原版更新；请先适配并验证新版"; return 1 ;;
+    esac
+    auto=0; check=0
+    case "${1:-}" in
+        --auto) auto=1 ;;
+        --check) check=1 ;;
+    esac
+    # 路径全部从脚本自身位置推导,兼容旧版 LaunchDaemon(root) 混跑时 $HOME 不可靠的场景
+    BIN=$(cd "$(dirname "$0")" && pwd)
+    UHOME="${BIN%/.local/bin}"
+    [ "$UHOME" = "$BIN" ] && UHOME="$HOME"
+    if [ "$auto" -eq 1 ]; then
+        mkdir -p "$BASE"
+        exec >>"$BASE/update.log" 2>&1
+        echo "# $(date '+%F %T') update --auto 开始"
+    fi
+
+    tmpd=$(mktemp -d)
+    if ! curl -sL --max-time 30 "https://codeload.github.com/YOURSJEYO/claude-switcher/zip/refs/heads/main" -o "$tmpd/main.zip" \
+        || ! unzip -q "$tmpd/main.zip" -d "$tmpd" 2>/dev/null; then
+        echo "FAIL:下载或解压失败(网络问题,稍后再试)"; rm -rf "$tmpd"; return 1
+    fi
+    NEW="$tmpd/claude-switcher-main"
+    if [ ! -f "$NEW/core/claude-switch.sh" ]; then
+        echo "FAIL:远程包结构异常,已中止"; rm -rf "$tmpd"; return 1
+    fi
+
+    # 工件完整性校验:逐项比对仓库 SHA256SUMS,任一不符即中止(防传输篡改;信任根为 GitHub 仓库本身)
+    if ! curl -sL --max-time 15 "https://raw.githubusercontent.com/YOURSJEYO/claude-switcher/main/SHA256SUMS" -o "$tmpd/SHA256SUMS" \
+        || [ ! -s "$tmpd/SHA256SUMS" ]; then
+        echo "FAIL:无法获取校验清单(SHA256SUMS),已中止"; rm -rf "$tmpd"; return 1
+    fi
+    bad=0
+    while read -r sum rel; do
+        [ -z "$sum" ] && continue
+        if [ ! -f "$NEW/$rel" ] || [ "$(shasum -a 256 "$NEW/$rel" | awk '{print $1}')" != "$sum" ]; then
+            bad=1; break
+        fi
+    done < "$tmpd/SHA256SUMS"
+    if [ "$bad" -eq 1 ]; then
+        echo "FAIL:工件校验失败,已中止(不排除网络篡改,可稍后重试或手动 update)"; rm -rf "$tmpd"; return 1
+    fi
+
+    # 跳过判断:剔除头部5个配置行后与本地已安装版本比对,无差异即已是最新
+    strip_cfg() { grep -vE '^(PROXY_MODE|PROXY_GROUP|COUNTRY_TARGET|TZ_TARGET|LOCALE_TARGET)="' "$1"; }
+    if [ -f "$BIN/claude-switch.sh" ] && \
+       diff <(strip_cfg "$BIN/claude-switch.sh") <(strip_cfg "$NEW/core/claude-switch.sh") >/dev/null 2>&1; then
+        echo "OK:已是最新版本"; rm -rf "$tmpd"; return 0
+    fi
+
+    # 只读检查:不备份、不写文件、不物化守护脚本、不触发自检/回滚
+    if [ "$check" -eq 1 ]; then
+        stamp=$(stat -f '%Sm' -t '%Y-%m-%d' "$NEW/core/claude-switch.sh" 2>/dev/null)
+        [ -z "$stamp" ] && stamp=$(date '+%F')
+        echo "INFO:发现新版本 $stamp"
+        rm -rf "$tmpd"; return 0
+    fi
+
+    # 备份现有核心脚本
+    [ -f "$BIN/claude-switch.sh" ] && cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"
+
+    # 替换核心脚本 + 从 .bak 读出5个配置值注入新脚本
+    cp "$NEW/core/claude-switch.sh" "$BIN/claude-switch.sh"
+    PM=""; PG=""; CT=""; TZV=""; LCT=""
+    if [ -f "$BIN/claude-switch.sh.bak" ]; then
+        get_cfg() { grep "^$1=\"" "$BIN/claude-switch.sh.bak" | head -1 | cut -d'"' -f2; }
+        PM=$(get_cfg PROXY_MODE); PG=$(get_cfg PROXY_GROUP); CT=$(get_cfg COUNTRY_TARGET)
+        TZV=$(get_cfg TZ_TARGET); LCT=$(get_cfg LOCALE_TARGET)
+        inject_cfg() { grep -q "^$1=\"" "$BIN/claude-switch.sh.bak" && sed -i '' "s|^$1=\".*\"|$1=\"$2\"|" "$BIN/claude-switch.sh"; }
+        inject_cfg PROXY_MODE "$PM"; inject_cfg PROXY_GROUP "$PG"; inject_cfg COUNTRY_TARGET "$CT"
+        inject_cfg TZ_TARGET "$TZV"; inject_cfg LOCALE_TARGET "$LCT"
+    fi
+    chmod +x "$BIN/claude-switch.sh"
+
+    # 守护进程脚本(root 所有,用户态不可写):与远程模板比对,有差异只提示不自动改
+    APPDIR="/Library/Application Support/claude-switcher"
+    if [ -f "$APPDIR/claude-bodyguard.sh" ] || [ -f "$APPDIR/tz-watchdog.sh" ]; then
+        [ -z "$PM" ] && PM="clash-verge"
+        [ -z "$TZV" ] && TZV="America/New_York"
+        sed -e "s|__HOME__|$UHOME|g" -e "s|__PROXY_MODE__|$PM|g" "$NEW/daemons/claude-bodyguard.sh" > "$tmpd/bg.new"
+        sed -e "s|__HOME__|$UHOME|g" -e "s|__TZ_TARGET__|$TZV|g" "$NEW/daemons/tz-watchdog.sh" > "$tmpd/tz.new"
+        if ! diff -q "$tmpd/bg.new" "$APPDIR/claude-bodyguard.sh" >/dev/null 2>&1 || \
+           ! diff -q "$tmpd/tz.new" "$APPDIR/tz-watchdog.sh" >/dev/null 2>&1; then
+            echo "INFO:守护进程脚本有更新,请运行 installer/安装.command 刷新(需要密码)"
+        fi
+    fi
+    rm -rf "$tmpd"
+
+    # 更新后自检:root(旧版 LaunchDaemon)下切回真实用户执行,避免 defaults 读到 root 的配置
+    if [ "$(id -u)" -eq 0 ]; then
+        owner=$(stat -f '%Su' "$UHOME" 2>/dev/null)
+        if [ -n "$owner" ]; then out=$(sudo -H -u "$owner" "$BIN/claude-switch.sh" checkdetail 2>&1); else out=""; fi
+    else
+        out=$("$BIN/claude-switch.sh" checkdetail 2>&1)
+    fi
+    if [ -z "$out" ] || echo "$out" | grep -q '=fail'; then
+        [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
+        echo "FAIL:新版自检未通过,已自动回滚"
+        return 1
+    fi
+    echo "OK:更新完成 $(date '+%Y-%m-%d')"
     return 0
 }
 

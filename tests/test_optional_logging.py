@@ -28,14 +28,7 @@ class OptionalLoggingTests(unittest.TestCase):
         self.settings = self.base / "checks.json"
         self.core = Path(self.tmp.name) / "claude-switch.sh"
         text = SOURCE.read_text(encoding="utf-8")
-        for current, fixture in (
-            ('PROXY_MODE="tag"', 'PROXY_MODE="sing-box"'),
-            ('COUNTRY_TARGET="JP"', 'COUNTRY_TARGET="US"'),
-            ('TZ_TARGET="Asia/Tokyo"', 'TZ_TARGET="America/New_York"'),
-            ('LOCALE_TARGET="ja_JP"', 'LOCALE_TARGET="en_US"'),
-        ):
-            assert current in text
-            text = text.replace(current, fixture, 1)
+        text = text.replace('PROXY_MODE="clash-verge"', 'PROXY_MODE="sing-box"', 1)
         self.core.write_text(text, encoding="utf-8")
         self.core.chmod(0o755)
         self.bin = Path(self.tmp.name) / "bin"
