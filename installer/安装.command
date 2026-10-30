@@ -310,11 +310,63 @@ cp "$REPO/daemons/local.claude-bodyguard.plist" "$REPO/daemons/local.tz-watchdog
 sed "s|__HOME__|$H|g" "$REPO/daemons/local.claude-update.plist" > "$H/.local/bin/local.claude-update.plist"
 echo "✓ 核心文件已安装"
 
-# ---- 4. 现场编译 App 到桌面 ----
-APP="$H/Desktop/Claude切换器.app"
-mkdir -p "$H/Desktop"
-pkill -x ClaudeSwitcher 2>/dev/null
-rm -rf "$APP"
+# 安装已编译的 App；原 App 暂存于同目录，替换失败时恢复。
+install_app_bundle() {
+    local source="$1" target="$2" parent="${2%/*}" stage old=0 bundle_id attempt
+    local -a privileged=()
+    if [ -L "$target" ]; then
+        echo "✗ 应用目标是符号链接，拒绝覆盖: $target"; return 1
+    fi
+    if [ -e "$target" ]; then
+        bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$target/Contents/Info.plist" 2>/dev/null)
+        [ "$bundle_id" = "local.claude-switcher" ] || { echo "✗ 目标不是 Claude 切换器，拒绝覆盖: $target"; return 1; }
+    fi
+    if [ ! -w "$parent" ] || { [ -e "$target" ] && [ ! -w "$target" ]; }; then
+        echo "需要管理员权限才能安装到应用程序文件夹。"
+        sudo -v || { echo "✗ 管理员认证失败，未替换 App"; return 1; }
+        privileged=(sudo)
+    fi
+    stage=$("${privileged[@]}" mktemp -d "$parent/.claude-switcher.XXXXXXXX") || return 1
+    if ! "${privileged[@]}" ditto "$source" "$stage/new.app" || ! "${privileged[@]}" codesign --verify --deep --strict "$stage/new.app"; then
+        "${privileged[@]}" rm -rf "$stage"
+        echo "✗ App 复制或签名验证失败，未替换原 App"; return 1
+    fi
+    pkill -x ClaudeSwitcher 2>/dev/null || true
+    for attempt in 1 2 3 4 5; do
+        pgrep -x ClaudeSwitcher >/dev/null 2>&1 || break
+        sleep 1
+    done
+    if pgrep -x ClaudeSwitcher >/dev/null 2>&1; then
+        "${privileged[@]}" rm -rf "$stage"
+        echo "✗ 切换器仍在运行，请退出后重试；未替换 App"; return 1
+    fi
+    if [ -e "$target" ]; then
+        if ! "${privileged[@]}" mv "$target" "$stage/previous.app"; then
+            "${privileged[@]}" rm -rf "$stage"
+            echo "✗ 无法暂存原 App，未替换"; return 1
+        fi
+        old=1
+    fi
+    if ! "${privileged[@]}" mv "$stage/new.app" "$target"; then
+        if [ "$old" -eq 1 ] && ! "${privileged[@]}" mv "$stage/previous.app" "$target"; then
+            echo "✗ App 替换失败且无法恢复，原 App 保留在 $stage/previous.app"; return 1
+        fi
+        "${privileged[@]}" rm -rf "$stage"
+        if [ "$old" -eq 1 ]; then
+            echo "✗ App 替换失败，原 App 已恢复"
+        else
+            echo "✗ App 安装失败"
+        fi
+        return 1
+    fi
+    "${privileged[@]}" rm -rf "$stage" || echo "⚠️ 临时目录未能清理: $stage"
+    return 0
+}
+
+# ---- 4. 先在临时目录编译 App，再安装到应用程序文件夹 ----
+APP_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/claude-switcher-app.XXXXXXXX") || { echo "✗ 无法创建 App 构建目录"; exit 1; }
+APP="$APP_STAGE/Claude切换器.app"
+APP_TARGET="/Applications/Claude切换器.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # 必须带 -target,否则新 SDK 编出的二进制在老系统被拒启动
 if swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" \
@@ -324,6 +376,7 @@ if swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" \
 else
     echo "✗ App 编译失败。若日志提示 SwiftUIMacros/插件缺失(macOS 26/27 常见),"
     echo "  请安装完整 Xcode 后执行: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+    rm -rf "$APP_STAGE"
     read -n 1 -s -r -p "按任意键退出..."; exit 1
 fi
 # 图标: assets/ 里有 PNG 源文件时现场生成 icns
@@ -357,8 +410,17 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </dict>
 </plist>
 EOF
-codesign --force --deep -s - "$APP" >/dev/null 2>&1 || true
-echo "✓ App 已放到桌面"
+if ! codesign --force --deep -s - "$APP" >/dev/null 2>&1 || ! codesign --verify --deep --strict "$APP"; then
+    rm -rf "$APP_STAGE"
+    echo "✗ App 签名或校验失败，未替换原 App"; exit 1
+fi
+if ! install_app_bundle "$APP" "$APP_TARGET"; then
+    rm -rf "$APP_STAGE"
+    echo "✗ App 安装失败，未完成安装"; exit 1
+fi
+rm -rf "$APP_STAGE"
+echo "✓ App 已安装到应用程序文件夹"
+[ -e "$H/Desktop/Claude切换器.app" ] && echo "ℹ️ 桌面旧版 App 仍保留，可在确认后自行移除。"
 
 # ---- 5. 生成全局扩展脚本(仅 Clash Verge;保留已有 main 与无关配置) ----
 if [ "$MODE" = "clash-verge" ]; then
@@ -430,7 +492,7 @@ echo "=================================="
 echo ""
 echo "=================================="
 echo "  ✅ 安装完成!"
-echo "  使用: 双击桌面「Claude切换器」"
+echo "  使用: 打开应用程序文件夹中的「Claude切换器」"
 echo "  首次使用: 打开后选账号A(自动收编当前登录)"
 echo "  换了其他国家节点后: 运行 claude-switch.sh set-region 一键重新适配"
 echo "  自动更新已启用(每12小时检查一次),也可手动: claude-switch.sh update"

@@ -109,7 +109,7 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 
 到 [Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest) 下载最新版本，按用途选择：
 
-- `ClaudeSwitcher-<版本>-installer-kit.zip`：**首次安装推荐**。解压后双击 `installer/安装.command`，安装核心脚本、守护进程与桌面 App。
+- `ClaudeSwitcher-<版本>-installer-kit.zip`：**首次安装推荐**。解压后双击 `installer/安装.command`，安装核心脚本、守护进程，并将 App 放入「应用程序」文件夹。
 - `ClaudeSwitcher-<版本>-macos-arm64-app-only.dmg` / `.zip`：**仅包含界面 App**（不含核心脚本）；已安装核心脚本时可用于替换旧版界面。首次安装请用上面的 installer-kit。
 - `ClaudeSwitcher-<版本>-windows.zip` / `ClaudeSwitcher-<版本>-linux.tar.gz`：Windows / Linux 脚本包（Beta），说明见各自目录的 README。
 
@@ -140,7 +140,7 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 
 ## 使用
 
-1. 双击桌面「Claude切换器」→ 等待 14 项检查
+1. 打开「应用程序」文件夹中的「Claude切换器」→ 等待 14 项检查
 2. 硬性安全项全部通过 → 选账号启动；有红项 → 「一键修复」自动处理。灰色跳过项仅代表用户明确关闭了对应非关键检查
 3. B/C/D 账号首次使用登录一次，以后 A–D 随切随用、互不干扰
 4. 换了其他国家的节点 → 跑一次 `~/.local/bin/claude-switch.sh set-region`，国家/时区/地区格式一键重新锁定

@@ -486,7 +486,7 @@ final class VM: ObservableObject {
         2. 安装或排障时先跑环境审计：硬性安全项必须通过；只有显式配置的非关键项可跳过或降为警告，skip 不表示检查通过。
         3. 账号切换前先完全退出 Claude；账号快照按 AGENTS.md 的规则保留，不要改动 ~/.claude-switcher/accounts/ 的结构。
         4. 保镖等常驻脚本只放在 root 所有的系统目录，不要改回用户可写路径；需要变更时引导我重跑安装器。
-        5. 不要未经我明确同意更新、覆盖或重装已安装版本（~/.local/bin、桌面 App、launchd 与系统目录），也不要执行 update 或安装器；先说明影响并征得同意。
+        5. 不要未经我明确同意更新、覆盖或重装已安装版本（~/.local/bin、应用程序及旧版桌面 App、launchd 与系统目录），也不要执行 update 或安装器；先说明影响并征得同意。
         6. 检查新版本只运行 `~/.local/bin/claude-switch.sh update-check`，看到结果后先问我是否执行更新。
         7. 不要在日志、文档或回复里暴露我的出口 IP、代理地址或任何凭据。
         """
