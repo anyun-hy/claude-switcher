@@ -135,9 +135,18 @@ class FlClashRepairTests(unittest.TestCase):
         home_dir = self.home.parents[2]
         core = home_dir / ".local/bin/claude-switch.sh"
         core.parent.mkdir(parents=True)
-        core.write_text(SCRIPT.read_text(encoding="utf-8").replace(
-            'PROXY_MODE="clash-verge"', 'PROXY_MODE="flclash"', 1
-        ), encoding="utf-8")
+        text = SCRIPT.read_text(encoding="utf-8")
+        for current, fixture in (
+            ('PROXY_MODE="tag"', 'PROXY_MODE="flclash"'),
+            ('PROXY_GROUP=""', 'PROXY_GROUP="IpEqual"'),
+            ('COUNTRY_TARGET="JP"', 'COUNTRY_TARGET="US"'),
+            ('TZ_TARGET="Asia/Tokyo"', 'TZ_TARGET="America/New_York"'),
+            ('LOCALE_TARGET="ja_JP"', 'LOCALE_TARGET="en_US"'),
+        ):
+            assert current in text
+            text = text.replace(current, fixture, 1)
+        core.write_text(text, encoding="utf-8")
+        core.chmod(0o700)
         (home_dir / ".claude-switcher").mkdir()
         fake_bin = home_dir / "bin"
         fake_bin.mkdir()

@@ -6,11 +6,24 @@ MODE="__PROXY_MODE__"
 
 ok=1
 
+# TAG 内核可能由特权服务启动；核验 PID 的实际可执行文件，防止命令行冒名。
+tag_alive() {
+    local pid executable
+    while IFS= read -r pid; do
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
+        executable=$(ps -p "$pid" -o comm= 2>/dev/null | sed 's/^[[:space:]]*//')
+        [ "$executable" = "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin" ] && return 0
+    done < <(pgrep -f '/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin' 2>/dev/null)
+    return 1
+}
+
 # TUN 在线判定:存在 fake-ip 网段地址即视为 TUN 已接管
 ifconfig 2>/dev/null | grep -q 'inet 198\.18\.' || ok=0
 
 # 内核在线判定:按安装时识别的客户端分派
 case "$MODE" in
+    tag)
+        tag_alive || ok=0 ;;
     clash-verge)
         pgrep -f verge-mihomo >/dev/null 2>&1 || ok=0 ;;
     flclash)

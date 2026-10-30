@@ -94,6 +94,7 @@ final class VM: ObservableObject {
     ]
 
     static let clientChoices: [(key: String, label: String)] = [
+        ("tag", "TAG"),
         ("clash-verge", "Clash Verge"),
         ("flclash", "FlClash"),
         ("shadowrocket", "Shadowrocket"),
@@ -1158,7 +1159,7 @@ struct UpdateSheet: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("版本更新").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
-                        Text("只检查，不写入任何文件").font(.caption).foregroundColor(ClaudeTheme.muted)
+                        Text("检查上游核心变化").font(.caption).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
                     Button { dismiss() } label: {
@@ -1191,8 +1192,8 @@ struct UpdateSheet: View {
                             .clipShape(Capsule())
                     }
                     .buttonStyle(.plain)
-                    Button { copyUpdateCommand() } label: {
-                        Label(copied ? "已复制" : "复制更新命令", systemImage: copied ? "checkmark" : "doc.on.doc")
+                    Button { copyUpdateCheckCommand() } label: {
+                        Label(copied ? "已复制" : "复制检查命令", systemImage: copied ? "checkmark" : "doc.on.doc")
                             .font(.callout.bold())
                             .padding(.horizontal, 16).padding(.vertical, 7)
                             .background(ClaudeTheme.iconWell)
@@ -1203,7 +1204,7 @@ struct UpdateSheet: View {
                     Spacer()
                 }
 
-                Text("复制后到终端执行即可更新；更新前会做 SHA256 校验，自检不通过会自动回滚。")
+                Text("上游有更新时需合并并验证 TAG 适配；检查会按日志设置记录脱敏信息。")
                     .font(.caption2).foregroundColor(ClaudeTheme.muted)
             }
             .padding(20)
@@ -1212,10 +1213,10 @@ struct UpdateSheet: View {
         .preferredColorScheme(.light)
     }
 
-    private func copyUpdateCommand() {
+    private func copyUpdateCheckCommand() {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        _ = pasteboard.setString("~/.local/bin/claude-switch.sh update", forType: .string)
+        _ = pasteboard.setString("~/.local/bin/claude-switch.sh update-check", forType: .string)
         copied = true
     }
 }

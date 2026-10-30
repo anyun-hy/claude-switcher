@@ -143,7 +143,19 @@ locale_for() {
 # ---- 0. 前置检查 ----
 CLASH_DIR="$H/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 FLCLASH_DIR="$H/Library/Application Support/com.follow.clash"
-if [ -d "$CLASH_DIR" ]; then
+# 仅在运行中的 PID 确认是 TAG 内核时自动选择，不能仅凭目录或命令行匹配。
+tag_alive() {
+    local pid executable
+    while IFS= read -r pid; do
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
+        executable=$(ps -p "$pid" -o comm= 2>/dev/null | sed 's/^[[:space:]]*//')
+        [ "$executable" = "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin" ] && return 0
+    done < <(pgrep -f '/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin' 2>/dev/null)
+    return 1
+}
+if tag_alive; then
+    MODE="tag"
+elif [ -d "$CLASH_DIR" ]; then
     MODE="clash-verge"
 elif [ -d "$FLCLASH_DIR" ]; then
     MODE="flclash"
@@ -153,7 +165,7 @@ else
     echo "未自动识别到代理客户端,请手动选择:"
     echo "  1) clash-verge    2) flclash         3) shadowrocket"
     echo "  4) sing-box       5) clashx          6) surge"
-    echo "  7) auto(任一命中即活)"
+    echo "  7) auto(任一命中即活)    8) tag"
     read -r -p "请输入序号或名称: " pick
     case "$pick" in
         1|clash-verge)  MODE="clash-verge" ;;
@@ -163,6 +175,7 @@ else
         5|clashx)        MODE="clashx" ;;
         6|surge)         MODE="surge" ;;
         7|auto)          MODE="auto" ;;
+        8|tag)           MODE="tag" ;;
         *) echo "未识别的选择,退出"; exit 1 ;;
     esac
 fi

@@ -44,7 +44,7 @@ private final class Fixture {
         case "$1" in
           checkdetail) delay check; cat "$root/audit"; result check ;;
           status) cat "$root/status"; result status ;;
-          get-client) echo 'client=clash-verge' ;;
+          get-client) if [ -f "$root/client" ]; then cat "$root/client"; else echo 'client=clash-verge'; fi ;;
           get-check-config) cat "$root/check-config"; result get-config ;;
           set-check-config) printf '%s\n' "$2" > "$root/saved-config"; result set-config ;;
           switch) delay switch; cat "$root/switch-output"; result switch ;;
@@ -100,6 +100,12 @@ struct MenuBarModelTests {
                 try f.idle(vm)
                 try expect(f.calls == ["checkdetail", "get-client", "status"], "启动不应重复检查")
                 try expect(vm.phase == .ready && vm.lastCheckSummary == "通过" && vm.current == "A", "初始状态不一致")
+            case "tag_client_recognized":
+                try f.write("client", "client=tag\n")
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try expect(vm.currentClient == "tag", "应读取 TAG 客户端")
+                try expect(VM.clientChoices.contains { $0.key == "tag" && $0.label == "TAG" }, "客户端列表应包含 TAG")
             case "multi_account_status":
                 try f.write("status", "current=A hasA=1 hasB=1 hasC=1 hasD=0 accounts=A,B,C accA=1.2G@2026-10-20 accB=900M@2026-10-19 accC=2.0G@2026-10-18\n")
                 try f.write("switch-output", "OK:已切换到账号 C\n")
