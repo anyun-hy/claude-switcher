@@ -177,43 +177,12 @@ final class VM: ObservableObject {
         }
     }
 
-    private var isPollingClient = false
-
     func refresh() {
         guard !isBusy else { return }
         hideAfterSwitch?.cancel()
         if !coreAvailable() { markCoreMissing(); return }
         isBusy = true
         checkEnvironment { _ in self.isBusy = false }
-    }
-
-    func pollClientStateIfNeeded() {
-        guard started, !isBusy, !updating, !isSwitchingClient, !isPollingClient, coreAvailable() else { return }
-        isPollingClient = true
-        run(["detect-client"], timeout: 5) { result in
-            self.isPollingClient = false
-            guard result.succeeded, !self.isBusy, !self.updating, !self.isSwitchingClient else { return }
-            var configured = ""
-            var alive = ""
-            var running = ""
-            for line in result.output.split(separator: "\n") {
-                let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
-                guard parts.count == 2 else { continue }
-                switch parts[0] {
-                case "configured": configured = parts[1]
-                case "alive": alive = parts[1]
-                case "running": running = parts[1]
-                default: break
-                }
-            }
-            let kernelRowState = self.rows.first(where: { $0.name == "代理内核" })?.state
-            let switchedClient = !running.isEmpty && running != "none" && running != self.currentClient
-            let configuredChanged = !configured.isEmpty && configured != self.currentClient
-            let aliveMismatch = (alive == "1" && kernelRowState == .fail) || (alive == "0" && kernelRowState == .ok)
-            if switchedClient || configuredChanged || aliveMismatch {
-                self.refresh()
-            }
-        }
     }
 
     private func coreAvailable() -> Bool {
@@ -1426,7 +1395,6 @@ struct NoticeView: View {
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let vm: VM
     private(set) var mainWindow: NSWindow?
-    private var monitorTimer: Timer?
 
     override init() {
         vm = VM()
@@ -1445,22 +1413,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         vm.onRelaunchRequested = { [weak self] in self?.relaunchApp() }
         showMainWindow()
         vm.start()
-        startClientMonitor()
-    }
-
-    private func startClientMonitor() {
-        monitorTimer?.invalidate()
-        monitorTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            self?.vm.pollClientStateIfNeeded()
-        }
-        let nc = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
-            nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    self?.vm.pollClientStateIfNeeded()
-                }
-            }
-        }
     }
 
     func relaunchApp() {
