@@ -2,14 +2,14 @@
 
 # Claude 切换器
 
-[English](README.en.md) · [Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest)
+[English](README.en.md) · [上游 Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest)
 
 **Fail-Closed 账号环境管理器 —— 把真实 IP 泄漏拦截在启动之前**
 
 > 🛠️ **本项目持续活跃更新中**——防护项随目标平台风控演进不断增加，见下方[路线图](#路线图)。
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/YOURSJEYO/claude-switcher?label=release&color=blue)](https://github.com/YOURSJEYO/claude-switcher/releases/latest)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](LICENSE)
+[![Upstream release](https://img.shields.io/github/v/release/YOURSJEYO/claude-switcher?label=upstream%20release&color=blue)](https://github.com/YOURSJEYO/claude-switcher/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-macOS-blue.svg)]()
 [![Windows](https://img.shields.io/badge/Windows-Beta-lightgrey.svg)](windows/)
 [![Linux](https://img.shields.io/badge/Linux-Beta-lightgrey.svg)](linux/)
@@ -19,6 +19,8 @@
 <img src="assets/icon-2048.png" width="128">
 
 </div>
+
+> **本 fork**：[anyun-hy/claude-switcher](https://github.com/anyun-hy/claude-switcher) 基于 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) 维护，保留原作者署名及 AGPL-3.0-only 许可证，并加入 macOS TAG 基础兼容。自己的 `main` 合入上游更新并保留适配；macOS 核心的检查更新与安装更新均使用自己的仓库 `main`。TAG 用户请按下方源码方式安装，适配边界和维护流程见 [TAG 适配说明](docs/TAG_ADAPTATION.md)。
 
 ---
 
@@ -53,8 +55,8 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 | 09 | WebRTC | 多节点 STUN 交叉探测（详见第 2 节） |
 | 10 | 保镖守护进程 | Kill-Switch 是否在线（详见第 3 节） |
 | 11 | 置顶路由规则 | 生态域名是否被强制走代理（详见第 6 节） |
-| 12 | 客户端语言 | 防止 JS 层 `navigator.language` / `Intl` 读出系统中文 |
-| 13 | ASN 属性 | 住宅宽带 vs 机房 IP（Residential vs Datacenter） |
+| 12 | 客户端语言 | 核对语言与目标地区；Windows 读取 Claude 配置，不代表已验证运行中的 JS 语言值 |
+| 13 | ASN 属性 | 核对网络类型；ISP 分类不等同于具体 IP 的住宅认证，Windows 检测边界见 [说明](windows/README.md#客户端语言与-asn-检查) |
 | 14 | 生态可达性 | claude.ai / api.anthropic.com 连通性验证 |
 
 > 关于「IP 与上次一致」：除了比对上一次出口，审计引擎还会维护 48 小时出口 IP 历史——**48 小时内出口 IP 变化 ≥3 次会亮黄色警告**（不阻断启动）。IP 频繁漂移意味着账号画像在风控眼里"居无定所"，建议固定一条高质量住宅节点长期使用。禁用 IP 一致检查后不会执行出口比对，也不会写入这份历史。
@@ -100,14 +102,14 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 
 ## 安装
 
-**系统要求**：macOS · Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）· Claude 桌面版 · python3
+**系统要求**：macOS · Clash Verge / FlClash / TAG / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）· Claude 桌面版 · python3
 
 > **Windows 用户**：[`windows/`](windows/) 目录提供 Windows 版（PowerShell + WPF，Beta），安装与注意事项见 [windows/README.md](windows/README.md)。
 > **Linux 用户**：[`linux/`](linux/) 目录提供 Linux 版（bash + systemd，Beta），设计取舍（无官方桌面版→切换浏览器登录态）见 [linux/README.md](linux/README.md)。
 
-### 直接下载（推荐）
+### 上游发行包
 
-到 [Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest) 下载最新版本，按用途选择：
+原作者的 [Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest) 提供以下发行包；这些包不包含本 fork 的 TAG 适配。安装本 fork 请使用下一节的源码方式。上游包可按用途选择：
 
 - `ClaudeSwitcher-<版本>-installer-kit.zip`：**首次安装推荐**。解压后双击 `installer/安装.command`，安装核心脚本、守护进程，并将 App 放入「应用程序」文件夹。
 - `ClaudeSwitcher-<版本>-macos-arm64-app-only.dmg` / `.zip`：**仅包含界面 App**（不含核心脚本）；已安装核心脚本时可用于替换旧版界面。首次安装请用上面的 installer-kit。
@@ -115,11 +117,11 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 
 > macOS 产物为 ad-hoc 签名、未公证。首次打开若被 Gatekeeper 拦截，请右键打开，或在「系统设置 → 隐私与安全性」中放行。每个 Release 附带 `SHA256SUMS-release.txt`，可用 `shasum -a 256 -c` 校验下载文件。
 
-### 从源码安装
+### 从源码安装本 fork（TAG 用户）
 
 ```bash
 # 克隆后双击 installer/安装.command 即可,自动识别代理客户端、代理组名与地区目标
-git clone https://github.com/YOURSJEYO/claude-switcher.git
+git clone --branch main https://github.com/anyun-hy/claude-switcher.git
 ```
 
 ## 地区自适应
@@ -170,6 +172,12 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 
 已安装的旧版 GUI 需要重新编译（或重新运行安装器）才会获得菜单栏功能；现有 `update` 命令仅更新核心脚本，不会替换 GUI。
 
+### macOS 核心更新
+
+安装本 fork 后，`claude-switch.sh update-check`（或 `update --check`）检查 [自己仓库的 `main`](https://github.com/anyun-hy/claude-switcher/tree/main)。它下载一次归档，以归档内同一快照的 `SHA256SUMS` 校验工件，再忽略五个本机运行配置项比较核心内容；检查过程不替换核心、不修改配置、不创建更新备份。
+
+执行 `claude-switch.sh update`，或由既有 LaunchAgent 调用 `update --auto`，会沿用上游的备份、保留配置、自检及失败回滚流程。更新源不随代理客户端模式改变。**这条通道只安装核心脚本**；App 界面、root 保镖和时区守护的变动需要重新运行安装器。上游新代码由维护者验证后合入自己的 `main`，详细流程见 [TAG 适配说明](docs/TAG_ADAPTATION.md)。
+
 开发者可在 macOS 上运行 `python3 -m unittest discover -s tests -v`，其中菜单栏模型测试使用假核心脚本，不访问真实账号或网络。隔离 UI 验证方法见 [tests/MENU-BAR-TESTING.md](tests/MENU-BAR-TESTING.md)。
 
 ## 多账号（A–D）
@@ -182,7 +190,7 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
   - `已建档 · 1.2G · 10-20`：该槽位已有独立快照，附带快照体积与最后归档日期
   - `未初始化`：空槽位，点击后创建新身份
 - **快照位置**：`~/.claude-switcher/accounts/<A|B|C|D>/`。切换时当前账号会先归档到对应目录，再把目标账号还原到 `~/Library/Application Support/Claude`；四个目录彼此独立，互不覆盖。
-- **CLI**：`~/.local/bin/claude-switch.sh switch A|B|C|D`。账号参数只接受 A–D，其他值会输出 `FAIL:` 并拒绝切换。
+- **CLI**：`~/.local/bin/claude-switch.sh switch A|B|C|D`。账号参数只接受 A–D，其他值会输出 `FAIL:` 并拒绝切换。终端 Claude Code 与桌面账号联动用 `cli` / `cli-current`，见下文「Claude Code 多账号联动」。
 - **状态**：`claude-switch.sh status` 在原有 `current/hasA/hasB` 字段外新增 `hasC/hasD`、`accounts=A,B,C`（无归档时为 `none`）与 `accA=<大小>@<日期>`；旧版界面仍可读取前两组字段。
 - 加密导出/导入同样支持 C/D：`snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`。
 
@@ -269,6 +277,43 @@ Windows 加密快照使用 `.csnap`（PBKDF2-HMAC-SHA256 + AES-256-CBC + HMAC-SH
 
 该命令**只检测不修改**：不会卸载、升级或删除任何东西；需要重装时按输出里的建议自行执行对应包管理器命令。
 
+## Claude Code 多账号联动（macOS CLI）
+
+终端里的 Claude Code 可以和桌面版使用同一账号：切换器按桌面当前账号映射独立的 `CLAUDE_CONFIG_DIR`（官方支持的多账号登录机制），再用映射后的目录启动真实 CLI。
+
+```bash
+# 以当前桌面账号启动 Claude Code，参数原样透传
+~/.local/bin/claude-switch.sh cli --resume
+
+# 只查看当前映射：输出 current=<槽位> config=<目录>
+~/.local/bin/claude-switch.sh cli-current
+```
+
+**账号映射与历史**：
+
+- 账号 A 使用既有 `~/.claude` 目录——已有登录态、设置和对话历史原样保留，不发生迁移
+- 账号 B/C/D 各使用 `~/.claude-switcher/cli-accounts/<槽位>/`（权限 0700）；首次使用会在各自目录下要求登录一次，之后直接复用
+- 各槽位的设置、登录态、对话历史互相独立，切换桌面账号后 CLI 侧按槽位独立恢复
+- 钥匙串条目由 CLI 按配置目录自动隔离，**无需也不应**导出、复制钥匙串或交换凭据文件
+
+**启动前防线**（`cli` 每次启动都执行）：
+
+- 要求桌面切换器已有有效 A–D 当前账号，未初始化时拒绝猜测
+- 检测到 `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY`、`ANTHROPIC_PROFILE` 等认证环境变量覆盖时拒绝启动；已设置的 `CLAUDE_CONFIG_DIR` 与目标槽位不一致也拒绝
+- 通过 CLI 启动与桌面切换共用原子锁串行化账号操作，再运行完整 `check` 环境审计；任何硬性失败都阻止启动，审计通过到启动前会重读当前账号，期间账号变化立即拒绝，避免启动与切换竞态串号。既有 B–D 账号目录或父目录为符号链接时同样拒绝
+
+**切换与急停**：
+
+- 切换桌面账号前，切换器通过 `ps` 识别并 TERM 安装用户的 CLI 进程（native `claude`/`claude.exe` 及 npm/bun 的 `@anthropic-ai/claude-code`），最多等待 10 秒；**CLI 未退出则停止切换**，桌面数据与当前指针保持不变。同一账号重复启动桌面版不要求退出 CLI
+- 保镖发现代理离线时，同时终止桌面版与上述 CLI 进程；只处理安装用户的进程，不按名字扫全系统
+
+**边界与限制**：
+
+- 直接绕过 `claude-switch.sh cli` 运行原始 `claude`，以上防线一律不参与，**无法保证与桌面账号一致**；保镖的代理离线急停仍然兜底
+- 加密桌面快照（`snapshot-export`）只含桌面数据，**不包含**独立 CLI 配置目录；迁移到新机器后 CLI 侧可能需要重新登录
+- 想在终端少打字可以自己在 shell 配置里加显式 alias（如 `alias ccc="$HOME/.local/bin/claude-switch.sh cli"`），安装器不会静默修改 shell 配置
+- 本功能当前验证范围为隔离回归（临时 HOME + 假 CLI + 假进程），**尚未做真机验收**；B–D 首次真实登录与保镖急停行为以真机为准
+
 ## 安全打开链接（open-safe，macOS）
 
 邮件里的验证链接、Magic Link、来路不明的登录链接，可以用一次性隔离浏览器打开：
@@ -291,7 +336,9 @@ Windows 加密快照使用 `.csnap`（PBKDF2-HMAC-SHA256 + AES-256-CBC + HMAC-SH
 ~/.local/bin/claude-switch.sh set-client flclash
 ```
 
-支持 `clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto`。改完重新跑一次 `checkdetail` 即可：
+支持 `clash-verge|flclash|tag|shadowrocket|sing-box|clashx|surge|auto`。改完重新跑一次 `checkdetail` 即可：
+
+- TAG 按指定内核的完整路径识别，TUN 与规则仍需在 TAG 中配置；Fake-IP 检测不证明实际路由，切换器不会自动重写 TAG 规则，详见 [TAG 适配说明](docs/TAG_ADAPTATION.md)。
 
 - 换成 FlClash 后，「代理内核」与保镖识别 `FlClashCore`/`FlClash` 进程；WebRTC 与其他非 Clash Verge 客户端一致，STUN 无响应显示「未确认」，不会把未验证当作已安全拒绝
 - 换成 Shadowrocket 后，「代理内核」检查 `scutil --nc` 的连接状态，不再去找 Clash Verge
@@ -370,7 +417,7 @@ WEBRTC_POLICY=reject ~/.local/bin/claude-switch.sh fix
 WEBRTC_POLICY=proxy ~/.local/bin/claude-switch.sh fix
 ```
 
-策略在成功写入后保存到 `~/.claude-switcher/webrtc-policy`，后续 GUI、检查和修复会沿用。**一键修复会重启 Clash Verge**。代理组不存在、当前节点是 DIRECT、节点不支持 UDP、全局脚本未启用、控制接口不可用或内核未加载置顶规则时，都不会显示规则修复成功。节点不支持 UDP 时请换节点或主动选择 `reject`；Mihomo 可能继续向下匹配规则，`proxy` 策略不能保证阻止这种回落。
+策略在成功写入后保存到 `~/.claude-switcher/webrtc-policy`，后续 GUI、检查和修复会沿用。**一键修复会重启 Clash Verge**。代理组不存在、当前节点是 DIRECT、节点不支持 UDP、全局脚本未启用、控制接口不可用或内核未加载置顶规则时，都不会显示规则修复成功。节点不支持 UDP 时请换节点或主动选择 `reject`；Mihomo 可能继续向下匹配规则，`proxy` 策略不能保证阻止这种回落。FlClash 的显式 `reject` 策略也会被修复和检查沿用；未设置时仍按 `proxy` 评估，不会强制改为拒绝。
 
 检查读取本机 Mihomo 的 `/configs`、`/proxies`、`/rules`，核对 rule 模式、代理组及实际规则的顺序、目标和启用状态；不再把文件中的文字或 fake-IP 解析当成规则生效。**全局模式（Global）视为合规**：该模式不经过规则匹配、全部流量已走代理，检查会标注「全局模式(全部流量走代理)」，无需写入 Script.js；规则置顶与 WebRTC 端口策略仅在 rule 模式下生效。控制接口连接优先使用配置中的 Unix socket，失效时回退到服务实际使用的 `/var/run/clash-verge-service/users/<uid>/verge-mihomo.sock`。**STUN 无响应不等于没有泄漏**：默认策略会报告未验证；仅在已验证拒绝规则的 `reject` 策略下，才把探测无响应解释为该端口策略的预期结果。
 
@@ -413,11 +460,11 @@ WEBRTC_POLICY=proxy ~/.local/bin/claude-switch.sh fix
 
 ## 微信交流群
 
-欢迎加入 **claude-switcher 交流群**，交流安装配置、使用心得和问题排查。使用微信扫描下方二维码即可入群：
+由于微信交流群人数已超过 200 人，目前只能通过邀请加入。请扫描下方二维码添加维护者 **JEYO** 的个人微信，并备注 `claude-switcher`，我会邀请你进群。
 
-![claude-switcher 微信交流群二维码](assets/wechat-group.png)
+![JEYO 微信二维码](assets/wechat-personal.jpg)
 
-> 当前二维码标注 **2026 年 11 月 2 日前有效**。若二维码过期或无法入群，请通过 [Issue](https://github.com/YOURSJEYO/claude-switcher/issues) 提醒维护者更新。
+> 若二维码失效，请通过 [Issue](https://github.com/YOURSJEYO/claude-switcher/issues) 提醒维护者更新。
 
 Bug 反馈和功能建议仍建议提交 Issue，便于跟踪与处理。
 
@@ -442,7 +489,7 @@ Bug 反馈和功能建议仍建议提交 Issue，便于跟踪与处理。
 - [x] 更多指纹维度：桌面端 `fingerprint` 命令覆盖字体地区特征 + GPU/虚拟机特征，Canvas/WebGL 由 Web 检测页覆盖
 - [x] 更多代理客户端适配：已支持 Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge（含 auto 自动识别），并可在 App 内下拉一键切换
 - [x] 快照切换提速：归档改为同卷移动 + 载入走 COW 克隆（APFS clonefile / Linux reflink），不再产生全量复制
-- [x] 应用内自动更新：launchd 每 12 小时自动检查更新，自检失败自动回滚，也可手动 `claude-switch.sh update` 保底
+- [x] macOS 核心自动更新：launchd 每 12 小时检查自己仓库 `main`，自检失败自动回滚，也可手动 `claude-switch.sh update`；App 与 root 守护通过安装器更新
 
 > 有想优先看到的功能，去 [Issues](https://github.com/YOURSJEYO/claude-switcher/issues) 投票或提需求，热度高的先做。
 
@@ -462,4 +509,6 @@ Bug 反馈和功能建议仍建议提交 Issue，便于跟踪与处理。
 
 ## License
 
-MIT © Claude Switcher Contributors
+AGPL-3.0-only © 2026 Claude Switcher Contributors
+
+> 自 2026 年 11 月 2 日起发布的新版本采用 AGPL-3.0-only。此前发布的 MIT 版本仍按 MIT 授权，已授予的权利不受影响。

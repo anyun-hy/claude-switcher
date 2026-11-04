@@ -12,7 +12,26 @@ $PROXY_GROUP = "GLOBAL"                # Clash 代理组名
 # =======================================================
 
 $BASE = Join-Path $env:USERPROFILE ".claude-switcher"
-$DATA = Join-Path $env:APPDATA "Claude"
+function Find-ClaudeMsixDataPath {
+    $msixRoot = Join-Path $env:LOCALAPPDATA "Claude-Data"
+    try {
+        $pkg = Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($pkg -and $pkg.PackageFamilyName) {
+            return (Join-Path $msixRoot ([string]$pkg.PackageFamilyName))
+        }
+    } catch {}
+    $candidates = @(Get-ChildItem -LiteralPath $msixRoot -Directory -Filter 'claude_*' -ErrorAction SilentlyContinue)
+    if ($candidates.Count -eq 1) { return $candidates[0].FullName }
+    return $null
+}
+function Find-ClaudeDataPath {
+    $legacy = Join-Path $env:APPDATA "Claude"
+    if (Test-Path -LiteralPath $legacy) { return $legacy }
+    $msix = Find-ClaudeMsixDataPath
+    if ($msix) { return $msix }
+    return $legacy
+}
+$DATA = Find-ClaudeDataPath
 $LOG  = Join-Path $BASE "claude-switch.log"
 $CLIENT_LOG = Join-Path $BASE "logs\client.log"
 $CHECK_CONFIG = Join-Path $BASE "checks.json"
@@ -1058,16 +1077,28 @@ function Invoke-CheckDetail {
 
     Get-RulesStatus
 
-    # 客户端语言:Windows 版读不到 Claude 内部语言设置,只能比对系统 UI 语言;不一致时告警，不再无条件报 ok
+    # Claude 的语言设置独立于 Windows 显示语言，使用当前数据目录中的配置。
     if (Test-CheckDisabled '客户端语言') {
         Format-OptionalResult '客户端语言' 'ok'
     } else {
-        $uiLang = [string]([System.Globalization.CultureInfo]::CurrentUICulture.Name)
+        $clientLang = ''
+        $clientConfig = Join-Path $DATA 'config.json'
+        # MSIX 版可能在旧目录仅保留 MCP 配置，而实际设置已迁移到 Claude-Data。
+        if (-not (Test-Path -LiteralPath $clientConfig)) {
+            $msix = Find-ClaudeMsixDataPath
+            if ($msix) { $clientConfig = Join-Path $msix 'config.json' }
+        }
+        try {
+            $locale = (Get-Content -LiteralPath $clientConfig -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).locale
+            if ($locale -is [string] -and $locale -match '^[a-z]{2,3}(?:-[a-z0-9]{2,8})*\z') { $clientLang = $locale }
+        } catch {}
         $wantLang = ([string]$LOCALE_TARGET -split '-')[0].ToLowerInvariant()
-        if ($uiLang -and (($uiLang -split '-')[0].ToLowerInvariant()) -eq $wantLang) {
-            Format-OptionalResult '客户端语言' 'ok' "系统UI=$uiLang"
+        if (-not $clientLang) {
+            Format-OptionalResult '客户端语言' 'warn' '未能读取 Claude 的语言设置'
+        } elseif ((($clientLang -split '-')[0].ToLowerInvariant()) -eq $wantLang) {
+            Format-OptionalResult '客户端语言' 'ok' "Claude=$clientLang"
         } else {
-            Format-OptionalResult '客户端语言' 'warn' "系统UI=$(if ($uiLang) { $uiLang } else { '未知' }),期望 $wantLang 前缀;Windows 版不读取客户端内部设置"
+            Format-OptionalResult '客户端语言' 'warn' "Claude=$clientLang,期望 $wantLang 前缀"
         }
     }
 
@@ -1075,10 +1106,27 @@ function Invoke-CheckDetail {
         Format-OptionalResult 'ASN属性' 'ok'
     } else {
         $org = ''
-        try { $org = ((& curl.exe -s --max-time 6 "https://ipinfo.io/json" 2>$null) | ConvertFrom-Json).org } catch {}
+        $asnType = ''
+        if ($e.ip) {
+            try {
+                $ipInfoResponse = (& curl.exe -s --max-time 6 "https://ipinfo.io/$([Uri]::EscapeDataString([string]$e.ip))/json" 2>$null) -join "`n"
+                $ipInfo = $ipInfoResponse | ConvertFrom-Json -ErrorAction Stop
+                if ([string]$ipInfo.ip -eq [string]$e.ip) { $org = [string]$ipInfo.org }
+            } catch {}
+        }
+        if ($org -match '^AS(\d+)\s') {
+            $asn = $Matches[1]
+            try {
+                $networkResponse = (& curl.exe -s --max-time 6 "https://www.peeringdb.com/api/net?asn=$asn&fields=asn,info_type" 2>$null) -join "`n"
+                $network = ($networkResponse | ConvertFrom-Json -ErrorAction Stop).data |
+                    Where-Object { [string]$_.asn -eq $asn } | Select-Object -First 1
+                $asnType = [string]$network.info_type
+            } catch {}
+        }
         if (-not $org) { Format-OptionalResult 'ASN属性' 'warn' '未获取' }
-        elseif ($org -match 'Comcast|AT&T|Verizon|Spectrum|Charter|Cox|T-Mobile|Cable|esidential') { Format-OptionalResult 'ASN属性' 'ok' $org }
-        else { Format-OptionalResult 'ASN属性' 'warn' "疑似机房($org)" }
+        elseif ($asnType -eq 'Cable/DSL/ISP') { Format-OptionalResult 'ASN属性' 'ok' "ISP($org);具体 IP 的住宅属性未验证" }
+        elseif ($asnType) { Format-OptionalResult 'ASN属性' 'warn' "$asnType($org);不代表具体 IP 用途" }
+        else { Format-OptionalResult 'ASN属性' 'warn' "网络类型未确认($org)" }
     }
 
     if (Test-CheckDisabled '生态可达性') {
@@ -1944,7 +1992,9 @@ function Read-SnapshotPassword([string]$Mode, [string]$Prompt = '输入快照密
 function Get-SnapshotKeys([string]$Password, [byte[]]$Salt) {
     $passwordBytes = [System.Text.Encoding]::UTF8.GetBytes($Password)
     try {
-        $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes -ArgumentList $passwordBytes,$Salt,200000,[System.Security.Cryptography.HashAlgorithmName]::SHA256
+        # 必须用 ::new()：New-Object -ArgumentList 会把 HashAlgorithmName 结构体转成字符串，
+        # Rfc2898DeriveBytes 随即抛 "is not a known hash algorithm"（Windows PowerShell 5.1 实测）
+        $kdf = [System.Security.Cryptography.Rfc2898DeriveBytes]::new($passwordBytes, $Salt, 200000, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
         try { $material = $kdf.GetBytes(64) } finally { $kdf.Dispose() }
         $encryptionKey = New-Object byte[] 32
         $macKey = New-Object byte[] 32
@@ -2086,6 +2136,32 @@ function Expand-SnapshotArchive([string]$ZipPath, [string]$Destination) {
     [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $Destination)
 }
 
+# .NET Framework 的 ZipFile::CreateFromDirectory 用 '\' 写条目名，会被 Test-SnapshotArchive
+# 的路径校验判为「非法路径」；这里手工写条目，统一成 '/'（.NET Core 才默认 '/')
+function New-SnapshotArchive([string]$SourceDir, [string]$ZipPath) {
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $root = [System.IO.Path]::GetFullPath($SourceDir).TrimEnd('\', '/')
+    $stream = [System.IO.File]::Open($ZipPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $zip = New-Object System.IO.Compression.ZipArchive($stream, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($dir in @(Get-ChildItem -LiteralPath $root -Recurse -Directory -Force -ErrorAction SilentlyContinue)) {
+                [void]$zip.CreateEntry($dir.FullName.Substring($root.Length + 1).Replace('\', '/') + '/')
+            }
+            foreach ($file in @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+                $entry = $zip.CreateEntry($file.FullName.Substring($root.Length + 1).Replace('\', '/'), [System.IO.Compression.CompressionLevel]::Optimal)
+                $entry.ExternalAttributes = [int]$file.Attributes
+                $entryStream = $entry.Open()
+                try {
+                    $fileStream = [System.IO.File]::OpenRead($file.FullName)
+                    try { $fileStream.CopyTo($entryStream) } finally { $fileStream.Dispose() }
+                } finally { $entryStream.Dispose() }
+            }
+        } finally { $zip.Dispose() }
+    } finally { $stream.Dispose() }
+}
+
 function Export-EncryptedSnapshot([string]$Target, [string]$Out, [string]$Mode) {
     if (-not (Test-AccountSlot $Target)) { $script:exitCode = 1; 'FAIL:账号必须是 A、B、C 或 D'; return }
     $source = Join-Path $BASE "accounts\$Target"
@@ -2109,7 +2185,7 @@ function Export-EncryptedSnapshot([string]$Target, [string]$Out, [string]$Mode) 
         $meta = [ordered]@{ format = 'claude-switcher-snapshot'; version = 1; account = $Target; created = ([DateTime]::UtcNow.ToString('o')); platform = 'Windows' }
         [System.IO.File]::WriteAllText((Join-Path $stage '.claude-switcher-snapshot.json'), ($meta | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
         Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $plain, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+        New-SnapshotArchive $stage $plain
         Protect-SnapshotFile $plain $Out $password
         "OK:账号$Target 已加密导出到 $Out"
     } catch {

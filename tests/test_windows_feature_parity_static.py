@@ -73,6 +73,20 @@ class WindowsFeatureParityStaticTests(unittest.TestCase):
             self.assertIn("flclash", text)
             self.assertIn("FlClashCore", text)
 
+    def test_msix_data_directory_is_discovered(self):
+        self.assertIn("function Find-ClaudeDataPath", self.core)
+        self.assertIn("Get-AppxPackage -Name 'Claude'", self.core)
+        self.assertIn('Join-Path $env:LOCALAPPDATA "Claude-Data"', self.core)
+        self.assertIn("$pkg.PackageFamilyName", self.core)
+        self.assertIn("$DATA = Find-ClaudeDataPath", self.core)
+
+    def test_installer_checks_claude_before_system_changes(self):
+        self.assertIn("未找到 Claude 桌面版", self.install)
+        preflight = self.install.index("未找到 Claude 桌面版")
+        self.assertIn("Get-AppxPackage -Name 'Claude'", self.install)
+        self.assertLess(preflight, self.install.index("Set-TimeZone"))
+        self.assertLess(preflight, self.install.index("Register-ScheduledTask"))
+
 
 if __name__ == "__main__":
     unittest.main()

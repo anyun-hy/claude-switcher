@@ -12,10 +12,16 @@
   - **sing-box / ClashX / Surge / WireGuard** —— 按进程或服务识别
   - **其他 TUN 客户端**（Astrill / OpenVPN / Tailscale 等）—— 安装时选 `other`
   - **auto** —— 任一已知进程/服务命中即视为在线（未识别到客户端时的默认选项）
-- Claude 桌面版 Windows
+- Claude 桌面版 Windows（传统 EXE 或 MSIX/Appx；MSIX 数据目录可自动发现，但仍待 Windows 真机验收）
 - 安装时需要**管理员权限**一次（注册守护任务 / 锁定时区 / 关闭 IPv6）
 
 > 代理模式同时写入 `%USERPROFILE%\.claude-switcher\proxy-mode.txt`，保镖按这个文件分派检测逻辑；缺失时按旧版 Clash Verge 行为处理。
+
+## WPF 界面结构
+
+新版 WPF 主窗口按导航、环境/代理状态、A–D 四账号卡、检查与工具区域组织信息：导航用于切换主要视图，状态区集中展示当前环境与代理概况，账号卡保留当前账号、建档状态、快照大小和归档日期，检查与工具区承接原有审计、修复和维护入口。这是小范围视觉重构，不改变既有安全检查、账号切换或工具行为。
+
+**新版视觉结构尚未经过 Windows 真机渲染与交互验收**；仓库静态检查不能视为界面已在 Windows 上渲染通过。
 
 ## 安装
 
@@ -118,13 +124,21 @@ claude-switch.ps1 set-check-config '{"disabled":["DNS"],"allowOptionalFailures":
 
 脱敏客户端日志默认开启，位于 `%USERPROFILE%\.claude-switcher\logs\client.log`，达到 512 KiB 后轮转为 `client.log.1`。日志只记录命令、退出码、耗时和检查状态，不记录公网/住宅/代理 IP、Bearer/token/session/cookie、账号内容或 Clash 配置。点击主窗口「导出诊断」可生成 zip；也可以运行 `claude-switch.ps1 export-diagnostics <文件路径>`。诊断包只含客户端日志、检查设置和脱敏环境/状态摘要，不包含账号快照、`lastip`、`iphistory` 或原始 `last-check.txt`。
 
+### 客户端语言与 ASN 检查
+
+「客户端语言」读取 Claude 数据目录中 `config.json` 的 `locale`，与目标地区的语言前缀比较，不再用 Windows 显示语言代替。传统版通常位于 `%APPDATA%\Claude`；该目录没有 `config.json` 时，会尝试已发现的 MSIX 数据目录 `%LOCALAPPDATA%\Claude-Data\<PackageFamilyName>`。配置缺失、损坏、语言未设置或不匹配时显示警告；读取配置不等于已验证运行中的 `navigator.language`。
+
+「ASN属性」按已检测出口 IP 查询 IPinfo 的 AS 号，再查询 PeeringDB 的网络类型；`Cable/DSL/ISP` 显示 ISP，通过仅表示 ASN 类型已确认，**不证明具体 IP 属于真实住宅宽带，也不认证其代理信誉**。其他网络类型如实显示为警告；查询失败或记录不完整时显示类型未确认，不再因运营商不在名称短名单中就推断为机房。此检查会将出口 IP 发送给 IPinfo，并将公开 AS 号发送给 PeeringDB；禁用该检查后不会发送这两项查询。
+
+隔离回归：`tests\windows-client-language-integration.ps1` 与 `tests\windows-asn-integration.ps1`，均在 Windows PowerShell 5.1 和 PowerShell 7 下执行，不读取真实账号或请求外网。回滚时恢复修复前的核心脚本即可，修复不修改 Claude 配置、账号存档或系统语言。
+
 ## 四账号与跨身份保留
 
 主窗口支持 A–D 四个账号卡片，显示当前账号、已建档状态、快照大小和归档日期。每次切换前会重新完成 14 项审计；输出不完整、硬性项失败或另一操作仍在进行时不会切换。`status` 与 `switch A|B|C|D` 也可在命令行使用，`check` 提供静默总检。启用 `IP一致` 时会维护最近 48 小时出口历史，不同出口达到 3 个会给出警告；禁用该项后不记录这段历史。
 
 同盘安装时，切换暂存和旧目录备份位于 `%USERPROFILE%\.claude-switcher\staging`，不会在 `%APPDATA%` 产生额外的 `Claude.new` / `Claude.old`。数据与账号指针先提交，再清理旧目录；清理失败不会把指针留在旧账号。下次切换只重试清理 `cleanup.json` 能证明归属的残留，不明目录仍需人工确认，绝不自动删除。若 `%APPDATA%` 与 `%USERPROFILE%` 在不同卷，为避免跨卷改名失败，仍使用原 `Claude.new` / `Claude.old` 路径。
 
-跨身份保留默认关闭。在 `%USERPROFILE%\.claude-switcher\keep-in-workspace.txt` 中每行写一个相对 `%APPDATA%\Claude` 的路径（如 `settings.json`、`skills/`），切换时先暂存，再合并到目标账号。绝对路径、盘符路径、`..` 越界和重解析点会跳过；暂存或还原失败会阻止启动，已有 `keep-stage` 不会被覆盖。只共享通用配置，不要放登录态、Cookie、缓存或账号专属数据。
+跨身份保留默认关闭。在 `%USERPROFILE%\.claude-switcher\keep-in-workspace.txt` 中每行写一个相对当前 Claude 数据目录的路径（如 `settings.json`、`skills/`），切换时先暂存，再合并到目标账号。绝对路径、盘符路径、`..` 越界和重解析点会跳过；暂存或还原失败会阻止启动，已有 `keep-stage` 不会被覆盖。只共享通用配置，不要放登录态、Cookie、缓存或账号专属数据。
 
 ## 维护工具
 
@@ -168,7 +182,7 @@ claude-switch.ps1 diagnose-proxy --config <私有配置.json>
 | 保镖判定 | 显式客户端模式按「客户端进程/服务 + TUN」；`auto` / `other` 只查 TUN |
 | IPv6 | 关闭的是所有网卡的 ms_tcpip6 绑定;要恢复: `Enable-NetAdapterBinding -ComponentID ms_tcpip6` |
 | SmartScreen | 首次运行可能弹"Windows 已保护你的电脑" → 点「更多信息」→「仍要运行」 |
-| 账号数据目录 | Windows 版在 `%APPDATA%\Claude`(与 macOS 路径不同,逻辑相同) |
+| 账号数据目录 | 传统 EXE 版为 `%APPDATA%\Claude`；MSIX/Appx 为 `%LOCALAPPDATA%\Claude-Data\<PackageFamilyName>`，旧版目录不存在时自动发现 |
 | 卸载 | 计划任务里删掉 ClaudeBodyguard,删除 `%USERPROFILE%\.claude-switcher` 和桌面快捷方式即可 |
 
 ## 已知限制与验证范围

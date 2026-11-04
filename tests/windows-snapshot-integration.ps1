@@ -4,16 +4,16 @@ $core = Join-Path (Split-Path -Parent $PSScriptRoot) 'windows\claude-switch.ps1'
 $root = Join-Path ([IO.Path]::GetTempPath()) ('cs-snapshot-' + [guid]::NewGuid().ToString('N'))
 $env:APPDATA = Join-Path $root 'appdata'
 $env:LOCALAPPDATA = Join-Path $root 'local'
-$home = Join-Path $root 'home'
-$accounts = Join-Path $home '.claude-switcher\accounts'
+$homeDir = Join-Path $root 'home'
+$accounts = Join-Path $homeDir '.claude-switcher\accounts'
 New-Item -ItemType Directory -Path "$accounts\A\sub" -Force | Out-Null
 Set-Content -LiteralPath "$accounts\A\sub\marker.txt" -Value 'account-a' -Encoding UTF8 -NoNewline
 New-Item -ItemType Directory -Path $env:APPDATA,$env:LOCALAPPDATA -Force | Out-Null
-Set-Content -LiteralPath "$home\.claude-switcher\current.txt" -Value 'B' -Encoding ascii -NoNewline
+Set-Content -LiteralPath "$homeDir\.claude-switcher\current.txt" -Value 'B' -Encoding ascii -NoNewline
 $password = 'test-password-123'
 $failures = 0
 
-function Invoke-Snapshot([string[]]$Arguments, [string]$Secret, [string]$HomePath = $home) {
+function Invoke-Snapshot([string[]]$Arguments, [string]$Secret, [string]$HomePath = $homeDir) {
     $env:USERPROFILE = $HomePath
     $out = $Secret | & powershell -NoProfile -ExecutionPolicy Bypass -File $core @Arguments 2>&1
     return @{ output = (@($out) -join "`n"); code = $LASTEXITCODE }
@@ -45,7 +45,7 @@ try {
     $r = Invoke-Snapshot @('snapshot-export','A',$shortImage,'--password-stdin') 'short'
     Assert '短密码拒绝' ($r.code -ne 0 -and -not (Test-Path $shortImage)) $r.output
 
-    Set-Content -LiteralPath "$home\.claude-switcher\current.txt" -Value 'A' -Encoding ascii -NoNewline
+    Set-Content -LiteralPath "$homeDir\.claude-switcher\current.txt" -Value 'A' -Encoding ascii -NoNewline
     $currentImage = Join-Path $root 'current.csnap'
     $r = Invoke-Snapshot @('snapshot-export','A',$currentImage,'--password-stdin') $password
     Assert '当前账号禁止导出' ($r.code -ne 0 -and -not (Test-Path $currentImage)) $r.output

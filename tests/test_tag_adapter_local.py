@@ -1,5 +1,4 @@
-"""Local TAG adaptation and update boundaries, with isolated state and commands."""
-import hashlib
+"""Local TAG adaptation checks, with isolated state and commands."""
 import os
 from pathlib import Path
 import re
@@ -7,7 +6,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,8 +54,11 @@ class TagAdapterTests(unittest.TestCase):
         return subprocess.run(["/bin/bash", str(self.core), *args], env=self.env,
                               text=True, capture_output=True, timeout=30)
 
-    def test_tag_identity_requires_the_real_executable(self):
-        self.stub("pgrep", '[ "${FAKE_TAG:-}" = missing ] && exit 1; echo 321')
+    def test_tag_identity_and_auto_mode_require_the_real_executable(self):
+        self.stub("pgrep", '''case "$*" in
+    "-f $TAG_EXE") [ "$FAKE_TAG" = missing ] && exit 1; echo 321 ;;
+    *) exit 1 ;;
+esac''')
         self.stub("ps", '''case "$FAKE_TAG" in
             present) echo "$TAG_EXE" ;;
             spoof) echo /usr/bin/other-process ;;
@@ -65,13 +66,14 @@ class TagAdapterTests(unittest.TestCase):
         esac''')
         text = self.core.read_text(encoding="utf-8")
         harness = (function(text, "tag_alive") + "\n" + function(text, "proxy_alive")
-                   + '\nPROXY_MODE="tag"\nproxy_alive\n')
-        for mode, expected in (("present", 0), ("missing", 1), ("spoof", 1), ("error", 1)):
-            with self.subTest(mode=mode):
-                env = dict(self.env, FAKE_TAG=mode, TAG_EXE=TAG_EXE)
-                run = subprocess.run(["/bin/bash", "-c", harness], env=env,
-                                     text=True, capture_output=True, timeout=5)
-                self.assertEqual(run.returncode, expected, run.stdout + run.stderr)
+                   + '\nshadowrocket_up() { return 1; }\nproxy_alive\n')
+        for client in ("tag", "auto"):
+            for mode, expected in (("present", 0), ("missing", 1), ("spoof", 1), ("error", 1)):
+                with self.subTest(client=client, mode=mode):
+                    env = dict(self.env, FAKE_TAG=mode, TAG_EXE=TAG_EXE, PROXY_MODE=client)
+                    run = subprocess.run(["/bin/bash", "-c", harness], env=env,
+                                         text=True, capture_output=True, timeout=5)
+                    self.assertEqual(run.returncode, expected, run.stdout + run.stderr)
 
     def test_client_discovery_reports_tag(self):
         run = self.run_core("get-client")
@@ -105,72 +107,6 @@ class TagAdapterTests(unittest.TestCase):
         run = subprocess.run(["/bin/bash", "-c", harness], env=self.env,
                              text=True, capture_output=True, timeout=5)
         self.assertIn("fail:客户端不一致", run.stdout)
-
-    def test_direct_and_automatic_updates_do_not_overwrite_adapter(self):
-        self.stub("curl", 'echo invoked >> "$HOME/curl-called"; exit 1')
-        old = self.core.read_bytes()
-        backup = self.core.with_suffix(".sh.bak")
-        backup.write_text("existing file")
-        for mode in ("tag", "clash-verge"):
-            self.core.write_bytes(old.replace(b'PROXY_MODE="tag"', ('PROXY_MODE="' + mode + '"').encode(), 1))
-            before = self.core.read_bytes()
-            for args in (("update",), ("update", "--auto"), ("update", "--unknown")):
-                with self.subTest(mode=mode, args=args):
-                    run = self.run_core(*args)
-                    self.assertNotEqual(run.returncode, 0)
-                    self.assertIn("不能直接安装原版更新", run.stdout)
-                    self.assertNotIn("unbound variable", run.stdout + run.stderr)
-                    self.assertEqual(self.core.read_bytes(), before)
-                    self.assertEqual(backup.read_text(), "existing file")
-                    self.assertFalse((self.home / "curl-called").exists())
-
-    def prepare_remote(self, content, manifest="valid"):
-        archive = self.root / "remote.zip"
-        with zipfile.ZipFile(archive, "w") as output:
-            output.writestr("claude-switcher-main/core/claude-switch.sh", content)
-        sums = self.root / "SHA256SUMS"
-        if manifest == "missing-core":
-            sums.write_text(hashlib.sha256(b"other").hexdigest() + "  other.txt\n")
-            with zipfile.ZipFile(archive, "a") as output:
-                output.writestr("claude-switcher-main/other.txt", b"other")
-        else:
-            digest = hashlib.sha256(content if manifest == "valid" else b"wrong").hexdigest()
-            sums.write_text(digest + "  core/claude-switch.sh\n")
-        self.env.update(FIXTURE_ARCHIVE=str(archive), FIXTURE_SUMS=str(sums))
-        self.stub("curl", '''out=""; url=""
-while [ "$#" -gt 0 ]; do
-    case "$1" in -o) out="$2"; shift 2 ;; http*) url="$1"; shift ;; *) shift ;; esac
-done
-case "$url" in
-    *codeload.github.com*) cp "$FIXTURE_ARCHIVE" "$out" ;;
-    *raw.githubusercontent.com*) cp "$FIXTURE_SUMS" "$out" ;;
-    *) exit 1 ;;
-esac''')
-
-    def test_update_check_compares_verified_upstream_core(self):
-        upstream = b"#!/bin/bash\n# synthetic upstream core\n"
-        source = self.core.read_text(encoding="utf-8")
-        source, count = re.subn(r'(?m)^TAG_UPSTREAM_CORE_SHA256="[0-9a-f]{64}"$',
-                                'TAG_UPSTREAM_CORE_SHA256="' + hashlib.sha256(upstream).hexdigest() + '"',
-                                source, count=1)
-        self.assertEqual(count, 1)
-        self.core.write_text(source, encoding="utf-8")
-        before = self.core.read_bytes()
-        for content, manifest, expected, success in (
-            (upstream, "valid", "基线一致", True),
-            (upstream + b"\n# new upstream\n", "valid", "上游核心有变化", True),
-            (upstream, "wrong", "校验失败", False),
-            (upstream, "missing-core", "校验失败", False),
-        ):
-            with self.subTest(manifest=manifest, success=success):
-                self.prepare_remote(content, manifest)
-                for args in (("update-check",), ("update", "--check")):
-                    with self.subTest(args=args):
-                        run = self.run_core(*args)
-                        self.assertEqual(run.returncode == 0, success, run.stdout + run.stderr)
-                        self.assertIn(expected, run.stdout)
-                        self.assertEqual(self.core.read_bytes(), before)
-                        self.assertFalse(self.core.with_suffix(".sh.bak").exists())
 
     def test_guard_accepts_tag_and_fails_closed_for_missing_or_spoofed_process(self):
         marker = self.home / "kill-called"

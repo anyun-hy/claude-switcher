@@ -10,3 +10,4 @@ _trash/
 .worktrees/
 
 .superpowers/
+__pycache__/

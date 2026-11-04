@@ -1159,7 +1159,7 @@ struct UpdateSheet: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("版本更新").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
-                        Text("检查上游核心变化").font(.caption).foregroundColor(ClaudeTheme.muted)
+                        Text("检查此适配版的核心更新").font(.caption).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
                     Button { dismiss() } label: {
@@ -1204,7 +1204,7 @@ struct UpdateSheet: View {
                     Spacer()
                 }
 
-                Text("上游有更新时需合并并验证 TAG 适配；检查会按日志设置记录脱敏信息。")
+                Text("检查不会安装更新；核心脚本可单独更新，App 与系统守护需运行安装器。")
                     .font(.caption2).foregroundColor(ClaudeTheme.muted)
             }
             .padding(20)

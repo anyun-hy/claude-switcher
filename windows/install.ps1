@@ -13,6 +13,17 @@ Write-Host "==================================" -ForegroundColor Cyan
 Write-Host ""
 
 # ---- 0. 前置检查 + 代理客户端探测 ----
+$claudeExe = @("$env:LOCALAPPDATA\AnthropicClaude\Claude.exe", "$env:LOCALAPPDATA\Programs\Claude\Claude.exe") |
+    Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+$claudeAppx = $null
+try { $claudeAppx = Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue | Select-Object -First 1 } catch {}
+$claudeData = Test-Path -LiteralPath "$env:APPDATA\Claude"
+$msixData = @(Get-ChildItem -LiteralPath "$env:LOCALAPPDATA\Claude-Data" -Directory -Filter 'claude_*' -ErrorAction SilentlyContinue)
+if (-not $claudeExe -and -not $claudeAppx -and -not $claudeData -and $msixData.Count -eq 0) {
+    Write-Host "X 未找到 Claude 桌面版，请先安装 Claude 后重试；尚未修改系统设置" -ForegroundColor Red
+    pause; exit 1
+}
+
 $PROXY_MODE = $null
 if ($CLASH_DIR) {
     $PROXY_MODE = 'clash-verge'

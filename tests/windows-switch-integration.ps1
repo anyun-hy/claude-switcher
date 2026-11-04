@@ -20,7 +20,13 @@ foreach ($d in @($env:USERPROFILE, $env:APPDATA, $env:LOCALAPPDATA)) {
     New-Item -ItemType Directory -Path $d -Force | Out-Null
 }
 
-# 打桩：不碰真实进程，也不启动任何程序（CmdletBinding 让 -ErrorAction 等公共参数可用）
+# 打桩：不碰真实进程、Appx 包，也不启动任何程序（CmdletBinding 让 -ErrorAction 等公共参数可用）
+$script:appxPackage = $null
+function global:Get-AppxPackage {
+    [CmdletBinding()]
+    param([string]$Name)
+    return $script:appxPackage
+}
 function global:Get-Process {
     [CmdletBinding()]
     param([string[]]$Name)
@@ -34,7 +40,8 @@ function global:Start-Process {
 $script:failOldCleanup = $false
 function global:Remove-Item {
     [CmdletBinding()]
-    param([string]$LiteralPath, [switch]$Recurse, [switch]$Force, [string]$ErrorAction)
+    # -ErrorAction 由 [CmdletBinding()] 提供，param 里不能再声明一次（否则调用时报参数重复定义）
+    param([string]$LiteralPath, [switch]$Recurse, [switch]$Force)
     if ($script:failOldCleanup -and $LiteralPath -eq "$BASE\staging\Claude.old") { throw 'simulated locked recovery directory' }
     Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
 }
@@ -55,8 +62,25 @@ function Read-Text([string]$path) {
 
 $scriptErrorPreference = $ErrorActionPreference
 try {
+    # MSIX 数据目录发现的分支与旧版优先级；完成后恢复旧版路径执行通用切换回归
+    $legacyData = Join-Path $env:APPDATA 'Claude'
+    $msixData = Join-Path $env:LOCALAPPDATA 'Claude-Data\claude_test_pfn'
+    New-Item -ItemType Directory -Path $msixData -Force | Out-Null
     . $core *> $null
     $ErrorActionPreference = 'Stop'
+    Assert '唯一 MSIX 数据目录回退发现' ($DATA -eq $msixData) "实际=$DATA"
+    $script:appxPackage = [pscustomobject]@{ PackageFamilyName = 'Claude_test_pfn' }
+    Assert 'Appx PackageFamilyName 主路径发现' ((Find-ClaudeDataPath) -eq $msixData)
+    New-Item -ItemType Directory -Path $legacyData -Force | Out-Null
+    Assert '旧版数据目录保持优先' ((Find-ClaudeDataPath) -eq $legacyData)
+    Remove-Item -LiteralPath $legacyData -Recurse -Force
+    $script:appxPackage = $null
+    $secondMsixData = Join-Path $env:LOCALAPPDATA 'Claude-Data\claude_other_pfn'
+    New-Item -ItemType Directory -Path $secondMsixData -Force | Out-Null
+    Assert '多个无包归属的 MSIX 目录不猜测' ((Find-ClaudeDataPath) -eq $legacyData)
+    Remove-Item -LiteralPath $secondMsixData -Recurse -Force
+    Remove-Item -LiteralPath $msixData -Recurse -Force
+    $DATA = $legacyData
 
     $data = $DATA
     $base = $BASE
@@ -113,7 +137,8 @@ try {
     Assert 'keep 路径仍归档在原账号' ((Read-Text "$accounts\A\settings.json") -eq 'shared-A')
     Assert 'keep 暂存成功后清理' (-not (Test-Path -LiteralPath "$base\keep-stage"))
     $status = (@(Invoke-Status) -join "`n")
-    Assert '状态包含 C/D 与账号列表' ($status -match 'hasC=1 hasD=0' -and $status -match 'accounts=A,B')
+    # 空槽位不落盘：切到 C 后 current=C，但 accounts\C 只有真正有数据时才出现
+    Assert '状态包含 C/D 与账号列表' ($status -match 'hasC=0 hasD=0' -and $status -match 'accounts=A,B') "输出=$status"
 
     # 8. 清理失败：数据和指针仍提交到目标账号，归属明确的残留下次可清理
     $script:failOldCleanup = $true
@@ -137,6 +162,20 @@ try {
     Assert '不明旧目录内容不删除' ((Read-Text "$base\staging\Claude.old\only-copy.txt") -eq 'preserve')
     Assert '不明残留时 current 不变' ((Read-Text "$base\current.txt") -eq 'A')
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath "$base\staging\Claude.old" -Recurse -Force
+
+    # 10. 设置界面的同步核心调用必须让 Windows PowerShell 5.1 收到完整 JSON
+    $uiPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'windows\SwitcherUI.ps1'
+    $uiText = Get-Content -LiteralPath $uiPath -Raw -Encoding UTF8
+    foreach ($functionName in @('Quote-UiArgument','Invoke-Core')) {
+        $match = [regex]::Match($uiText, "(?ms)^function $functionName.*?\n\}")
+        Assert "提取界面函数 $functionName" $match.Success
+        if ($match.Success) { Invoke-Expression $match.Value }
+    }
+    $settingsJson = '{"disabled":["DNS"],"allowOptionalFailures":false,"logging":true}'
+    $saveOutput = Invoke-Core @('set-check-config', $settingsJson)
+    Assert '同步调用保存 DNS 跳过设置' ($script:lastCoreExit -eq 0 -and $saveOutput -match '(?m)^OK:') "输出=$saveOutput"
+    $savedConfig = Get-Content -LiteralPath "$base\checks.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert '保存结果包含 DNS 禁用项' (@($savedConfig.disabled) -contains 'DNS')
 } finally {
     $ErrorActionPreference = $scriptErrorPreference
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
