@@ -187,6 +187,24 @@ class SetClientTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("WARN:保镖", result.stdout)
 
+    def test_gui_set_client_syncs_stale_bodyguard_mode(self):
+        self.stub("osascript",
+                  f"#!/bin/sh\n/usr/bin/sed -i '' 's/^MODE=\"[^\"]*\"/MODE=\"flclash\"/' '{self.guard}'\n")
+        env = dict(os.environ, CLAUDE_SWITCHER_CORE=str(self.copy),
+                   HOME=str(self.root), PATH=f"{self.fakebin}:/usr/bin:/bin")
+        result = subprocess.run(["/bin/bash", str(self.copy), "set-client", "flclash", "--gui"],
+                                env=env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OK:系统保镖守护已同步为 flclash", result.stdout)
+        self.assertNotIn("WARN:保镖", result.stdout)
+        self.assertIn('MODE="flclash"', self.guard.read_text(encoding="utf-8"))
+
+    def test_fix_syncs_stale_bodyguard_mode(self):
+        core = SCRIPT.read_text(encoding="utf-8")
+        fix_fn = re.search(r"(?ms)^fix\(\) \{\n.*?^\}", core).group(0)
+        self.assertIn("fail:客户端不一致*", fix_fn)
+        self.assertIn('/Library/Application Support/claude-switcher/claude-bodyguard.sh', fix_fn)
+
     def test_guard_status_fails_closed_on_mode_mismatch(self):
         core = self.copy.read_text(encoding="utf-8")
         match = re.search(r"(?ms)^bodyguard_status\(\) \{\n.*?^\}", core)

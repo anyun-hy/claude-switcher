@@ -422,8 +422,8 @@ final class VM: ObservableObject {
         guard coreAvailable() else { markCoreMissing(); return }
         isBusy = true
         isSwitchingClient = true
-        banner = "正在切换代理客户端…"
-        run(["set-client", key], timeout: operationTimeout) { result in
+        banner = "正在切换代理客户端（若弹出密码框请授权同步系统保镖）…"
+        run(["set-client", key, "--gui"], timeout: operationTimeout) { result in
             self.isSwitchingClient = false
             guard result.succeeded else {
                 self.banner = result.output

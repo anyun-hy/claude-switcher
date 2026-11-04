@@ -1414,12 +1414,29 @@ bodyguard_status() {
         return
     fi
     if [ "$guard_mode" != "$PROXY_MODE" ]; then
-        echo "fail:客户端不一致(核心=$PROXY_MODE,保镖=$guard_mode;请重新运行安装器同步)"
+        echo "fail:客户端不一致(核心=$PROXY_MODE,保镖=$guard_mode;请点一键修复或重新运行安装器同步)"
         return
     fi
     local lastkill
     lastkill=$(tail -1 "$HOME/Library/Logs/claude-bodyguard.log" 2>/dev/null | cut -c1-40)
     echo "ok:${lastkill:-待命}"
+}
+
+# 同步 root 保镖脚本中的 MODE(需管理员权限;仅允许白名单客户端名称)
+sync_bodyguard_mode() {
+    local mode="${1:-$PROXY_MODE}"
+    local guard="/Library/Application Support/claude-switcher/claude-bodyguard.sh"
+    case "$mode" in
+        tag|clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto) ;;
+        *) return 1 ;;
+    esac
+    [ -r "$guard" ] || return 1
+    osascript <<ASEOF >/dev/null 2>&1
+do shell script "/usr/bin/sed -i '' 's/^MODE=\"[^\"]*\"/MODE=\"$mode\"/' '$guard' && /usr/sbin/chown root:wheel '$guard' && /bin/chmod 755 '$guard'" with prompt "切换代理客户端需要同步系统保镖守护进程" with administrator privileges
+ASEOF
+    local new_mode
+    new_mode=$(sed -n 's/^MODE="\([^"]*\)".*/\1/p' "$guard" 2>/dev/null | head -1)
+    [ "$new_mode" = "$mode" ]
 }
 
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
@@ -1670,12 +1687,22 @@ fix() {
     # B. 时区/IPv6/DNS缓存/保镖(需管理员权限,会弹一次密码框)
     tz=$(readlink /etc/localtime 2>/dev/null)
     v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
+    guard_state=$(bodyguard_status)
     adminCmds=""
     [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
     echo "$v6" | grep -qi 'off' || adminCmds="${adminCmds}networksetup -setv6off Wi-Fi; "
     if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
         adminCmds="${adminCmds}cp -X $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ || exit 1; /usr/bin/xattr -d com.apple.quarantine /Library/LaunchDaemons/local.claude-bodyguard.plist 2>/dev/null || true; chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1; "
     fi
+    case "$guard_state" in
+        fail:客户端不一致*)
+            case "$PROXY_MODE" in
+                tag|clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto)
+                    adminCmds="${adminCmds}/usr/bin/sed -i '' 's/^MODE=\"[^\"]*\"/MODE=\"$PROXY_MODE\"/' '/Library/Application Support/claude-switcher/claude-bodyguard.sh' || exit 1; chown root:wheel '/Library/Application Support/claude-switcher/claude-bodyguard.sh' || exit 1; chmod 755 '/Library/Application Support/claude-switcher/claude-bodyguard.sh' || exit 1; "
+                    ;;
+            esac
+            ;;
+    esac
     if [ -n "$adminCmds" ]; then
         adminCmds="${adminCmds}dscacheutil -flushcache; killall -HUP mDNSResponder"
         echo "FIX:修复时区/IPv6/DNS/保镖(需要密码)..."
@@ -1760,6 +1787,8 @@ ASEOF
 # 更换代理客户端:写入 ~/.claude-switcher/config.env(兼容显式指定 CLAUDE_SWITCHER_CORE 的旧测试)
 set_client() {
     mode="${1:-}"
+    local gui_mode=0
+    [ "${2:-}" = "--gui" ] && gui_mode=1
     case "$mode" in
         tag|clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto) ;;
         *) echo "FAIL:用法: claude-switch.sh set-client <tag|clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto>"; return 1 ;;
@@ -1772,9 +1801,19 @@ set_client() {
     fi
     echo "OK:代理客户端已设为 $mode"
     guard_state=$(bodyguard_status)
+    if [ "$gui_mode" -eq 1 ]; then
+        case "$guard_state" in
+            fail:客户端不一致*)
+                if sync_bodyguard_mode "$mode"; then
+                    echo "OK:系统保镖守护已同步为 $mode"
+                    guard_state=$(bodyguard_status)
+                fi
+                ;;
+        esac
+    fi
     case "$guard_state" in
         fail:未安装) echo "INFO:保镖尚未安装,checkdetail 会提示未安装" ;;
-        fail:*) echo "WARN:保镖校验未通过(${guard_state#fail:});请重新运行安装器同步 root 守护脚本(需管理员权限),完成前不要启动 Claude" ;;
+        fail:*) echo "WARN:保镖校验未通过(${guard_state#fail:});请点击「一键修复」或重新运行安装器同步 root 守护脚本(需管理员权限),完成前不要启动 Claude" ;;
     esac
     echo "INFO:重新运行 checkdetail 生效;非 Clash 客户端请在应用内自行添加 Claude 域名置顶规则"
     return 0
@@ -2876,7 +2915,7 @@ case "$operation" in
     status) status ;;
     switch) switch_to "${2:-}" ;;
     set-region) set_region ;;
-    set-client) set_client "${2:-}" ;;
+    set-client) set_client "${2:-}" "${3:-}" ;;
     get-client) get_client ;;
     update) self_update "${2:-}" ;;
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
