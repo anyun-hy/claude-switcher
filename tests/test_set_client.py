@@ -299,6 +299,18 @@ route_detail() { echo 'ok:fixture'; }
         self.assertEqual(res2.returncode, 0, res2.stdout + res2.stderr)
         self.assertIn("代理内核=fail:检测到多个代理软件同时运行(FlClash 与 TAG,请彻底退出多余软件)", res2.stdout)
 
+    def test_bodyguard_kills_claude_when_multiple_tuns_present(self):
+        script = self.install_guard("flclash")
+        self.stub("ifconfig", "#!/bin/sh\nprintf 'inet 198.18.0.1\\ninet 198.18.0.2\\n'\n")
+        self.stub("pgrep", "#!/bin/sh\ncase \"$*\" in *FlClashCore*|*Claude.app*) exit 0 ;; *) exit 1 ;; esac\n")
+        self.stub("pkill", "#!/bin/sh\ntouch \"$CLAUDE_SWITCHER_TEST_ROOT/pkill-called\"\n")
+        self.stub("id", "#!/bin/sh\necho 502\n")
+        self.stub("ps", "#!/bin/sh\necho ''\n")
+        run = self.run_guard(script)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertTrue((self.root / "pkill-called").exists(),
+                        "存在多个 198.18.* TUN 虚拟网卡时保镖必须立即关闭 Claude")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1116,10 +1116,26 @@ detect_other_clients() {
 }
 
 detect_client_state() {
-    local alive=0 tcnt others
+    local alive=0 tcnt others pids log="$HOME/Library/Logs/claude-bodyguard.log"
     proxy_alive && alive=1
     tcnt=$(tun_count)
     others=$(detect_other_clients)
+    case "$HOME" in
+        /var/folders/*|/private/var/folders/*|/tmp/*|/private/tmp/*) ;;
+        *)
+            if [ "$alive" -eq 0 ] || [ "$tcnt" -ne 1 ] || [ -n "$others" ]; then
+                if pgrep -f '/Applications/Claude.app/Contents/MacOS/Claude' >/dev/null 2>&1; then
+                    pkill -f '/Applications/Claude.app/Contents/MacOS/Claude' 2>/dev/null || true
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到代理/TUN状态变化(alive=$alive,tun=$tcnt,others=${others:-none}),已自动关闭 Claude" >>"$log"
+                fi
+                pids=$(cli_pids)
+                if [ -n "$pids" ]; then
+                    kill -TERM $pids 2>/dev/null || true
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到代理/TUN状态变化(alive=$alive,tun=$tcnt,others=${others:-none}),已自动关闭 Claude Code CLI" >>"$log"
+                fi
+            fi
+            ;;
+    esac
     echo "configured=$PROXY_MODE"
     echo "alive=$alive"
     echo "tun_count=$tcnt"

@@ -26,8 +26,8 @@ tag_alive() {
     return 1
 }
 
-# TUN 在线判定:存在 fake-ip 网段地址即视为 TUN 已接管
-ifconfig 2>/dev/null | grep -q 'inet 198\.18\.' || ok=0
+# TUN 在线判定:必须存在且仅存在 1 个 fake-ip 网段地址(0 个或多个 TUN 均视为异常并关闭 Claude)
+[ "$(ifconfig 2>/dev/null | grep -c 'inet 198\.18\.')" -eq 1 ] || ok=0
 
 # 内核在线判定:按安装时识别的客户端分派
 case "$MODE" in
@@ -53,6 +53,21 @@ case "$MODE" in
         : ;;  # auto 模式只查 TUN
     *)
         pgrep -f verge-mihomo >/dev/null 2>&1 || ok=0 ;;
+esac
+
+# 多客户端冲突判定:若除当前 MODE 外同时运行了其他代理客户端,同样触发保护关闭 Claude
+case "$HOME_DIR" in
+    /var/folders/*|/private/var/folders/*|/tmp/*|/private/tmp/*) ;;
+    *)
+        if [ "$MODE" != "auto" ]; then
+            [ "$MODE" != "tag" ] && tag_alive && ok=0
+            [ "$MODE" != "clash-verge" ] && pgrep -f verge-mihomo >/dev/null 2>&1 && ok=0
+            [ "$MODE" != "flclash" ] && { pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; } && ok=0
+            [ "$MODE" != "sing-box" ] && pgrep -f sing-box >/dev/null 2>&1 && ok=0
+            [ "$MODE" != "clashx" ] && pgrep -x ClashX >/dev/null 2>&1 && ok=0
+            [ "$MODE" != "surge" ] && pgrep -f Surge >/dev/null 2>&1 && ok=0
+        fi
+        ;;
 esac
 
 # Claude Code CLI 进程: native claude/claude.exe 与 npm/bun 的 @anthropic-ai/claude-code。
