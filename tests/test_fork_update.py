@@ -54,10 +54,12 @@ class ForkUpdateTests(unittest.TestCase):
         self.curl_log = self.root / "curl.log"
         self.forbidden_log = self.root / "forbidden.log"
         self.app_target = self.root / "Applications/Claude切换器.app"
+        self.daemons_dir = self.root / "LaunchDaemons"
         self.env = dict(os.environ, HOME=str(self.home), TMPDIR=str(self.tmp),
                         PATH=str(self.bin) + ":/usr/bin:/bin:/usr/sbin:/sbin",
                         CLAUDE_SWITCHER_PYTHON=sys.executable,
                         CLAUDE_SWITCHER_APP=str(self.app_target),
+                        CLAUDE_SWITCHER_DAEMONS=str(self.daemons_dir),
                         FIXTURE_ARCHIVE=str(self.archive), CURL_LOG=str(self.curl_log),
                         EXPECTED_UPDATE_URL=UPDATE_URL, FORBIDDEN_LOG=str(self.forbidden_log),
                         SELF_CHECK_MARKER=str(self.root / "self-check-called"))
@@ -299,7 +301,7 @@ chmod 755 "$out"
         self.stub("codesign", "exit 0")
         self.stub("ditto", '/bin/cp -R "$1" "$2"')
         self.stub("chown", "exit 0")
-        self.stub("osascript", 'script="$1"; /bin/bash "$script"')
+        self.stub("osascript", 'script="$2"; /bin/bash "$script"')
         app_src = "// updated SwiftUI source v2\n"
         expected_sha = hashlib.sha256(app_src.encode("utf-8")).hexdigest()
         self.prepare_remote(self.install_candidate("proxy=ok"), app_source=app_src)
