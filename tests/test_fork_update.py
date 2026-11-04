@@ -53,9 +53,11 @@ class ForkUpdateTests(unittest.TestCase):
         self.archive = self.root / "remote.zip"
         self.curl_log = self.root / "curl.log"
         self.forbidden_log = self.root / "forbidden.log"
+        self.app_target = self.root / "Applications/Claude切换器.app"
         self.env = dict(os.environ, HOME=str(self.home), TMPDIR=str(self.tmp),
                         PATH=str(self.bin) + ":/usr/bin:/bin:/usr/sbin:/sbin",
                         CLAUDE_SWITCHER_PYTHON=sys.executable,
+                        CLAUDE_SWITCHER_APP=str(self.app_target),
                         FIXTURE_ARCHIVE=str(self.archive), CURL_LOG=str(self.curl_log),
                         EXPECTED_UPDATE_URL=UPDATE_URL, FORBIDDEN_LOG=str(self.forbidden_log),
                         SELF_CHECK_MARKER=str(self.root / "self-check-called"))
@@ -94,7 +96,7 @@ cp "$FIXTURE_ARCHIVE" "$out"
             self.assertEqual(count, 1, key)
         return text
 
-    def prepare_remote(self, content, manifest="valid", package="claude-switcher-main"):
+    def prepare_remote(self, content, manifest="valid", package="claude-switcher-main", app_source=None):
         if isinstance(content, str):
             content = content.encode("utf-8")
         files = {
@@ -102,11 +104,15 @@ cp "$FIXTURE_ARCHIVE" "$out"
             "daemons/claude-bodyguard.sh": b'HOME_DIR="__HOME__"\nMODE="__PROXY_MODE__"\n',
             "daemons/tz-watchdog.sh": b'HOME_DIR="__HOME__"\nTZV="__TZ_TARGET__"\n',
         }
+        if app_source is not None:
+            files["app/main.swift"] = app_source.encode("utf-8") if isinstance(app_source, str) else app_source
         entries = [(hashlib.sha256(body).hexdigest(), name) for name, body in files.items()]
         if manifest == "wrong-core":
             entries[0] = ("0" * 64, entries[0][1])
         elif manifest == "missing-core":
             entries = entries[1:]
+        elif manifest == "missing-app":
+            entries = [(d, n) for d, n in entries if n != "app/main.swift"]
         elif manifest == "missing-file":
             entries.append(("0" * 64, "core/not-in-archive.sh"))
         elif manifest == "wrong-extra":
@@ -268,6 +274,45 @@ cp "$FIXTURE_ARCHIVE" "$out"
                 self.assertEqual(self.core.read_bytes(), before)
                 self.assertEqual(self.backup.read_bytes(), before)
                 self.assertTrue(Path(self.env["SELF_CHECK_MARKER"]).exists())
+
+    def test_archive_with_unlisted_app_source_fails_verification(self):
+        self.prepare_remote(self.core.read_bytes(), manifest="missing-app", app_source="// new ui\n")
+        before = self.installed_state()
+        run, urls = self.run_core("update-check")
+        self.assert_run(run, False, "校验")
+        self.assertEqual(urls, [UPDATE_URL])
+        self.assertEqual(self.installed_state(), before)
+
+    @unittest.skipUnless(sys.platform == "darwin", "actual updater uses macOS BSD sed/stat/PlistBuddy")
+    def test_gui_update_compiles_app_and_syncs_daemons_via_admin(self):
+        guard = self.appdir / "claude-bodyguard.sh"
+        guard.write_bytes(b"stale guard\n")
+        tz = self.appdir / "tz-watchdog.sh"
+        tz.write_bytes(b"stale tz\n")
+        self.stub("swiftc", '''out=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
+done
+printf '#!/bin/sh\necho new-binary\n' > "$out"
+chmod 755 "$out"
+''')
+        self.stub("codesign", "exit 0")
+        self.stub("ditto", '/bin/cp -R "$1" "$2"')
+        self.stub("chown", "exit 0")
+        self.stub("osascript", 'script="$1"; /bin/bash "$script"')
+        app_src = "// updated SwiftUI source v2\n"
+        expected_sha = hashlib.sha256(app_src.encode("utf-8")).hexdigest()
+        self.prepare_remote(self.install_candidate("proxy=ok"), app_source=app_src)
+        run, urls = self.run_core("update", "--gui")
+        self.assert_run(run, True, "核心脚本更新完成")
+        self.assertIn("界面App", run.stdout)
+        self.assertIn("守护进程", run.stdout)
+        self.assertEqual(urls, [UPDATE_URL])
+        self.assertTrue((self.app_target / "Contents/MacOS/ClaudeSwitcher").is_file())
+        plist_text = (self.app_target / "Contents/Info.plist").read_text(encoding="utf-8")
+        self.assertIn(expected_sha, plist_text)
+        self.assertIn('MODE="tag"', guard.read_text(encoding="utf-8"))
+        self.assertIn('TZV="America/Toronto"', tz.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

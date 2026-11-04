@@ -1812,15 +1812,41 @@ ASEOF
     echo "OK:region=$ctry tz=$ntz locale=$nlocale source=$src"
 }
 
-# 核心更新:拉取自有 main,SHA256 校验+配置注入+自检+失败回滚
-# --check 只检查不写入;--auto 供 LaunchAgent 每12小时调用(静默写 update.log)
+# 应用内/命令行更新:拉取自有 main,SHA256 校验+配置注入+按需重编 App/同步守护+自检+失败回滚
+# --check 只检查不写入;--auto 供 LaunchAgent 每12小时调用(静默写 update.log);--gui 供界面「立即更新」调用
+replace_app_bundle() {
+    local source="$1" target="$2" parent="${2%/*}" stage old=0
+    mkdir -p "$parent" 2>/dev/null || true
+    stage=$(mktemp -d "$parent/.claude-switcher.XXXXXXXX") || return 1
+    if ! ditto "$source" "$stage/new.app" || ! codesign --verify --deep --strict "$stage/new.app" >/dev/null 2>&1; then
+        rm -rf "$stage"
+        return 1
+    fi
+    if [ -e "$target" ]; then
+        if ! mv "$target" "$stage/previous.app"; then
+            rm -rf "$stage"
+            return 1
+        fi
+        old=1
+    fi
+    if ! mv "$stage/new.app" "$target"; then
+        [ "$old" -eq 1 ] && mv "$stage/previous.app" "$target" 2>/dev/null
+        rm -rf "$stage"
+        return 1
+    fi
+    /usr/bin/xattr -dr com.apple.quarantine "$target" 2>/dev/null || true
+    rm -rf "$stage" 2>/dev/null || true
+    return 0
+}
+
 self_update() {
-    auto=0; check=0
+    auto=0; check=0; gui=0
     case "${1:-}" in
         '') ;;
         --auto) auto=1 ;;
         --check) check=1 ;;
-        *) echo "FAIL:用法: claude-switch.sh update [--check|--auto]"; return 1 ;;
+        --gui) gui=1 ;;
+        *) echo "FAIL:用法: claude-switch.sh update [--check|--auto|--gui]"; return 1 ;;
     esac
     # 路径全部从脚本自身位置推导,兼容旧版 LaunchDaemon(root) 混跑时 $HOME 不可靠的场景
     BIN=$(cd "$(dirname "$0")" && pwd)
@@ -1846,22 +1872,64 @@ self_update() {
     if [ ! -s "$NEW/SHA256SUMS" ]; then
         echo "FAIL:无法获取校验清单(SHA256SUMS),已中止"; rm -rf "$tmpd"; return 1
     fi
-    bad=0; saw_core=0
+    bad=0; saw_core=0; saw_app=0
     while read -r sum rel; do
         [ -z "$sum" ] && continue
         [ "$rel" = "core/claude-switch.sh" ] && saw_core=1
+        [ "$rel" = "app/main.swift" ] && saw_app=1
         if [ ! -f "$NEW/$rel" ] || [ "$(shasum -a 256 "$NEW/$rel" | awk '{print $1}')" != "$sum" ]; then
             bad=1; break
         fi
     done < "$NEW/SHA256SUMS"
-    if [ "$bad" -eq 1 ] || [ "$saw_core" -ne 1 ]; then
+    if [ "$bad" -eq 1 ] || [ "$saw_core" -ne 1 ] || { [ -f "$NEW/app/main.swift" ] && [ "$saw_app" -ne 1 ]; }; then
         echo "FAIL:工件校验失败,已中止(不排除网络篡改,可稍后重试或手动 update)"; rm -rf "$tmpd"; return 1
     fi
 
-    # 跳过判断:剔除头部5个配置行后与本地已安装版本比对,无差异即已是最新
+    PM=""; PG=""; CT=""; TZV=""; LCT=""
+    if [ -f "$BIN/claude-switch.sh" ]; then
+        get_cfg() { grep "^$1=\"" "$BIN/claude-switch.sh" | head -1 | cut -d'"' -f2; }
+        PM=$(get_cfg PROXY_MODE); PG=$(get_cfg PROXY_GROUP); CT=$(get_cfg COUNTRY_TARGET)
+        TZV=$(get_cfg TZ_TARGET); LCT=$(get_cfg LOCALE_TARGET)
+    fi
+
+    # 跳过判断:剔除头部5个配置行后比对核心,并检查已安装界面与守护脚本是否需要更新
     strip_cfg() { grep -vE '^(PROXY_MODE|PROXY_GROUP|COUNTRY_TARGET|TZ_TARGET|LOCALE_TARGET)="' "$1"; }
-    if [ -f "$BIN/claude-switch.sh" ] && \
-       diff <(strip_cfg "$BIN/claude-switch.sh") <(strip_cfg "$NEW/core/claude-switch.sh") >/dev/null 2>&1; then
+    core_changed=0
+    if [ ! -f "$BIN/claude-switch.sh" ] || \
+       ! diff <(strip_cfg "$BIN/claude-switch.sh") <(strip_cfg "$NEW/core/claude-switch.sh") >/dev/null 2>&1; then
+        core_changed=1
+    fi
+
+    APPDIR="/Library/Application Support/claude-switcher"
+    daemon_changed=0
+    if [ -f "$APPDIR/claude-bodyguard.sh" ] || [ -f "$APPDIR/tz-watchdog.sh" ]; then
+        [ -z "$PM" ] && PM="clash-verge"
+        [ -z "$TZV" ] && TZV="America/New_York"
+        sed -e "s|__HOME__|$UHOME|g" -e "s|__PROXY_MODE__|$PM|g" "$NEW/daemons/claude-bodyguard.sh" > "$tmpd/bg.new"
+        sed -e "s|__HOME__|$UHOME|g" -e "s|__TZ_TARGET__|$TZV|g" "$NEW/daemons/tz-watchdog.sh" > "$tmpd/tz.new"
+        if ! diff -q "$tmpd/bg.new" "$APPDIR/claude-bodyguard.sh" >/dev/null 2>&1 || \
+           ! diff -q "$tmpd/tz.new" "$APPDIR/tz-watchdog.sh" >/dev/null 2>&1; then
+            daemon_changed=1
+        fi
+    fi
+
+    APP_TARGET="${CLAUDE_SWITCHER_APP:-/Applications/Claude切换器.app}"
+    app_changed=0; remote_app_sha=""
+    if [ -f "$NEW/app/main.swift" ] && [ "$auto" -eq 0 ]; then
+        remote_app_sha=$(shasum -a 256 "$NEW/app/main.swift" | awk '{print $1}')
+        if [ -e "$APP_TARGET" ] || [ -L "$APP_TARGET" ]; then
+            installed_app_sha=$(/usr/libexec/PlistBuddy -c 'Print :ClaudeSwitcherSourceSHA256' "$APP_TARGET/Contents/Info.plist" 2>/dev/null)
+            [ "$installed_app_sha" = "$remote_app_sha" ] || app_changed=1
+        elif [ "$gui" -eq 1 ]; then
+            app_changed=1
+        fi
+    fi
+
+    if [ "$auto" -eq 1 ]; then
+        if [ "$core_changed" -eq 0 ]; then
+            echo "OK:已是最新版本"; rm -rf "$tmpd"; return 0
+        fi
+    elif [ "$core_changed" -eq 0 ] && [ "$app_changed" -eq 0 ] && { [ "$daemon_changed" -eq 0 ] || { [ "$check" -eq 0 ] && [ "$gui" -eq 0 ]; }; }; then
         echo "OK:已是最新版本"; rm -rf "$tmpd"; return 0
     fi
 
@@ -1873,35 +1941,122 @@ self_update() {
         rm -rf "$tmpd"; return 0
     fi
 
-    # 备份现有核心脚本
-    [ -f "$BIN/claude-switch.sh" ] && cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"
-
-    # 替换核心脚本 + 从 .bak 读出5个配置值注入新脚本
-    cp "$NEW/core/claude-switch.sh" "$BIN/claude-switch.sh"
-    PM=""; PG=""; CT=""; TZV=""; LCT=""
-    if [ -f "$BIN/claude-switch.sh.bak" ]; then
-        get_cfg() { grep "^$1=\"" "$BIN/claude-switch.sh.bak" | head -1 | cut -d'"' -f2; }
-        PM=$(get_cfg PROXY_MODE); PG=$(get_cfg PROXY_GROUP); CT=$(get_cfg COUNTRY_TARGET)
-        TZV=$(get_cfg TZ_TARGET); LCT=$(get_cfg LOCALE_TARGET)
-        inject_cfg() { grep -q "^$1=\"" "$BIN/claude-switch.sh.bak" && sed -i '' "s|^$1=\".*\"|$1=\"$2\"|" "$BIN/claude-switch.sh"; }
-        inject_cfg PROXY_MODE "$PM"; inject_cfg PROXY_GROUP "$PG"; inject_cfg COUNTRY_TARGET "$CT"
-        inject_cfg TZ_TARGET "$TZV"; inject_cfg LOCALE_TARGET "$LCT"
-    fi
-    chmod +x "$BIN/claude-switch.sh"
-
-    # 守护进程脚本(root 所有,用户态不可写):与远程模板比对,有差异只提示不自动改
-    APPDIR="/Library/Application Support/claude-switcher"
-    if [ -f "$APPDIR/claude-bodyguard.sh" ] || [ -f "$APPDIR/tz-watchdog.sh" ]; then
-        [ -z "$PM" ] && PM="clash-verge"
-        [ -z "$TZV" ] && TZV="America/New_York"
-        sed -e "s|__HOME__|$UHOME|g" -e "s|__PROXY_MODE__|$PM|g" "$NEW/daemons/claude-bodyguard.sh" > "$tmpd/bg.new"
-        sed -e "s|__HOME__|$UHOME|g" -e "s|__TZ_TARGET__|$TZV|g" "$NEW/daemons/tz-watchdog.sh" > "$tmpd/tz.new"
-        if ! diff -q "$tmpd/bg.new" "$APPDIR/claude-bodyguard.sh" >/dev/null 2>&1 || \
-           ! diff -q "$tmpd/tz.new" "$APPDIR/tz-watchdog.sh" >/dev/null 2>&1; then
-            echo "INFO:守护进程脚本有更新,请运行 installer/安装.command 刷新(需要密码)"
+    # 若需更新 App,先在临时目录编译并签名校验,确保失败时不改动任何已安装文件
+    app_built=""
+    need_admin_app=0
+    if [ "$app_changed" -eq 1 ] && [ "$auto" -eq 0 ]; then
+        if [ -L "$APP_TARGET" ]; then
+            echo "FAIL:应用目标是符号链接,拒绝覆盖: $APP_TARGET"; rm -rf "$tmpd"; return 1
+        fi
+        if [ -e "$APP_TARGET" ]; then
+            bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_TARGET/Contents/Info.plist" 2>/dev/null)
+            if [ "$bundle_id" != "local.claude-switcher" ]; then
+                echo "FAIL:目标不是 Claude 切换器,拒绝覆盖: $APP_TARGET"; rm -rf "$tmpd"; return 1
+            fi
+        fi
+        if ! command -v swiftc >/dev/null 2>&1; then
+            echo "FAIL:未检测到 swiftc,无法编译新版界面 App"; rm -rf "$tmpd"; return 1
+        fi
+        app_built="$tmpd/Claude切换器.app"
+        mkdir -p "$app_built/Contents/MacOS" "$app_built/Contents/Resources"
+        if ! swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" \
+            "$NEW/app/main.swift" -o "$app_built/Contents/MacOS/ClaudeSwitcher" \
+            -framework SwiftUI -framework AppKit >/dev/null 2>&1; then
+            echo "FAIL:新版 App 编译失败,已中止更新"; rm -rf "$tmpd"; return 1
+        fi
+        if [ -f "$NEW/assets/icon-2048.png" ]; then
+            iconset="$tmpd/AppIcon.iconset"
+            mkdir -p "$iconset"
+            for sz in 16 32 128 256 512; do
+                sips -z "$sz" "$sz" "$NEW/assets/icon-2048.png" --out "$iconset/icon_${sz}x${sz}.png" >/dev/null 2>&1
+                sips -z $((sz*2)) $((sz*2)) "$NEW/assets/icon-2048.png" --out "$iconset/icon_${sz}x${sz}@2x.png" >/dev/null 2>&1
+            done
+            iconutil -c icns "$iconset" -o "$app_built/Contents/Resources/AppIcon.icns" 2>/dev/null || true
+        elif [ -f "$APP_TARGET/Contents/Resources/AppIcon.icns" ]; then
+            cp "$APP_TARGET/Contents/Resources/AppIcon.icns" "$app_built/Contents/Resources/AppIcon.icns" 2>/dev/null || true
+        fi
+        cat > "$app_built/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key><string>ClaudeSwitcher</string>
+	<key>CFBundleIdentifier</key><string>local.claude-switcher</string>
+	<key>CFBundleName</key><string>Claude切换器</string>
+	<key>CFBundleDisplayName</key><string>Claude切换器</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>1.0</string>
+	<key>CFBundleVersion</key><string>1</string>
+	<key>LSMinimumSystemVersion</key><string>13.0</string>
+	<key>CFBundleIconFile</key><string>AppIcon</string>
+	<key>ClaudeSwitcherSourceSHA256</key><string>$remote_app_sha</string>
+	<key>NSHighResolutionCapable</key><true/>
+	<key>LSUIElement</key><true/>
+</dict>
+</plist>
+EOF
+        if ! codesign --force --deep -s - "$app_built" >/dev/null 2>&1 || ! codesign --verify --deep --strict "$app_built" >/dev/null 2>&1; then
+            echo "FAIL:新版 App 签名或校验失败,已中止更新"; rm -rf "$tmpd"; return 1
+        fi
+        app_parent="${APP_TARGET%/*}"
+        if [ ! -w "$app_parent" ] || { [ -e "$APP_TARGET" ] && [ ! -w "$APP_TARGET" ]; }; then
+            need_admin_app=1
         fi
     fi
-    rm -rf "$tmpd"
+
+    # 备份现有核心脚本并注入配置
+    if [ "$core_changed" -eq 1 ]; then
+        [ -f "$BIN/claude-switch.sh" ] && cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"
+        cp "$NEW/core/claude-switch.sh" "$BIN/claude-switch.sh"
+        if [ -f "$BIN/claude-switch.sh.bak" ]; then
+            inject_cfg() { grep -q "^$1=\"" "$BIN/claude-switch.sh.bak" && sed -i '' "s|^$1=\".*\"|$1=\"$2\"|" "$BIN/claude-switch.sh"; }
+            inject_cfg PROXY_MODE "$PM"; inject_cfg PROXY_GROUP "$PG"; inject_cfg COUNTRY_TARGET "$CT"
+            inject_cfg TZ_TARGET "$TZV"; inject_cfg LOCALE_TARGET "$LCT"
+        fi
+        chmod +x "$BIN/claude-switch.sh"
+    fi
+
+    # 守护进程与需提权的 App 安装:界面内点击「立即更新」(--gui)时合并一次管理员授权同步;命令行模式仅提示
+    DAEMON_DIR="${CLAUDE_SWITCHER_DAEMONS:-/Library/LaunchDaemons}"
+    daemon_updated=0
+    app_updated=0
+    if [ "$gui" -eq 1 ] && { [ "$daemon_changed" -eq 1 ] || [ "$need_admin_app" -eq 1 ]; }; then
+        admin_script="$tmpd/admin-update.sh"
+        {
+            echo '#!/bin/bash'
+            echo 'set -e'
+            declare -f replace_app_bundle
+            if [ "$need_admin_app" -eq 1 ]; then
+                printf 'replace_app_bundle %q %q\n' "$app_built" "$APP_TARGET"
+            fi
+            if [ "$daemon_changed" -eq 1 ]; then
+                printf 'mkdir -p %q\n' "$APPDIR"
+                printf 'cp %q %q\n' "$tmpd/bg.new" "$APPDIR/claude-bodyguard.sh"
+                printf 'cp %q %q\n' "$tmpd/tz.new" "$APPDIR/tz-watchdog.sh"
+                printf 'chown root:wheel %q %q\n' "$APPDIR/claude-bodyguard.sh" "$APPDIR/tz-watchdog.sh"
+                printf 'chmod 755 %q %q\n' "$APPDIR/claude-bodyguard.sh" "$APPDIR/tz-watchdog.sh"
+                printf '/usr/bin/xattr -d com.apple.quarantine %q %q 2>/dev/null || true\n' "$APPDIR/claude-bodyguard.sh" "$APPDIR/tz-watchdog.sh"
+                printf 'if [ -f %q ]; then launchctl bootout system/local.claude-bodyguard 2>/dev/null || true; launchctl bootstrap system %q; launchctl print system/local.claude-bodyguard >/dev/null 2>&1; fi\n' "$DAEMON_DIR/local.claude-bodyguard.plist" "$DAEMON_DIR/local.claude-bodyguard.plist"
+                printf 'if [ -f %q ]; then launchctl bootout system/local.tz-watchdog 2>/dev/null || true; launchctl bootstrap system %q; launchctl print system/local.tz-watchdog >/dev/null 2>&1; fi\n' "$DAEMON_DIR/local.tz-watchdog.plist" "$DAEMON_DIR/local.tz-watchdog.plist"
+            fi
+        } > "$admin_script"
+        chmod 700 "$admin_script"
+        if ! osascript - "$admin_script" <<'ASEOF' >/dev/null 2>&1
+on run argv
+    do shell script "/bin/bash " & quoted form of item 1 of argv with prompt "Claude 切换器更新需要管理员权限" with administrator privileges
+end run
+ASEOF
+        then
+            [ "$core_changed" -eq 1 ] && [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
+            rm -rf "$tmpd"
+            echo "FAIL:管理员授权取消或系统组件更新失败,已自动回滚"
+            return 1
+        fi
+        [ "$need_admin_app" -eq 1 ] && app_updated=1
+        [ "$daemon_changed" -eq 1 ] && daemon_updated=1
+    elif [ "$daemon_changed" -eq 1 ]; then
+        echo "INFO:守护进程脚本有更新,请运行 installer/安装.command 刷新(需要密码)"
+    fi
 
     # 更新后自检:root(旧版 LaunchDaemon)下切回真实用户执行,避免 defaults 读到 root 的配置
     if [ "$(id -u)" -eq 0 ]; then
@@ -1911,11 +2066,31 @@ self_update() {
         out=$("$BIN/claude-switch.sh" checkdetail 2>&1)
     fi
     if [ -z "$out" ] || echo "$out" | grep -q '=fail'; then
-        [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
+        [ "$core_changed" -eq 1 ] && [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
+        rm -rf "$tmpd"
         echo "FAIL:新版自检未通过,已自动回滚"
         return 1
     fi
-    echo "OK:核心脚本更新完成 $(date '+%Y-%m-%d')；App 与系统守护由安装器更新"
+
+    if [ -n "$app_built" ] && [ "$need_admin_app" -eq 0 ]; then
+        if ! replace_app_bundle "$app_built" "$APP_TARGET"; then
+            [ "$core_changed" -eq 1 ] && [ -f "$BIN/claude-switch.sh.bak" ] && cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh"
+            rm -rf "$tmpd"
+            echo "FAIL:新版 App 替换失败,已自动回滚"
+            return 1
+        fi
+        app_updated=1
+    fi
+    rm -rf "$tmpd"
+
+    extras=""
+    [ "$app_updated" -eq 1 ] && extras="${extras}、界面App"
+    [ "$daemon_updated" -eq 1 ] && extras="${extras}、守护进程"
+    if [ -n "$extras" ]; then
+        echo "OK:核心脚本更新完成 $(date '+%Y-%m-%d')（已同步更新：${extras#、}）"
+    else
+        echo "OK:核心脚本更新完成 $(date '+%Y-%m-%d')；App 与系统守护由安装器更新"
+    fi
     return 0
 }
 
@@ -2553,7 +2728,7 @@ case "$operation" in
     set-check-config) "$0" _support config-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto|--gui]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
 rc=$?
 case "$operation" in

@@ -48,6 +48,7 @@ private final class Fixture {
           get-check-config) cat "$root/check-config"; result get-config ;;
           set-check-config) printf '%s\n' "$2" > "$root/saved-config"; result set-config ;;
           switch) delay switch; cat "$root/switch-output"; result switch ;;
+          update) delay update; cat "$root/update-output"; result update ;;
           fix) delay fix; echo 'FIX:演示修复完成'; result fix ;;
           fingerprint) delay fingerprint; echo 'GPU=ok:演示设备' ;;
           *) exit 2 ;;
@@ -106,6 +107,22 @@ struct MenuBarModelTests {
                 vm.start(); try f.idle(vm)
                 try expect(vm.currentClient == "tag", "应读取 TAG 客户端")
                 try expect(VM.clientChoices.contains { $0.key == "tag" && $0.label == "TAG" }, "客户端列表应包含 TAG")
+            case "in_app_update_relaunch":
+                try f.write("update-output", "OK:已是最新版本\n")
+                let vm = f.vm()
+                var relaunches = 0
+                vm.onRelaunchRequested = { relaunches += 1 }
+                vm.performUpdate(); try f.idle(vm)
+                try expect(f.calls == ["update --gui"], "立即更新应调用 update --gui")
+                try expect(relaunches == 0, "已是最新版本时不应重启应用")
+                try f.write("update-output", "OK:核心脚本更新完成 2026-11-04（已同步更新：界面App）\n")
+                vm.performUpdate(); try f.idle(vm)
+                try expect(relaunches == 1, "更新成功后应请求自动重启应用")
+                try expect(vm.updateText.contains("正在重启 Claude 切换器"), "应提示正在重启")
+                try f.write("update-exit", "1")
+                try f.write("update-output", "FAIL:新版自检未通过,已自动回滚\n")
+                vm.performUpdate(); try f.idle(vm)
+                try expect(relaunches == 1, "更新失败时不应重启应用")
             case "multi_account_status":
                 try f.write("status", "current=A hasA=1 hasB=1 hasC=1 hasD=0 accounts=A,B,C accA=1.2G@2026-10-20 accB=900M@2026-10-19 accC=2.0G@2026-10-18\n")
                 try f.write("switch-output", "OK:已切换到账号 C\n")

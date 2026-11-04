@@ -74,6 +74,8 @@ final class VM: ObservableObject {
     @Published private(set) var lastCheckSummary = "尚未检查"
     @Published var updateText = ""
     @Published var showUpdateSheet = false
+    @Published private(set) var checkingUpdate = false
+    @Published private(set) var updating = false
     @Published private(set) var coreMissing = false
     @Published private(set) var currentClient = ""
     @Published private(set) var isSwitchingClient = false
@@ -108,9 +110,9 @@ final class VM: ObservableObject {
     private let operationTimeout: TimeInterval
     private var started = false
     private var switchRequested = false
-    private var checkingUpdate = false
     private var hideAfterSwitch: DispatchWorkItem?
     var onSwitchCompleted: (() -> Void)?
+    var onRelaunchRequested: (() -> Void)?
 
     init(core: String = NSHomeDirectory() + "/.local/bin/claude-switch.sh",
          checkTimeout: TimeInterval = 45, operationTimeout: TimeInterval = 180) {
@@ -119,7 +121,7 @@ final class VM: ObservableObject {
         self.operationTimeout = operationTimeout
     }
 
-    var canQuit: Bool { !switchRequested && phase != .fixing && phase != .switching }
+    var canQuit: Bool { !switchRequested && !updating && phase != .fixing && phase != .switching }
 
     func start() {
         guard !started else { return }
@@ -458,7 +460,7 @@ final class VM: ObservableObject {
     }
 
     func checkUpdate() {
-        guard !checkingUpdate else { return }
+        guard !checkingUpdate, !updating else { return }
         checkingUpdate = true
         updateText = "正在检查更新…"
         run(["update-check"], timeout: 120) { result in
@@ -466,6 +468,27 @@ final class VM: ObservableObject {
                 ? (result.succeeded ? "检查完成，核心脚本没有返回结果" : "检查失败，请重试")
                 : result.output
             self.checkingUpdate = false
+        }
+    }
+
+    func performUpdate() {
+        guard !isBusy, !checkingUpdate, !updating else { return }
+        guard coreAvailable() else { markCoreMissing(); return }
+        hideAfterSwitch?.cancel()
+        isBusy = true
+        updating = true
+        updateText = "正在更新（下载校验、按需重编界面与同步守护，若弹出密码框请输入开机密码）…"
+        run(["update", "--gui"], timeout: operationTimeout) { result in
+            self.updating = false
+            self.isBusy = false
+            self.updateText = result.output.isEmpty
+                ? (result.succeeded ? "更新完成" : "更新失败，请重试")
+                : result.output
+            guard result.succeeded else { return }
+            if !result.output.contains("已是最新版本") {
+                self.updateText += "\n正在重启 Claude 切换器…"
+                self.onRelaunchRequested?()
+            }
         }
     }
 
@@ -478,7 +501,7 @@ final class VM: ObservableObject {
         return """
         这是「Claude 切换器」的 AI 交接提示词。请先完整阅读交接文档，再开始安装、配置或排障。
 
-        仓库地址：https://github.com/YOURSJEYO/claude-switcher
+        仓库地址：https://github.com/anyun-hy/claude-switcher
         \(agentsLine)
 
         执行要求：
@@ -1159,13 +1182,14 @@ struct UpdateSheet: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("版本更新").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
-                        Text("检查此适配版的核心更新").font(.caption).foregroundColor(ClaudeTheme.muted)
+                        Text("检查并在应用内直接更新核心、界面与系统守护").font(.caption).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
                     Button { dismiss() } label: {
                         Image(systemName: "xmark.circle.fill").font(.title2).foregroundColor(ClaudeTheme.muted)
                     }
                     .buttonStyle(.plain)
+                    .disabled(vm.updating)
                     .accessibilityLabel("关闭")
                 }
 
@@ -1183,8 +1207,8 @@ struct UpdateSheet: View {
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(ClaudeTheme.cardBorder))
 
                 HStack(spacing: 10) {
-                    Button { vm.checkUpdate() } label: {
-                        Label("重新检查", systemImage: "arrow.clockwise")
+                    Button { vm.performUpdate() } label: {
+                        Label(vm.updating ? "正在更新…" : "立即更新", systemImage: "arrow.down.circle.fill")
                             .font(.callout.bold())
                             .padding(.horizontal, 16).padding(.vertical, 7)
                             .background(LinearGradient(colors: [ClaudeTheme.terracotta, ClaudeTheme.terracottaDeep], startPoint: .leading, endPoint: .trailing))
@@ -1192,8 +1216,21 @@ struct UpdateSheet: View {
                             .clipShape(Capsule())
                     }
                     .buttonStyle(.plain)
-                    Button { copyUpdateCheckCommand() } label: {
-                        Label(copied ? "已复制" : "复制检查命令", systemImage: copied ? "checkmark" : "doc.on.doc")
+                    .disabled(vm.checkingUpdate || vm.updating || vm.isBusy)
+
+                    Button { vm.checkUpdate() } label: {
+                        Label(vm.checkingUpdate ? "检查中…" : "重新检查", systemImage: "arrow.clockwise")
+                            .font(.callout.bold())
+                            .padding(.horizontal, 16).padding(.vertical, 7)
+                            .background(ClaudeTheme.iconWell)
+                            .foregroundColor(ClaudeTheme.ink)
+                            .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(vm.checkingUpdate || vm.updating || vm.isBusy)
+
+                    Button { copyUpdateCommand() } label: {
+                        Label(copied ? "已复制" : "复制更新命令", systemImage: copied ? "checkmark" : "doc.on.doc")
                             .font(.callout.bold())
                             .padding(.horizontal, 16).padding(.vertical, 7)
                             .background(ClaudeTheme.iconWell)
@@ -1204,7 +1241,7 @@ struct UpdateSheet: View {
                     Spacer()
                 }
 
-                Text("检查不会安装更新；核心脚本可单独更新，App 与系统守护需运行安装器。")
+                Text("点击「立即更新」将在应用内完成 SHA256 校验、核心与界面更新（守护脚本变更时会请求管理员授权），更新后自动重启；自检不通过会自动回滚。")
                     .font(.caption2).foregroundColor(ClaudeTheme.muted)
             }
             .padding(20)
@@ -1213,10 +1250,10 @@ struct UpdateSheet: View {
         .preferredColorScheme(.light)
     }
 
-    private func copyUpdateCheckCommand() {
+    private func copyUpdateCommand() {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        _ = pasteboard.setString("~/.local/bin/claude-switch.sh update-check", forType: .string)
+        _ = pasteboard.setString("~/.local/bin/claude-switch.sh update", forType: .string)
         copied = true
     }
 }
@@ -1370,8 +1407,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
         vm.onSwitchCompleted = { [weak self] in self?.mainWindow?.orderOut(nil) }
+        vm.onRelaunchRequested = { [weak self] in self?.relaunchApp() }
         showMainWindow()
         vm.start()
+    }
+
+    func relaunchApp() {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let installed = "/Applications/Claude切换器.app"
+        let appPath = FileManager.default.fileExists(atPath: installed) ? installed : Bundle.main.bundlePath
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "for i in $(seq 1 50); do kill -0 \(pid) 2>/dev/null || break; sleep 0.1; done; open \"$1\"", "_", appPath]
+        try? p.run()
+        NSApplication.shared.terminate(nil)
     }
 
     func showMainWindow() {

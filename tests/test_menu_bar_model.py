@@ -1,5 +1,6 @@
 """macOS menu-bar regression tests. Only fake scripts under _trash are executed."""
 from pathlib import Path
+import os
 import platform
 import shutil
 import subprocess
@@ -8,7 +9,7 @@ import unittest
 
 PROJECT = Path(__file__).resolve().parents[1]
 SCENARIOS = (
-    "startup_once", "tag_client_recognized", "multi_account_status", "first_use_cd_note", "legacy_status_fallback",
+    "startup_once", "tag_client_recognized", "in_app_update_relaunch", "multi_account_status", "first_use_cd_note", "legacy_status_fallback",
     "invalid_multi_account_status", "warnings_allowed", "skipped_optional_allowed", "settings_round_trip", "local_status_refresh", "fresh_audit", "failed_check",
     "incomplete_check", "duplicate_check", "duplicate_overwrite", "empty_check",
     "unknown_check_code", "empty_check_code", "nonzero_check", "timeout_check",
@@ -44,8 +45,10 @@ class MenuBarModelTests(unittest.TestCase):
 
 def scenario_test(name):
     def test(self):
+        env = dict(os.environ)
+        env.pop("BASH_ENV", None)
         result = subprocess.run(
-            [str(self.binary), name], cwd=PROJECT,
+            [str(self.binary), name], cwd=PROJECT, env=env,
             capture_output=True, text=True, timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

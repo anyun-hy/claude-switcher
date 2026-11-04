@@ -15,9 +15,10 @@ macOS 核心的更新源固定为 **`anyun-hy/claude-switcher` 的 `main`**，�
 
 | 入口 | 行为 |
 |---|---|
-| `update-check` / `update --check` | 下载自己仓库 `main` 的归档，使用归档内同一快照的 `SHA256SUMS` 校验后比较核心脚本。只检查，不替换已安装核心、不修改运行配置、不创建更新备份。 |
-| `update` / `update --auto` | 复用上游的核心更新流程：校验、备份、保留配置、安装核心、自检，失败时回滚。`--auto` 供既有用户态 LaunchAgent 调用。 |
-| 安装器 | 安装或更新 App、root 保镖与时区守护等组件，并同步客户端配置；核心更新命令不会自动替换这些组件。 |
+| `update-check` / `update --check` | 下载自己仓库 `main` 的归档，使用归档内同一快照的 `SHA256SUMS` 校验后比较核心、界面与守护脚本。只检查，不替换已安装文件、不修改运行配置、不创建更新备份。 |
+| 界面「立即更新」(`update --gui`) | 在应用内完成下载、校验、核心更新、按需重编并替换 `/Applications/Claude切换器.app`、按需请求一次管理员权限同步 root 守护脚本，自检通过后自动重启应用（失败自动回滚）。 |
+| `update` / `update --auto` | 命令行或 LaunchAgent 更新核心脚本（命令行下若界面源码变化且目录可写也会同步重编 App）；`--auto` 供用户态 LaunchAgent 后台静默更新核心，不弹窗、不中断运行中界面。 |
+| 安装器 | 首次安装或手动完整重装核心、App、root 保镖与时区守护等组件，并同步客户端配置。 |
 
 版本内容比较忽略 `PROXY_MODE`、`PROXY_GROUP`、`COUNTRY_TARGET`、`TZ_TARGET`、`LOCALE_TARGET` 五个运行配置项，更新时保留它们的本机值。检查和实际更新使用相同的下载、校验与比较方式，不再依赖固定的上游核心哈希，也不永久禁用 TAG 模式的更新。
 

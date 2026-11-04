@@ -391,6 +391,7 @@ if [ -f "$PNG" ]; then
     iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns" 2>/dev/null \
         && echo "✓ 图标已生成" || echo "⚠️  图标生成失败(不影响使用)"
 fi
+APP_SHA=$(shasum -a 256 "$REPO/app/main.swift" | awk '{print $1}')
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -405,6 +406,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<key>CFBundleVersion</key><string>1</string>
 	<key>LSMinimumSystemVersion</key><string>13.0</string>
 	<key>CFBundleIconFile</key><string>AppIcon</string>
+	<key>ClaudeSwitcherSourceSHA256</key><string>$APP_SHA</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>LSUIElement</key><true/>
 </dict>
