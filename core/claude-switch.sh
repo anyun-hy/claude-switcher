@@ -1072,11 +1072,76 @@ proxy_alive() {
         sing-box)     pgrep -f sing-box >/dev/null 2>&1 ;;
         clashx)       pgrep -x ClashX >/dev/null 2>&1 || pgrep -f clash >/dev/null 2>&1 ;;
         surge)        pgrep -f Surge >/dev/null 2>&1 ;;
-        auto)         tag_alive || pgrep -f verge-mihomo >/dev/null 2>&1 || shadowrocket_up \
+        auto)         tag_alive || pgrep -f verge-mihomo >/dev/null 2>&1 \
+                      || pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1 \
+                      || shadowrocket_up \
                       || pgrep -f sing-box >/dev/null 2>&1 \
                       || pgrep -x ClashX >/dev/null 2>&1 || pgrep -f clash >/dev/null 2>&1 \
                       || pgrep -f Surge >/dev/null 2>&1 ;;
         *)            pgrep -f verge-mihomo >/dev/null 2>&1 ;;
+    esac
+}
+
+# 当当前配置的客户端未运行时(或切到了另一款客户端),自动探测系统中实际正在运行的代理客户端
+detect_running_client() {
+    local found="" count=0
+    if tag_alive; then
+        found="tag"; count=$((count + 1))
+    fi
+    if pgrep -f verge-mihomo >/dev/null 2>&1; then
+        found="clash-verge"; count=$((count + 1))
+    fi
+    if pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; then
+        found="flclash"; count=$((count + 1))
+    fi
+    if pgrep -f sing-box >/dev/null 2>&1; then
+        found="sing-box"; count=$((count + 1))
+    fi
+    if pgrep -x ClashX >/dev/null 2>&1; then
+        found="clashx"; count=$((count + 1))
+    fi
+    if pgrep -f Surge >/dev/null 2>&1; then
+        found="surge"; count=$((count + 1))
+    fi
+    if [ "$count" -eq 1 ]; then
+        echo "$found"
+        return 0
+    fi
+    # 若多个客户端同时打开(例如 TAG 断开后仍驻留非 root 子进程),优先识别以 root(UID 0) 运行 TUN 的内核
+    local root_found="" root_count=0
+    if ps -axo uid=,comm= 2>/dev/null | awk '$1 == 0 && $2 == "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin" { found=1 } END { exit !found }'; then
+        root_found="tag"; root_count=$((root_count + 1))
+    fi
+    if ps -axo uid=,comm= 2>/dev/null | awk '$1 == 0 && $2 ~ /FlClashCore$/ { found=1 } END { exit !found }'; then
+        root_found="flclash"; root_count=$((root_count + 1))
+    fi
+    if ps -axo uid=,comm= 2>/dev/null | awk '$1 == 0 && $2 ~ /verge-mihomo$/ { found=1 } END { exit !found }'; then
+        root_found="clash-verge"; root_count=$((root_count + 1))
+    fi
+    [ "$root_count" -eq 1 ] && echo "$root_found"
+}
+
+detect_client_state() {
+    local alive=0 running=""
+    proxy_alive && alive=1
+    running=$(detect_running_client)
+    echo "configured=$PROXY_MODE"
+    echo "alive=$alive"
+    echo "running=${running:-none}"
+}
+
+auto_sync_running_client() {
+    [ "$PROXY_MODE" = "auto" ] && return 0
+    local detected
+    detected=$(detect_running_client)
+    [ -n "$detected" ] || return 0
+    [ "$detected" != "$PROXY_MODE" ] || return 0
+    PROXY_MODE="$detected"
+    save_runtime_config 2>/dev/null || true
+    case "$(bodyguard_status)" in
+        fail:客户端不一致*)
+            sync_bodyguard_mode "$detected" 2>/dev/null || true
+            ;;
     esac
 }
 
@@ -1442,6 +1507,7 @@ ASEOF
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
 checkdetail() {
     load_check_config || { echo "检查配置无效，请恢复默认设置"; return 1; }
+    auto_sync_running_client
     if proxy_alive; then
         case "$PROXY_MODE" in
             shadowrocket) echo '代理内核=ok:Shadowrocket 已连接' ;;
@@ -2917,6 +2983,7 @@ case "$operation" in
     set-region) set_region ;;
     set-client) set_client "${2:-}" "${3:-}" ;;
     get-client) get_client ;;
+    detect-client) detect_client_state ;;
     update) self_update "${2:-}" ;;
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     open-safe) open_safe "${2:-}" ;;
@@ -2934,7 +3001,7 @@ case "$operation" in
 esac
 rc=$?
 case "$operation" in
-    get-check-config|set-check-config|export-diagnostics) ;;
+    get-check-config|set-check-config|export-diagnostics|detect-client) ;;
     *) log_result "$started_at" "$operation" "$rc" "$summary" ;;
 esac
 exit "$rc"
