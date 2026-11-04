@@ -45,6 +45,9 @@ class ForkUpdateTests(unittest.TestCase):
         self.base = self.home / ".claude-switcher"
         (self.base / "accounts").mkdir(parents=True)
         (self.base / "checks.json").write_text('{"logging": false}\n', encoding="utf-8")
+        self.stun = self.base / "stun-probe.py"
+        self.stun_source = (ROOT / "core/stun-probe.py").read_bytes()
+        self.stun.write_bytes(self.stun_source)
         self.original = SOURCE.read_text(encoding="utf-8").replace(
             'APPDIR="/Library/Application Support/claude-switcher"',
             'APPDIR="' + str(self.appdir) + '"')
@@ -98,23 +101,34 @@ cp "$FIXTURE_ARCHIVE" "$out"
             self.assertEqual(count, 1, key)
         return text
 
-    def prepare_remote(self, content, manifest="valid", package="claude-switcher-main", app_source=None):
+    def prepare_remote(self, content, manifest="valid", package="claude-switcher-main",
+                       app_source=None, stun_source=None):
         if isinstance(content, str):
             content = content.encode("utf-8")
+        if stun_source is None:
+            stun_source = self.stun_source
+        elif isinstance(stun_source, str):
+            stun_source = stun_source.encode("utf-8")
         files = {
             "core/claude-switch.sh": content,
+            "core/stun-probe.py": stun_source,
             "daemons/claude-bodyguard.sh": b'HOME_DIR="__HOME__"\nMODE="__PROXY_MODE__"\n',
             "daemons/tz-watchdog.sh": b'HOME_DIR="__HOME__"\nTZV="__TZ_TARGET__"\n',
         }
         if app_source is not None:
             files["app/main.swift"] = app_source.encode("utf-8") if isinstance(app_source, str) else app_source
+            files["scripts/build-app.sh"] = (ROOT / "scripts/build-app.sh").read_bytes()
         entries = [(hashlib.sha256(body).hexdigest(), name) for name, body in files.items()]
         if manifest == "wrong-core":
             entries[0] = ("0" * 64, entries[0][1])
         elif manifest == "missing-core":
-            entries = entries[1:]
+            entries = [e for e in entries if e[1] != "core/claude-switch.sh"]
+        elif manifest == "missing-stun":
+            entries = [e for e in entries if e[1] != "core/stun-probe.py"]
         elif manifest == "missing-app":
             entries = [(d, n) for d, n in entries if n != "app/main.swift"]
+        elif manifest == "missing-build":
+            entries = [(d, n) for d, n in entries if n != "scripts/build-app.sh"]
         elif manifest == "missing-file":
             entries.append(("0" * 64, "core/not-in-archive.sh"))
         elif manifest == "wrong-extra":
@@ -248,16 +262,19 @@ cp "$FIXTURE_ARCHIVE" "$out"
         ui = self.home / "Applications/Claude Switcher.app/Contents/MacOS/applet"
         ui.parent.mkdir(parents=True)
         ui.write_bytes(b"existing UI\n")
-        self.prepare_remote(self.install_candidate("proxy=ok"))
+        candidate = self.install_candidate("proxy=ok")
+        self.prepare_remote(candidate, stun_source="# updated stun probe v2\n")
         run, urls = self.run_core("update")
         self.assert_run(run, True, "核心脚本更新完成")
+        self.assertIn("STUN探针", run.stdout)
         self.assertIn("请运行 installer/安装.command", run.stdout)
         self.assertEqual(urls, [UPDATE_URL])
         self.assertEqual(self.backup.read_bytes(), before)
-        installed = self.core.read_text()
-        self.assertIn("# installed fork candidate", installed)
+        self.assertEqual(self.core.read_text(encoding="utf-8"), candidate)
+        cfg_text = (self.base / "config.env").read_text(encoding="utf-8")
         for key, value in LOCAL_CONFIG.items():
-            self.assertIn(key + '="' + value + '"', installed)
+            self.assertIn(key + '="' + value + '"', cfg_text)
+        self.assertEqual(self.stun.read_text(encoding="utf-8"), "# updated stun probe v2\n")
         self.assertTrue(os.access(self.core, os.X_OK))
         self.assertTrue(Path(self.env["SELF_CHECK_MARKER"]).exists())
         self.assertEqual(guard.read_bytes(), b"existing installed guard\n")
@@ -269,21 +286,27 @@ cp "$FIXTURE_ARCHIVE" "$out"
         for check_result in ("proxy=fail:fixture", ""):
             with self.subTest(check_result=check_result):
                 before = self.core.read_bytes()
-                self.prepare_remote(self.install_candidate(check_result))
+                before_stun = self.stun.read_bytes()
+                self.prepare_remote(self.install_candidate(check_result),
+                                    stun_source="# broken stun candidate\n")
                 run, urls = self.run_core("update")
                 self.assert_run(run, False, "已自动回滚")
                 self.assertEqual(urls, [UPDATE_URL])
                 self.assertEqual(self.core.read_bytes(), before)
                 self.assertEqual(self.backup.read_bytes(), before)
+                self.assertEqual(self.stun.read_bytes(), before_stun)
+                self.assertFalse((self.base / "config.env").exists())
                 self.assertTrue(Path(self.env["SELF_CHECK_MARKER"]).exists())
 
-    def test_archive_with_unlisted_app_source_fails_verification(self):
-        self.prepare_remote(self.core.read_bytes(), manifest="missing-app", app_source="// new ui\n")
-        before = self.installed_state()
-        run, urls = self.run_core("update-check")
-        self.assert_run(run, False, "校验")
-        self.assertEqual(urls, [UPDATE_URL])
-        self.assertEqual(self.installed_state(), before)
+    def test_archive_with_unlisted_app_or_build_or_stun_fails_verification(self):
+        for manifest in ("missing-app", "missing-build", "missing-stun"):
+            with self.subTest(manifest=manifest):
+                self.prepare_remote(self.core.read_bytes(), manifest=manifest, app_source="// new ui\n")
+                before = self.installed_state()
+                run, urls = self.run_core("update-check")
+                self.assert_run(run, False, "校验")
+                self.assertEqual(urls, [UPDATE_URL])
+                self.assertEqual(self.installed_state(), before)
 
     @unittest.skipUnless(sys.platform == "darwin", "actual updater uses macOS BSD sed/stat/PlistBuddy")
     def test_gui_update_compiles_app_and_syncs_daemons_via_admin(self):
@@ -315,6 +338,48 @@ chmod 755 "$out"
         self.assertIn(expected_sha, plist_text)
         self.assertIn('MODE="tag"', guard.read_text(encoding="utf-8"))
         self.assertIn('TZV="America/Toronto"', tz.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "actual updater uses macOS BSD sed/stat/PlistBuddy")
+    def test_gui_update_runs_self_check_before_admin_and_leaves_app_and_daemons_untouched_on_fail(self):
+        guard = self.appdir / "claude-bodyguard.sh"
+        guard.write_bytes(b"stale guard\n")
+        tz = self.appdir / "tz-watchdog.sh"
+        tz.write_bytes(b"stale tz\n")
+        self.stub("swiftc", '''out=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
+done
+printf '#!/bin/sh\necho new-binary\n' > "$out"
+chmod 755 "$out"
+''')
+        self.stub("codesign", "exit 0")
+        # Keep osascript on the forbidden stub! Since self-check fails first, osascript must never be called.
+        before_core = self.core.read_bytes()
+        self.prepare_remote(self.install_candidate("出口IP=fail:CN"), app_source="// updated SwiftUI source v3\n")
+        run, urls = self.run_core("update", "--gui")
+        self.assert_run(run, False, "新版自检未通过,已自动回滚")
+        self.assertEqual(urls, [UPDATE_URL])
+        self.assertEqual(self.core.read_bytes(), before_core)
+        self.assertFalse(self.app_target.exists())
+        self.assertEqual(guard.read_bytes(), b"stale guard\n")
+        self.assertEqual(tz.read_bytes(), b"stale tz\n")
+
+    def test_update_lock_prevents_concurrent_updates_and_recovers_stale_lock(self):
+        lockdir = self.base / "update.lock"
+        lockdir.mkdir(parents=True)
+        (lockdir / "pid").write_text(str(os.getpid()), encoding="utf-8")
+        before = self.installed_state()
+        run, urls = self.run_core("update", "--gui")
+        self.assert_run(run, False, "另一个更新进程正在运行")
+        self.assertEqual(urls, [])
+        self.assertEqual(self.installed_state(), before)
+        # Stale PID should be automatically recovered
+        (lockdir / "pid").write_text("999999", encoding="utf-8")
+        self.prepare_remote(self.original)
+        run, urls = self.run_core("update")
+        self.assert_run(run, True, "已是最新版本")
+        self.assertEqual(urls, [UPDATE_URL])
+        self.assertFalse(lockdir.exists())
 
 
 if __name__ == "__main__":

@@ -29,21 +29,17 @@
 
 首选引导用户运行安装器（双击 `installer/安装.command`，或终端执行它）。如果安装器环境受限，按下面的手动等效步骤执行：
 
-1. 把 `core/claude-switch.sh` 复制为 `~/.local/bin/claude-switch.sh`（可执行），把 `core/stun-probe.py` 放到 `~/.claude-switcher/`
-2. 探测代理客户端并写进脚本顶部 `PROXY_MODE="..."`：存在 Clash Verge 配置目录 → `clash-verge`；否则 `scutil --nc list` 有 Shadowrocket VPN 配置 → `shadowrocket`；都没有则让用户在 clash-verge/shadowrocket/sing-box/clashx/surge/auto 中选择
-3. Clash Verge 模式下，从 `clash-verge.yaml` 的 `proxy-groups:` 找第一个 `type: select` 的组名写进 `PROXY_GROUP="..."`（其他客户端跳过）
-4. 按出口 IP 自动锁定地区目标：多源依次尝试 ipinfo.io（country/timezone）→ ipapi.co（country_code/timezone）→ ifconfig.co（country_iso/timezone）→ Cloudflare trace（loc，时区用国家默认映射），全失败时让用户在 US/JP/TW/HK/SG/GB/DE/FR/KR/AU/CA 中手动选，`FORCE=1` 按 US + America/New_York；country → `COUNTRY_TARGET`，timezone → `TZ_TARGET`，country 经映射表（US→en_US、JP→ja_JP、TW→zh_TW、HK→zh_HK、SG→en_SG、GB→en_GB、DE→de_DE、FR→fr_FR、KR→ko_KR、AU→en_AU、CA→en_CA，其余→en_US）→ `LOCALE_TARGET`，三项都写进脚本头部
+1. 把 `core/claude-switch.sh` 复制为 `~/.local/bin/claude-switch.sh`（可执行，原样复制保持与 `SHA256SUMS` 一致），把 `core/stun-probe.py` 放到 `~/.claude-switcher/`
+2. 探测代理客户端并写进 `~/.claude-switcher/config.env` 的 `PROXY_MODE="..."`（脚本头部保留默认兜底值以兼容老用户）：存在 Clash Verge 配置目录 → `clash-verge`；否则 `scutil --nc list` 有 Shadowrocket VPN 配置 → `shadowrocket`；都没有则让用户在 clash-verge/shadowrocket/sing-box/clashx/surge/auto 中选择
+3. Clash Verge 模式下，从 `clash-verge.yaml` 的 `proxy-groups:` 找第一个 `type: select` 的组名写进 `~/.claude-switcher/config.env` 的 `PROXY_GROUP="..."`（其他客户端跳过）
+4. 按出口 IP 自动锁定地区目标：多源依次尝试 ipinfo.io（country/timezone）→ ipapi.co（country_code/timezone）→ ifconfig.co（country_iso/timezone）→ Cloudflare trace（loc，时区用国家默认映射），全失败时让用户在 US/JP/TW/HK/SG/GB/DE/FR/KR/AU/CA 中手动选，`FORCE=1` 按 US + America/New_York；country → `COUNTRY_TARGET`，timezone → `TZ_TARGET`，country 经映射表（US→en_US、JP→ja_JP、TW→zh_TW、HK→zh_HK、SG→en_SG、GB→en_GB、DE→de_DE、FR→fr_FR、KR→ko_KR、AU→en_AU、CA→en_CA，其余→en_US）→ `LOCALE_TARGET`，三项都写进 `~/.claude-switcher/config.env`（权限 600）
 5. 参照 `daemons/` 目录的模板，物化保镖与时区看门狗脚本（把 `__HOME__` / `__TZ_TARGET__` / `__PROXY_MODE__` 替换为实际值），用 sudo 装入 **root 所有的** `/Library/Application Support/claude-switcher/`（chown root:wheel、chmod 755，用户态不可写防提权）；`local.claude-bodyguard` / `local.tz-watchdog` 两个 LaunchDaemon 安装到 `/Library/LaunchDaemons/`（plist 的 ProgramArguments 已写死指向系统目录，直接 cp 即可）。自动更新 `local.claude-update` 是**用户态 LaunchAgent**：plist 放 `~/Library/LaunchAgents/`，用 `launchctl bootstrap gui/$(id -u)` 注册，不走 root（模板 `daemons/local.claude-update.plist`，每 12 小时跑一次 `update --auto`）
-6. 现场编译界面 App（需要 Xcode 命令行工具，必须带 `-target` 否则新 SDK 产物在老系统拒启动）：
-   ```bash
-   swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" app/main.swift -o Claude切换器.app/Contents/MacOS/ClaudeSwitcher -framework SwiftUI -framework AppKit
-   ```
-   图标用 `assets/icon-2048.png` 经 sips 生成 iconset 再 `iconutil -c icns` 打进 `Contents/Resources/AppIcon.icns`，`Info.plist` 声明 `CFBundleIconFile`，最后 `codesign --force --deep -s -`
+6. 现场编译界面 App（统一调用 `bash scripts/build-app.sh <repo_root> <output_app_path> 1.0`，内部使用 `swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0"` 编译、通过 `sips`/`iconutil` 生成 `AppIcon.icns`、向 `Info.plist` 写入 `ClaudeSwitcherSourceSHA256` 并完成 `codesign` 签名与严格校验）
 7. Clash Verge 模式下通过核心脚本的 `write-merge-rules` 隐藏入口生成「全局扩展脚本」(profiles/Script.js)，直接前置 `config.rules`，保留已有 main，备份并迁移 Merge.yaml 中本项目旧标记块；重启 Clash Verge 后必须验证内核 `/rules`。其他客户端提示用户自行添加 DOMAIN-SUFFIX 置顶规则
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
-日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|tag|shadowrocket|sing-box|clashx|surge|auto）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `cli [args...]`（以当前桌面账号启动 Claude Code，参数原样透传；启动前审计并拒绝认证环境变量覆盖，B–D 首次使用各自登录一次，各账号历史独立）/ `cli-current`（只读输出当前槽位与映射的 CLAUDE_CONFIG_DIR 目录）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto|--gui]` / `update-check`（macOS 更新：更新源为 `anyun-hy/claude-switcher` 的 `main`。`update-check` 与 `update --check` 只下载并校验，忽略 5 个运行配置项后比较内容，不替换已安装文件、不修改运行配置、不创建更新备份；界面内点击「立即更新」调用 `update --gui`，在应用内完成核心更新、按需重编替换 `/Applications/Claude切换器.app` 及按需提权同步 root 守护并自动重启；`--auto` 由用户态 LaunchAgent 每 12 小时调用、静默更新核心并落 `~/.claude-switcher/update.log`；自检含任何 `=fail` 自动回滚）
+日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|tag|shadowrocket|sing-box|clashx|surge|auto）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `cli [args...]`（以当前桌面账号启动 Claude Code，参数原样透传；启动前审计并拒绝认证环境变量覆盖，B–D 首次使用各自登录一次，各账号历史独立）/ `cli-current`（只读输出当前槽位与映射的 CLAUDE_CONFIG_DIR 目录）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto|--gui]` / `update-check`（macOS 更新：更新源为 `anyun-hy/claude-switcher` 的 `main`。`update-check` 与 `update --check` 只下载并校验，比较核心、`stun-probe.py`、界面与守护脚本，不替换已安装文件、不修改运行配置、不创建更新备份；真实更新通过 `~/.claude-switcher/update.lock` 互斥并注册 `trap` 异常回滚，先更新用户态核心与 `stun-probe.py`、写入 `config.env` 并跑 `checkdetail` 自检，自检通过后才替换 `/Applications/Claude切换器.app` 及按需提权同步 root 守护（root 执行前二次校验临时文件 SHA256）；界面内点击「立即更新」调用 `update --gui`（超时 600s）并在完成后自动重启；`--auto` 由用户态 LaunchAgent 每 12 小时调用、静默更新核心与 `stun-probe.py` 并落 `~/.claude-switcher/update.log`。归档内 `SHA256SUMS` 防传输损坏与缺文件，信任根为 GitHub HTTPS 与仓库写权限）
 
 检查设置：`get-check-config` / `set-check-config <json>` 读写 `~/.claude-switcher/checks.json`，App 齿轮与菜单栏也提供设置入口。只允许关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`生态可达性`；禁用项必须真正跳过探测并显示灰色 `skip`，不能当作通过。`allowOptionalFailures` 只把这 6 项的失败降为警告。出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全、root 权限边界与更新 SHA256 等硬性安全项不可关闭或降级。
 
@@ -91,7 +87,7 @@
 2. 切换账号前必须先完全退出 Claude 进程，并等待安装用户的全部 Claude Code CLI 进程退出（TERM 后最多 10 秒）；CLI 未退出时切换必须中止，桌面数据与当前指针保持不变
 3. 不要在日志、文档、Issue 里暴露用户的住宅/代理 IP 与任何凭据
 4. 不要改动 `~/.claude-switcher/accounts/` 下的存档结构
-5. **维护纪律**：`core/`、`daemons/`、`installer/` 下任何文件改动后，提交前必须运行 `scripts/gen-sums.sh` 重新生成根目录 `SHA256SUMS` 并同提交——自动更新靠它校验工件完整性，清单与代码不一致会导致所有用户更新失败
+5. **维护纪律**：`core/`、`app/`、`scripts/build-app.sh`、`daemons/`、`installer/` 下任何文件改动后，提交前必须运行 `scripts/gen-sums.sh` 重新生成根目录 `SHA256SUMS` 并同提交——自动更新靠它校验工件完整性，清单与代码不一致会导致所有用户更新失败
 6. **守护进程脚本只在 root 目录**：`/Library/Application Support/claude-switcher/` 下的保镖/看门狗属 root:wheel，任何功能都不要改回写 `~/.local/bin/` 下的同名脚本（用户可写=提权面）；需要变更时引导用户重跑安装器
 
 ## 问题修复决策规则（Agent 必须遵守）

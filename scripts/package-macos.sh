@@ -38,52 +38,10 @@ trap cleanup EXIT
 mkdir -p "$BUILD"
 rm -rf "$APP" "$ZIP" "$DMG" "$KIT_ZIP"
 
-echo "==> 编译 $APP_NAME $VERSION ($ARCH_LABEL)"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -O -parse-as-library -warnings-as-errors \
-    -target "$ARCH-apple-macos13.0" \
-    "$ROOT/app/main.swift" \
-    -o "$APP/Contents/MacOS/ClaudeSwitcher" \
-    -framework SwiftUI -framework AppKit
-
-echo "==> 生成图标"
-ICONSET="$WORK/AppIcon.iconset"
-mkdir -p "$ICONSET"
-for SZ in 16 32 128 256 512; do
-    sips -z "$SZ" "$SZ" "$ROOT/assets/icon-2048.png" \
-        --out "$ICONSET/icon_${SZ}x${SZ}.png" >/dev/null
-    sips -z $((SZ * 2)) $((SZ * 2)) "$ROOT/assets/icon-2048.png" \
-        --out "$ICONSET/icon_${SZ}x${SZ}@2x.png" >/dev/null
-done
-iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
-
-echo "==> 写入 Info.plist"
-cat > "$APP/Contents/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>CFBundleExecutable</key><string>ClaudeSwitcher</string>
-	<key>CFBundleIdentifier</key><string>local.claude-switcher</string>
-	<key>CFBundleName</key><string>Claude切换器</string>
-	<key>CFBundleDisplayName</key><string>Claude切换器</string>
-	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>$VERSION</string>
-	<key>CFBundleVersion</key><string>$VERSION</string>
-	<key>LSMinimumSystemVersion</key><string>13.0</string>
-	<key>CFBundleIconFile</key><string>AppIcon</string>
-	<key>NSHighResolutionCapable</key><true/>
-	<key>LSUIElement</key><true/>
-</dict>
-</plist>
-EOF
+echo "==> 编译并签名 $APP_NAME $VERSION ($ARCH_LABEL)"
+CLAUDE_SWITCHER_SWIFTC_FLAGS="-warnings-as-errors" bash "$ROOT/scripts/build-app.sh" "$ROOT" "$APP" "$VERSION"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
-
-if codesign --force --deep -s - "$APP" >/dev/null 2>&1; then
-    echo "✓ ad-hoc 签名完成"
-else
-    echo "⚠️ ad-hoc 签名失败，继续打包"
-fi
+echo "✓ App 构建与 ad-hoc 签名完成"
 
 NOTE="$WORK/安装说明.txt"
 cat > "$NOTE" <<'NOTE_EOF'
@@ -120,14 +78,15 @@ done
 for DIR in core daemons installer app; do
     ditto "$ROOT/$DIR" "$KIT_ROOT/$DIR"
 done
-mkdir -p "$KIT_ROOT/assets" "$KIT_ROOT/docs"
+mkdir -p "$KIT_ROOT/assets" "$KIT_ROOT/docs" "$KIT_ROOT/scripts"
 cp "$ROOT/assets/icon-2048.png" "$KIT_ROOT/assets/"
 cp "$ROOT/docs/screenshot.png" "$KIT_ROOT/docs/"
-chmod +x "$KIT_ROOT/installer/安装.command" "$KIT_ROOT/installer/卸载.command"
+cp "$ROOT/scripts/build-app.sh" "$KIT_ROOT/scripts/"
+chmod +x "$KIT_ROOT/installer/安装.command" "$KIT_ROOT/installer/卸载.command" "$KIT_ROOT/scripts/build-app.sh"
 for ITEM in \
     README.md README.en.md AGENTS.md SECURITY.md LICENSE \
     core/claude-switch.sh daemons/claude-bodyguard.sh installer/安装.command \
-    app/main.swift assets/icon-2048.png docs/screenshot.png; do
+    scripts/build-app.sh app/main.swift assets/icon-2048.png docs/screenshot.png; do
     if [ ! -e "$KIT_ROOT/$ITEM" ]; then
         echo "✗ installer kit 缺少 $ITEM" >&2
         exit 1

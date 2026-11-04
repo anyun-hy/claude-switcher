@@ -108,6 +108,7 @@ final class VM: ObservableObject {
     let core: String
     private let checkTimeout: TimeInterval
     private let operationTimeout: TimeInterval
+    private let updateTimeout: TimeInterval
     private var started = false
     private var switchRequested = false
     private var hideAfterSwitch: DispatchWorkItem?
@@ -115,10 +116,12 @@ final class VM: ObservableObject {
     var onRelaunchRequested: (() -> Void)?
 
     init(core: String = NSHomeDirectory() + "/.local/bin/claude-switch.sh",
-         checkTimeout: TimeInterval = 45, operationTimeout: TimeInterval = 180) {
+         checkTimeout: TimeInterval = 45, operationTimeout: TimeInterval = 180,
+         updateTimeout: TimeInterval = 600) {
         self.core = core
         self.checkTimeout = checkTimeout
         self.operationTimeout = operationTimeout
+        self.updateTimeout = updateTimeout
     }
 
     var canQuit: Bool { !switchRequested && !updating && phase != .fixing && phase != .switching }
@@ -478,7 +481,7 @@ final class VM: ObservableObject {
         isBusy = true
         updating = true
         updateText = "正在更新（下载校验、按需重编界面与同步守护，若弹出密码框请输入开机密码）…"
-        run(["update", "--gui"], timeout: operationTimeout) { result in
+        run(["update", "--gui"], timeout: updateTimeout) { result in
             self.updating = false
             self.isBusy = false
             self.updateText = result.output.isEmpty

@@ -15,12 +15,12 @@ macOS 核心的更新源固定为 **`anyun-hy/claude-switcher` 的 `main`**，�
 
 | 入口 | 行为 |
 |---|---|
-| `update-check` / `update --check` | 下载自己仓库 `main` 的归档，使用归档内同一快照的 `SHA256SUMS` 校验后比较核心、界面与守护脚本。只检查，不替换已安装文件、不修改运行配置、不创建更新备份。 |
-| 界面「立即更新」(`update --gui`) | 在应用内完成下载、校验、核心更新、按需重编并替换 `/Applications/Claude切换器.app`、按需请求一次管理员权限同步 root 守护脚本，自检通过后自动重启应用（失败自动回滚）。 |
-| `update` / `update --auto` | 命令行或 LaunchAgent 更新核心脚本（命令行下若界面源码变化且目录可写也会同步重编 App）；`--auto` 供用户态 LaunchAgent 后台静默更新核心，不弹窗、不中断运行中界面。 |
-| 安装器 | 首次安装或手动完整重装核心、App、root 保镖与时区守护等组件，并同步客户端配置。 |
+| `update-check` / `update --check` | 下载自己仓库 `main` 的归档，使用归档内同一快照的 `SHA256SUMS` 校验后比较核心、`stun-probe.py`、界面与守护脚本。只检查，不替换已安装文件、不修改运行配置、不创建更新备份。 |
+| 界面「立即更新」(`update --gui`) | 获取 `~/.claude-switcher/update.lock` 互斥锁并注册 `trap` 异常回滚（界面超时 600 秒），先更新核心脚本、`stun-probe.py` 并写入 `~/.claude-switcher/config.env`，**先执行 `checkdetail` 自检通过后**，再统一通过 `scripts/build-app.sh` 编译替换 `/Applications/Claude切换器.app`、按需请求一次管理员权限同步 root 守护脚本（root 执行前二次校验临时文件 SHA256），完成后自动重启应用（失败或中断自动回滚）。 |
+| `update` / `update --auto` | 命令行或 LaunchAgent 更新核心脚本与 `stun-probe.py`（命令行下若界面源码变化且目录可写也会在自检通过后同步重编 App）；`--auto` 供用户态 LaunchAgent 后台静默更新核心与探针，不弹窗、不中断运行中界面。 |
+| 安装器 | 首次安装或手动完整重装核心、App、root 保镖与时区守护等组件，并将运行配置写入 `~/.claude-switcher/config.env`。 |
 
-版本内容比较忽略 `PROXY_MODE`、`PROXY_GROUP`、`COUNTRY_TARGET`、`TZ_TARGET`、`LOCALE_TARGET` 五个运行配置项，更新时保留它们的本机值。检查和实际更新使用相同的下载、校验与比较方式，不再依赖固定的上游核心哈希，也不永久禁用 TAG 模式的更新。
+运行配置项 `PROXY_MODE`、`PROXY_GROUP`、`COUNTRY_TARGET`、`TZ_TARGET`、`LOCALE_TARGET` 持久化在 `~/.claude-switcher/config.env`（脚本头部保留默认兜底值以兼容老版本升级），使已安装的核心脚本保持与 `SHA256SUMS` 字节一致。归档内的 `SHA256SUMS` 用于防传输损坏与缺文件校验，信任根为 GitHub HTTPS 与自有仓库写权限；提权同步 root 守护与系统目录 App 时，会在 root 脚本内二次核验临时构建产物的 SHA-256 摘要。
 
 修改仓库源码不会自动替换本机已经安装的核心、App 或系统守护；旧版本继续执行它原有的更新逻辑。首次迁移到本 fork 时应从自己的 `main` 运行安装器，之后核心更新才使用上述通道。原作者发布的安装包也不包含本 fork 的 TAG 适配。
 

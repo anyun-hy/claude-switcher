@@ -177,8 +177,8 @@ git clone --branch main https://github.com/anyun-hy/claude-switcher.git
 安装本 fork 后，可在软件底栏或菜单栏打开「检查更新」，点击 **「立即更新」** 直接在软件内完成全量更新并自动重启：
 
 - `claude-switch.sh update-check`（或 `update --check`）检查 [自己仓库的 `main`](https://github.com/anyun-hy/claude-switcher/tree/main)。它下载一次归档，以归档内同一快照的 `SHA256SUMS` 校验工件，忽略五个本机运行配置项比较核心、界面与守护脚本；检查过程不替换文件、不修改配置、不创建更新备份。
-- 在软件内点击「立即更新」（调用 `claude-switch.sh update --gui`）会完成 SHA256 校验、备份并更新核心脚本、按需重编并替换 `/Applications/Claude切换器.app`、按需弹出一次管理员密码框同步 root 守护进程，自检通过后**自动重启应用**（自检不通过自动回滚）。
-- 后台 LaunchAgent 每 12 小时调用 `update --auto` 仅静默更新核心脚本，不弹窗、不打断运行中的界面。上游新代码由维护者验证后合入自己的 `main`，详细流程见 [TAG 适配说明](docs/TAG_ADAPTATION.md)。
+- 在软件内点击「立即更新」（调用 `claude-switch.sh update --gui`，超时放宽至 600 秒）会先获取更新锁（`~/.claude-switcher/update.lock`）并注册 `trap` 异常回滚，随后完成归档内 `SHA256SUMS` 校验、将 5 个运行配置持久化至 `~/.claude-switcher/config.env`（保持核心脚本与 `SHA256SUMS` 字节一致）、更新核心脚本与 `stun-probe.py`，**先执行 `checkdetail` 自检通过后**，再统一通过 `scripts/build-app.sh` 编译替换 `/Applications/Claude切换器.app` 及按需弹窗提权同步 root 守护进程（root 执行前二次校验临时文件 SHA256），最后**自动重启应用**（任何步骤失败或中断均自动回滚）。
+- 后台 LaunchAgent 每 12 小时调用 `update --auto` 仅静默更新核心脚本与 `stun-probe.py`，不弹窗、不打断运行中的界面。归档内的 `SHA256SUMS` 用于防传输损坏与缺文件校验，信任根为 GitHub HTTPS 与自有仓库写权限；上游新代码由维护者验证后合入自己的 `main`，详细流程见 [TAG 适配说明](docs/TAG_ADAPTATION.md)。
 
 开发者可在 macOS 上运行 `python3 -m unittest discover -s tests -v`，其中菜单栏模型测试使用假核心脚本，不访问真实账号或网络。隔离 UI 验证方法见 [tests/MENU-BAR-TESTING.md](tests/MENU-BAR-TESTING.md)。
 

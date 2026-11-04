@@ -285,14 +285,15 @@ mkdir -p "$H/.local/bin" "$H/.claude-switcher" "$H/Library/Logs"
 cp "$REPO/core/claude-switch.sh" "$H/.local/bin/"
 cp "$REPO/core/stun-probe.py" "$H/.claude-switcher/"
 chmod +x "$H/.local/bin/claude-switch.sh"
-# 写入探测到的客户端/代理组名/地区目标
-sed -i '' \
-    -e "s|^PROXY_MODE=\".*\"|PROXY_MODE=\"$MODE\"|" \
-    -e "s|^PROXY_GROUP=\".*\"|PROXY_GROUP=\"$GRP\"|" \
-    -e "s|^COUNTRY_TARGET=\".*\"|COUNTRY_TARGET=\"$CTRY\"|" \
-    -e "s|^TZ_TARGET=\".*\"|TZ_TARGET=\"$TZV\"|" \
-    -e "s|^LOCALE_TARGET=\".*\"|LOCALE_TARGET=\"$LOCALE\"|" \
-    "$H/.local/bin/claude-switch.sh"
+# 写入探测到的客户端/代理组名/地区目标到独立配置文件,保持核心脚本与 SHA256SUMS 一致
+cat > "$H/.claude-switcher/config.env" <<EOF
+PROXY_MODE="$MODE"
+PROXY_GROUP="$GRP"
+COUNTRY_TARGET="$CTRY"
+TZ_TARGET="$TZV"
+LOCALE_TARGET="$LOCALE"
+EOF
+chmod 600 "$H/.claude-switcher/config.env" 2>/dev/null || true
 
 # 保镖/时区看门狗脚本:物化到临时目录,由 sudo 段装入 root 所有的系统目录(用户态不可写,防提权)
 STAGE=$(mktemp -d)
@@ -367,54 +368,13 @@ install_app_bundle() {
 APP_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/claude-switcher-app.XXXXXXXX") || { echo "✗ 无法创建 App 构建目录"; exit 1; }
 APP="$APP_STAGE/Claude切换器.app"
 APP_TARGET="/Applications/Claude切换器.app"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-# 必须带 -target,否则新 SDK 编出的二进制在老系统被拒启动
-if swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" \
-    "$REPO/app/main.swift" -o "$APP/Contents/MacOS/ClaudeSwitcher" \
-    -framework SwiftUI -framework AppKit; then
-    echo "✓ App 编译完成"
+if bash "$REPO/scripts/build-app.sh" "$REPO" "$APP" "1.0"; then
+    echo "✓ App 编译与签名校验完成"
 else
-    echo "✗ App 编译失败。若日志提示 SwiftUIMacros/插件缺失(macOS 26/27 常见),"
+    echo "✗ App 编译或签名失败。若日志提示 SwiftUIMacros/插件缺失(macOS 26/27 常见),"
     echo "  请安装完整 Xcode 后执行: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
     rm -rf "$APP_STAGE"
     read -n 1 -s -r -p "按任意键退出..."; exit 1
-fi
-# 图标: assets/ 里有 PNG 源文件时现场生成 icns
-PNG="$REPO/assets/icon-2048.png"
-if [ -f "$PNG" ]; then
-    ICONSET="$(mktemp -d)/AppIcon.iconset"
-    mkdir -p "$ICONSET"
-    for sz in 16 32 128 256 512; do
-        sips -z "$sz" "$sz" "$PNG" --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null 2>&1
-        sips -z $((sz*2)) $((sz*2)) "$PNG" --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null 2>&1
-    done
-    iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns" 2>/dev/null \
-        && echo "✓ 图标已生成" || echo "⚠️  图标生成失败(不影响使用)"
-fi
-APP_SHA=$(shasum -a 256 "$REPO/app/main.swift" | awk '{print $1}')
-cat > "$APP/Contents/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>CFBundleExecutable</key><string>ClaudeSwitcher</string>
-	<key>CFBundleIdentifier</key><string>local.claude-switcher</string>
-	<key>CFBundleName</key><string>Claude切换器</string>
-	<key>CFBundleDisplayName</key><string>Claude切换器</string>
-	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>1.0</string>
-	<key>CFBundleVersion</key><string>1</string>
-	<key>LSMinimumSystemVersion</key><string>13.0</string>
-	<key>CFBundleIconFile</key><string>AppIcon</string>
-	<key>ClaudeSwitcherSourceSHA256</key><string>$APP_SHA</string>
-	<key>NSHighResolutionCapable</key><true/>
-	<key>LSUIElement</key><true/>
-</dict>
-</plist>
-EOF
-if ! codesign --force --deep -s - "$APP" >/dev/null 2>&1 || ! codesign --verify --deep --strict "$APP"; then
-    rm -rf "$APP_STAGE"
-    echo "✗ App 签名或校验失败，未替换原 App"; exit 1
 fi
 if ! install_app_bundle "$APP" "$APP_TARGET"; then
     rm -rf "$APP_STAGE"
