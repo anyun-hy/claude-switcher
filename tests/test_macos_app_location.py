@@ -34,7 +34,7 @@ class MacAppLocationTests(unittest.TestCase):
         self.stub("pgrep", 'exit "${PROCESS_ABSENT:-1}"')
         self.stub("mv", 'case "$1" in */new.app) [ "${FAIL_NEW_MOVE:-0}" = 1 ] && exit 1 ;; esac\nexec /bin/mv "$@"')
         self.source = self.bundle(self.root / "source.app", "new")
-        self.target = self.root / "Applications" / "Claude切换器.app"
+        self.target = self.root / "Applications" / "Claude Switcher.app"
         self.target.parent.mkdir()
 
     def stub(self, name, body):
@@ -67,8 +67,9 @@ class MacAppLocationTests(unittest.TestCase):
     def test_entrypoints_use_application_and_legacy_paths(self):
         install = INSTALLER.read_text(encoding="utf-8")
         uninstall = UNINSTALLER.read_text(encoding="utf-8")
-        self.assertIn('APP_TARGET="/Applications/Claude切换器.app"', install)
+        self.assertIn('APP_TARGET="/Applications/Claude Switcher.app"', install)
         self.assertIn('install_app_bundle "$APP" "$APP_TARGET"', install)
+        self.assertIn('remove_app_bundle "/Applications/Claude Switcher.app"', uninstall)
         self.assertIn('remove_app_bundle "/Applications/Claude切换器.app"', uninstall)
         self.assertIn('remove_app_bundle "$HOME/Desktop/Claude切换器.app"', uninstall)
         self.assertNotIn('rm -rf "$H/Desktop/Claude切换器.app"', install)

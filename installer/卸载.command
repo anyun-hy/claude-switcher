@@ -27,6 +27,7 @@ remove_app_bundle() {
     fi
 }
 app_removal_failed=0
+remove_app_bundle "/Applications/Claude Switcher.app" || app_removal_failed=1
 remove_app_bundle "/Applications/Claude切换器.app" || app_removal_failed=1
 remove_app_bundle "$HOME/Desktop/Claude切换器.app" || app_removal_failed=1
 rm -f "$HOME/.local/bin/claude-switch.sh" "$HOME/.local/bin/claude-bodyguard.sh" "$HOME/.local/bin/tz-watchdog.sh" "$HOME/.local/bin/local.claude-bodyguard.plist" "$HOME/.local/bin/local.tz-watchdog.plist" "$HOME/.local/bin/local.claude-update.plist" "$HOME/.local/bin/claude-switch.sh.bak" "$HOME/.local/bin/claude-bodyguard.sh.bak" "$HOME/.local/bin/tz-watchdog.sh.bak"

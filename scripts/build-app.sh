@@ -51,8 +51,8 @@ cat > "$APP_OUT/Contents/Info.plist" <<EOF
 <dict>
 	<key>CFBundleExecutable</key><string>ClaudeSwitcher</string>
 	<key>CFBundleIdentifier</key><string>local.claude-switcher</string>
-	<key>CFBundleName</key><string>Claude切换器</string>
-	<key>CFBundleDisplayName</key><string>Claude切换器</string>
+	<key>CFBundleName</key><string>Claude Switcher</string>
+	<key>CFBundleDisplayName</key><string>Claude Switcher</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>$VERSION</string>
 	<key>CFBundleVersion</key><string>$BUILD_VERSION</string>

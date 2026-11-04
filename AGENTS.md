@@ -7,7 +7,7 @@
 
 ## 本 fork 的维护范围
 
-当前维护仓库是 `anyun-hy/claude-switcher`，上游为 `YOURSJEYO/claude-switcher`。仓库同步任务应将 `upstream/main` 合入自己的 `main`，保留集中、少量的 TAG 客户端适配和「应用程序」安装位置，流程见 [TAG 适配说明](docs/TAG_ADAPTATION.md)。macOS 的 `update-check` / `update` 固定读取自己仓库的 `main`，不要把用户更新入口改回原作者仓库。界面内点击「立即更新」（`update --gui`）可直接更新核心、按需重编替换 `/Applications/Claude切换器.app` 并按需提权同步 root 守护后自动重启；后台 `--auto` 仅静默更新核心。TAG 的 Fake-IP 信号不能当作实际路由或置顶规则的证明，也不要自动重写 TAG 规则。
+当前维护仓库是 `anyun-hy/claude-switcher`，上游为 `YOURSJEYO/claude-switcher`。仓库同步任务应将 `upstream/main` 合入自己的 `main`，保留集中、少量的 TAG 客户端适配和「应用程序」安装位置，流程见 [TAG 适配说明](docs/TAG_ADAPTATION.md)。macOS 的 `update-check` / `update` 固定读取自己仓库的 `main`，不要把用户更新入口改回原作者仓库。界面内点击「立即更新」（`update --gui`）可直接更新核心、按需重编替换 `/Applications/Claude Switcher.app` 并按需提权同步 root 守护后自动重启；后台 `--auto` 仅静默更新核心。TAG 的 Fake-IP 信号不能当作实际路由或置顶规则的证明，也不要自动重写 TAG 规则。
 
 下面的安装、系统配置与运行验收流程适用于用户要求安装的任务；单纯同步仓库或检查代码时无需安装、启动应用或修改本机系统配置。
 
@@ -39,7 +39,7 @@
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
-日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|tag|shadowrocket|sing-box|clashx|surge|auto）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `cli [args...]`（以当前桌面账号启动 Claude Code，参数原样透传；启动前审计并拒绝认证环境变量覆盖，B–D 首次使用各自登录一次，各账号历史独立）/ `cli-current`（只读输出当前槽位与映射的 CLAUDE_CONFIG_DIR 目录）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto|--gui]` / `update-check`（macOS 更新：更新源为 `anyun-hy/claude-switcher` 的 `main`。`update-check` 与 `update --check` 只下载并校验，比较核心、`stun-probe.py`、界面与守护脚本，不替换已安装文件、不修改运行配置、不创建更新备份；真实更新通过 `~/.claude-switcher/update.lock` 互斥并注册 `trap` 异常回滚，先更新用户态核心与 `stun-probe.py`、写入 `config.env` 并跑 `checkdetail` 自检，自检通过后才替换 `/Applications/Claude切换器.app` 及按需提权同步 root 守护（root 执行前二次校验临时文件 SHA256）；界面内点击「立即更新」调用 `update --gui`（超时 600s）并在完成后自动重启；`--auto` 由用户态 LaunchAgent 每 12 小时调用、静默更新核心与 `stun-probe.py` 并落 `~/.claude-switcher/update.log`。归档内 `SHA256SUMS` 防传输损坏与缺文件，信任根为 GitHub HTTPS 与仓库写权限）
+日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|tag|shadowrocket|sing-box|clashx|surge|auto）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `cli [args...]`（以当前桌面账号启动 Claude Code，参数原样透传；启动前审计并拒绝认证环境变量覆盖，B–D 首次使用各自登录一次，各账号历史独立）/ `cli-current`（只读输出当前槽位与映射的 CLAUDE_CONFIG_DIR 目录）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto|--gui]` / `update-check`（macOS 更新：更新源为 `anyun-hy/claude-switcher` 的 `main`。`update-check` 与 `update --check` 只下载并校验，比较核心、`stun-probe.py`、界面与守护脚本，不替换已安装文件、不修改运行配置、不创建更新备份；真实更新通过 `~/.claude-switcher/update.lock` 互斥并注册 `trap` 异常回滚，先更新用户态核心与 `stun-probe.py`、写入 `config.env` 并跑 `checkdetail` 自检，自检通过后才替换 `/Applications/Claude Switcher.app` 及按需提权同步 root 守护（root 执行前二次校验临时文件 SHA256）；界面内点击「立即更新」调用 `update --gui`（超时 600s）并在完成后自动重启；`--auto` 由用户态 LaunchAgent 每 12 小时调用、静默更新核心与 `stun-probe.py` 并落 `~/.claude-switcher/update.log`。归档内 `SHA256SUMS` 防传输损坏与缺文件，信任根为 GitHub HTTPS 与仓库写权限）
 
 检查设置：`get-check-config` / `set-check-config <json>` 读写 `~/.claude-switcher/checks.json`，App 齿轮与菜单栏也提供设置入口。只允许关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`生态可达性`；禁用项必须真正跳过探测并显示灰色 `skip`，不能当作通过。`allowOptionalFailures` 只把这 6 项的失败降为警告。出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全、root 权限边界与更新 SHA256 等硬性安全项不可关闭或降级。
 
@@ -154,7 +154,7 @@ Linux 用户使用 `linux/` 下的 bash 版本。**开始之前必须先理解�
 **除非维护者在当次对话中明确要求，否则不得更新/部署维护者本机的已安装版本。** 具体包括：
 
 - 不得覆盖 `~/.local/bin/claude-switch.sh`、`~/.local/bin/local.claude-*.plist`
-- 不得重新编译或替换已安装 App（`/Applications/Claude切换器.app` 或旧版桌面位置）
+- 不得重新编译或替换已安装 App（`/Applications/Claude Switcher.app` 或旧版桌面位置）
 - 不得改动 `/Library/Application Support/claude-switcher/`、`/Library/LaunchDaemons/local.claude-*`、`~/Library/LaunchAgents/local.claude-*`
 - 不得触发本机 `update`、不得执行安装器/卸载器
 

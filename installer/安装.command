@@ -366,8 +366,8 @@ install_app_bundle() {
 
 # ---- 4. 先在临时目录编译 App，再安装到应用程序文件夹 ----
 APP_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/claude-switcher-app.XXXXXXXX") || { echo "✗ 无法创建 App 构建目录"; exit 1; }
-APP="$APP_STAGE/Claude切换器.app"
-APP_TARGET="/Applications/Claude切换器.app"
+APP="$APP_STAGE/Claude Switcher.app"
+APP_TARGET="/Applications/Claude Switcher.app"
 if bash "$REPO/scripts/build-app.sh" "$REPO" "$APP" "1.0"; then
     echo "✓ App 编译与签名校验完成"
 else
@@ -457,7 +457,7 @@ echo "=================================="
 echo ""
 echo "=================================="
 echo "  ✅ 安装完成!"
-echo "  使用: 打开应用程序文件夹中的「Claude切换器」"
+echo "  使用: 打开应用程序文件夹中的「Claude Switcher」"
 echo "  首次使用: 打开后选账号A(自动收编当前登录)"
 echo "  换了其他国家节点后: 运行 claude-switch.sh set-region 一键重新适配"
 echo "  自动更新已启用(每12小时检查一次),也可手动: claude-switch.sh update"

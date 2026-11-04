@@ -16,7 +16,7 @@ macOS 核心的更新源固定为 **`anyun-hy/claude-switcher` 的 `main`**，�
 | 入口 | 行为 |
 |---|---|
 | `update-check` / `update --check` | 下载自己仓库 `main` 的归档，使用归档内同一快照的 `SHA256SUMS` 校验后比较核心、`stun-probe.py`、界面与守护脚本。只检查，不替换已安装文件、不修改运行配置、不创建更新备份。 |
-| 界面「立即更新」(`update --gui`) | 获取 `~/.claude-switcher/update.lock` 互斥锁并注册 `trap` 异常回滚（界面超时 600 秒），先更新核心脚本、`stun-probe.py` 并写入 `~/.claude-switcher/config.env`，**先执行 `checkdetail` 自检通过后**，再统一通过 `scripts/build-app.sh` 编译替换 `/Applications/Claude切换器.app`、按需请求一次管理员权限同步 root 守护脚本（root 执行前二次校验临时文件 SHA256），完成后自动重启应用（失败或中断自动回滚）。 |
+| 界面「立即更新」(`update --gui`) | 获取 `~/.claude-switcher/update.lock` 互斥锁并注册 `trap` 异常回滚（界面超时 600 秒），先更新核心脚本、`stun-probe.py` 并写入 `~/.claude-switcher/config.env`，**先执行 `checkdetail` 自检通过后**，再统一通过 `scripts/build-app.sh` 编译替换 `/Applications/Claude Switcher.app`、按需请求一次管理员权限同步 root 守护脚本（root 执行前二次校验临时文件 SHA256），完成后自动重启应用（失败或中断自动回滚）。 |
 | `update` / `update --auto` | 命令行或 LaunchAgent 更新核心脚本与 `stun-probe.py`（命令行下若界面源码变化且目录可写也会在自检通过后同步重编 App）；`--auto` 供用户态 LaunchAgent 后台静默更新核心与探针，不弹窗、不中断运行中界面。 |
 | 安装器 | 首次安装或手动完整重装核心、App、root 保镖与时区守护等组件，并将运行配置写入 `~/.claude-switcher/config.env`。 |
 

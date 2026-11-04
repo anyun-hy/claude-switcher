@@ -1417,7 +1417,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func relaunchApp() {
         let pid = ProcessInfo.processInfo.processIdentifier
-        let installed = "/Applications/Claude切换器.app"
+        let installed = "/Applications/Claude Switcher.app"
         let appPath = FileManager.default.fileExists(atPath: installed) ? installed : Bundle.main.bundlePath
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")

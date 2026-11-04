@@ -17,7 +17,7 @@ case "$VERSION" in
         ;;
 esac
 
-APP_NAME="Claude切换器"
+APP_NAME="Claude Switcher"
 BUILD="$ROOT/build"
 APP="$BUILD/$APP_NAME.app"
 ARCH="$(uname -m)"

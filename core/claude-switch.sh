@@ -1902,6 +1902,25 @@ update_lock_release() {
     fi
 }
 
+# 原子替换:同目录写临时文件后 mv -f 换 inode。bash 边读边执行脚本,原地 cp 覆盖正在运行的核心
+# 会让旧进程从原字节偏移处继续读取新文件内容并执行。
+atomic_install() {
+    local src="$1" dst="$2" mode="${3:-}" tmp
+    tmp="$(dirname "$dst")/.$(basename "$dst").new.$$"
+    if ! cp "$src" "$tmp" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+    if [ -n "$mode" ] && ! chmod "$mode" "$tmp" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+    if ! mv -f "$tmp" "$dst" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+}
+
 self_update() {
     auto=0; check=0; gui=0
     case "${1:-}" in
@@ -1935,7 +1954,7 @@ self_update() {
     rollback_update() {
         if [ "${core_replaced:-0}" -eq 1 ]; then
             if [ "${had_core:-0}" -eq 1 ] && [ -f "$BIN/claude-switch.sh.bak" ]; then
-                cp "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh" 2>/dev/null || true
+                atomic_install "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh" +x || true
             else
                 rm -f "$BIN/claude-switch.sh" 2>/dev/null || true
             fi
@@ -1943,7 +1962,7 @@ self_update() {
         fi
         if [ "${stun_replaced:-0}" -eq 1 ]; then
             if [ "${had_stun:-0}" -eq 1 ] && [ -f "$BASE/stun-probe.py.bak" ]; then
-                cp "$BASE/stun-probe.py.bak" "$BASE/stun-probe.py" 2>/dev/null || true
+                atomic_install "$BASE/stun-probe.py.bak" "$BASE/stun-probe.py" || true
             else
                 rm -f "$BASE/stun-probe.py" 2>/dev/null || true
             fi
@@ -2057,7 +2076,7 @@ self_update() {
         fi
     fi
 
-    APP_TARGET="${CLAUDE_SWITCHER_APP:-/Applications/Claude切换器.app}"
+    APP_TARGET="${CLAUDE_SWITCHER_APP:-/Applications/Claude Switcher.app}"
     app_changed=0; remote_app_sha=""
     if [ -f "$NEW/app/main.swift" ] && [ "$auto" -eq 0 ]; then
         remote_app_sha=$(shasum -a 256 "$NEW/app/main.swift" | awk '{print $1}')
@@ -2101,7 +2120,7 @@ self_update() {
         if ! command -v swiftc >/dev/null 2>&1; then
             echo "FAIL:未检测到 swiftc,无法编译新版界面 App"; cleanup_update; return 1
         fi
-        app_built="$tmpd/Claude切换器.app"
+        app_built="$tmpd/Claude Switcher.app"
         build_script="$NEW/scripts/build-app.sh"
         [ -f "$build_script" ] || build_script="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/scripts/build-app.sh"
         if ! /bin/bash "$build_script" "$NEW" "$app_built" "1.0" "$APP_TARGET/Contents/Resources/AppIcon.icns" >/dev/null 2>&1; then
@@ -2131,7 +2150,9 @@ self_update() {
             cp "$BASE/stun-probe.py" "$BASE/stun-probe.py.bak"
             had_stun=1
         fi
-        cp "$NEW/core/stun-probe.py" "$BASE/stun-probe.py"
+        if ! atomic_install "$NEW/core/stun-probe.py" "$BASE/stun-probe.py"; then
+            echo "FAIL:无法写入 STUN 探针,已自动回滚"; cleanup_update; return 1
+        fi
         stun_replaced=1
     fi
 
@@ -2140,8 +2161,10 @@ self_update() {
             cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"
             had_core=1
         fi
-        cp "$NEW/core/claude-switch.sh" "$BIN/claude-switch.sh"
-        chmod +x "$BIN/claude-switch.sh"
+        # 必须原子替换:当前进程正在执行的就是该文件
+        if ! atomic_install "$NEW/core/claude-switch.sh" "$BIN/claude-switch.sh" +x; then
+            echo "FAIL:无法写入核心脚本,已自动回滚"; cleanup_update; return 1
+        fi
         core_replaced=1
     fi
 

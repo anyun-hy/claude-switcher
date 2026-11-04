@@ -56,7 +56,7 @@ class ForkUpdateTests(unittest.TestCase):
         self.archive = self.root / "remote.zip"
         self.curl_log = self.root / "curl.log"
         self.forbidden_log = self.root / "forbidden.log"
-        self.app_target = self.root / "Applications/Claude切换器.app"
+        self.app_target = self.root / "Applications/Claude Switcher.app"
         self.daemons_dir = self.root / "LaunchDaemons"
         self.env = dict(os.environ, HOME=str(self.home), TMPDIR=str(self.tmp),
                         PATH=str(self.bin) + ":/usr/bin:/bin:/usr/sbin:/sbin",
@@ -363,6 +363,24 @@ chmod 755 "$out"
         self.assertFalse(self.app_target.exists())
         self.assertEqual(guard.read_bytes(), b"stale guard\n")
         self.assertEqual(tz.read_bytes(), b"stale tz\n")
+
+    @unittest.skipUnless(sys.platform == "darwin", "actual updater uses macOS BSD sed/stat")
+    def test_replacing_running_core_does_not_execute_bytes_from_new_file(self):
+        # bash reads the running script incrementally; an in-place overwrite would make the old
+        # process resume at its byte offset inside the new file. The candidate is padded beyond the
+        # installed core so that any such offset lands on a leak marker followed by a non-zero exit.
+        leak = "echo SELF_OVERWRITE_LEAK; exit 42\n"
+        head = self.install_candidate("proxy=ok") + "exit 0\n"
+        padding = leak * (len(self.core.read_bytes()) // len(leak) + 200)
+        candidate = head + padding
+        self.prepare_remote(candidate)
+        run, urls = self.run_core("update")
+        self.assert_run(run, True, "核心脚本更新完成")
+        self.assertNotIn("SELF_OVERWRITE_LEAK", run.stdout + run.stderr)
+        self.assertEqual(urls, [UPDATE_URL])
+        self.assertEqual(self.core.read_text(encoding="utf-8"), candidate)
+        self.assertTrue(os.access(self.core, os.X_OK))
+        self.assertEqual(list(self.core.parent.glob(".claude-switch.sh.*")), [])
 
     def test_update_lock_prevents_concurrent_updates_and_recovers_stale_lock(self):
         lockdir = self.base / "update.lock"
