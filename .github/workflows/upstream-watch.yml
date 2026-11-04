@@ -1,0 +1,111 @@
+name: upstream-watch
+
+on:
+  schedule:
+    # 每天 01:00 UTC (北京时间 09:00 / 东京时间 10:00) 自动检查上游更新
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: true
+
+jobs:
+  check-upstream:
+    name: Check YOURSJEYO/claude-switcher main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check upstream commits and notify via Issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: YOURSJEYO/claude-switcher
+          UPSTREAM_BRANCH: main
+        run: |
+          set -euo pipefail
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+          UPSTREAM_REF="upstream/${UPSTREAM_BRANCH}"
+          UPSTREAM_SHA=$(git rev-parse --short=12 "${UPSTREAM_REF}")
+          UPSTREAM_FULL_SHA=$(git rev-parse "${UPSTREAM_REF}")
+
+          # 若上游最新提交已在当前 main 历史中，自动关闭已有的 [Upstream Sync] 提醒 Issue
+          if git merge-base --is-ancestor "${UPSTREAM_REF}" HEAD; then
+            echo "✓ 当前 main 已包含上游 ${UPSTREAM_REPO}@${UPSTREAM_SHA}，无需同步。"
+            OPEN_ISSUES=$(gh issue list --state open --search "[Upstream Sync] in:title" --json number --jq '.[].number' || true)
+            for num in $OPEN_ISSUES; do
+              gh issue close "$num" --comment "✅ 上游最新提交 (\`${UPSTREAM_SHA}\`) 已合入 \`main\`，自动关闭此同步提醒。"
+            done
+            exit 0
+          fi
+
+          COMMIT_COUNT=$(git rev-list --count "HEAD..${UPSTREAM_REF}")
+          echo "发现上游 ${UPSTREAM_REPO} 有 ${COMMIT_COUNT} 个未合入的新提交 (最新: ${UPSTREAM_SHA})"
+
+          # 预检合并冲突状态（不提交、不推送）
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge --no-commit --no-ff "${UPSTREAM_REF}" >/dev/null 2>&1; then
+            MERGE_STATUS="✅ **无冲突**：可直接干净合并（合并后需运行 \`scripts/gen-sums.sh\` 更新 \`SHA256SUMS\` 并跑测试）。"
+            git merge --abort 2>/dev/null || git reset --hard HEAD
+          else
+            CONFLICTS=$(git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/' || true)
+            git merge --abort 2>/dev/null || git reset --hard HEAD
+            MERGE_STATUS=$(printf "⚠️ **存在合并冲突**，需按 \`docs/TAG_ADAPTATION.md\` 处理以下文件：\n%s" "${CONFLICTS}")
+          fi
+
+          BODY_FILE=$(mktemp)
+          {
+            echo "## 上游更新提醒 (\`${UPSTREAM_REPO}\`)"
+            echo ""
+            echo "- **上游最新提交**: [\`${UPSTREAM_SHA}\`](https://github.com/${UPSTREAM_REPO}/commit/${UPSTREAM_FULL_SHA})"
+            echo "- **新增提交数量**: \`${COMMIT_COUNT}\`"
+            echo "- **对比链接**: [查看完整 Diff](https://github.com/${UPSTREAM_REPO}/compare/$(git merge-base HEAD "${UPSTREAM_REF}")...${UPSTREAM_FULL_SHA})"
+            echo ""
+            echo "### 合并预检"
+            echo "${MERGE_STATUS}"
+            echo ""
+            echo "### 新增提交列表"
+            git log --format="- [%h](https://github.com/${UPSTREAM_REPO}/commit/%H) %s (%cr)" "HEAD..${UPSTREAM_REF}"
+            echo ""
+            echo "### 变更文件统计"
+            echo '```text'
+            git diff --stat "HEAD...${UPSTREAM_REF}"
+            echo '```'
+            echo ""
+            echo "---"
+            echo "💡 **如何同步**：在本地打开项目，直接对 AI Agent 说："
+            echo "> 请按 \`docs/TAG_ADAPTATION.md\` 将 \`upstream/main\` 同步合入 \`main\`"
+          } > "${BODY_FILE}"
+
+          TITLE="[Upstream Sync] 上游 ${UPSTREAM_REPO} 有 ${COMMIT_COUNT} 个新提交 (${UPSTREAM_SHA})"
+
+          # 检查是否已有同 SHA 的未关闭提醒，避免重复建单
+          SAME_SHA_ISSUE=$(gh issue list --state open --search "[Upstream Sync] (${UPSTREAM_SHA}) in:title" --json number --jq '.[0].number // empty' || true)
+          if [ -n "${SAME_SHA_ISSUE}" ]; then
+            echo "已存在针对 ${UPSTREAM_SHA} 的提醒 Issue #${SAME_SHA_ISSUE}，跳过重复创建。"
+            rm -f "${BODY_FILE}"
+            exit 0
+          fi
+
+          # 若已有旧 SHA 的未关闭提醒，直接更新标题并追加评论；否则新建 Issue
+          EXISTING_ISSUE=$(gh issue list --state open --search "[Upstream Sync] in:title" --json number --jq '.[0].number // empty' || true)
+          if [ -n "${EXISTING_ISSUE}" ]; then
+            gh issue edit "${EXISTING_ISSUE}" --title "${TITLE}" --body-file "${BODY_FILE}"
+            gh issue comment "${EXISTING_ISSUE}" --body "🔔 上游又有新提交推进至 \`${UPSTREAM_SHA}\`（共 ${COMMIT_COUNT} 个待同步提交），已更新正文。"
+            echo "✓ 已更新现有 Issue #${EXISTING_ISSUE}"
+          else
+            gh issue create --title "${TITLE}" --body-file "${BODY_FILE}"
+            echo "✓ 已创建新提醒 Issue"
+          fi
+          rm -f "${BODY_FILE}"
