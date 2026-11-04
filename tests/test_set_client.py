@@ -255,6 +255,50 @@ launchctl() { return 0; }
         self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
         self.assertIn("OK:", ok.stdout)
 
+    def test_detect_and_checkdetail_report_multi_tun_and_other_clients_without_modifying_mode(self):
+        core = self.copy.read_text(encoding="utf-8")
+        checkdetail_fn = re.search(r"(?ms)^checkdetail\(\) \{\n.*?^\}", core).group(0)
+        harness = r"""
+PROXY_MODE="flclash"
+load_check_config() { return 0; }
+check_disabled() { return 1; }
+optional_result() { echo "$2"; }
+client_log_checkdetail() { return 0; }
+save_runtime_config() { echo "MUTATED" >&2; exit 99; }
+COUNTRY_TARGET="US"; TZ_TARGET="America/New_York"; LOCALE_TARGET="en_US"
+BASE="$HOME"
+proxy_name() { echo "FlClash"; }
+detect_other_clients() { echo "TAG"; }
+tun_up() { return 1; }
+tun_count() { echo 2; }
+tun_if() { echo "utun4"; }
+curl() { case "$*" in *cdn-cgi/trace*) printf 'ip=198.51.100.2\nloc=US\n' ;; *) printf '403' ;; esac; }
+iphist_count() { echo 0; }
+readlink() { echo /var/db/timezone/zoneinfo/America/New_York; }
+defaults() { case "$*" in *AppleLocale*) echo en_US ;; *) echo en-US ;; esac; }
+networksetup() { echo 'IPv6: off'; }
+dig() { echo '198.18.0.1'; }
+webrtc_status() { echo 'ok:fixture'; }
+bodyguard_status() { echo 'ok:运行中'; }
+route_ok() { return 0; }
+route_detail() { echo 'ok:fixture'; }
+"""
+        env = dict(os.environ, HOME=str(self.root), PATH=f"{self.fakebin}:/usr/bin:/bin")
+        # 场景 1: 当前配置的 FlClash 已关闭，但检测到 TAG 运行中，且有 2 个 TUN 网卡
+        src_stopped = harness + "\nproxy_alive() { return 1; }\n" + checkdetail_fn + "\ncheckdetail\n"
+        res1 = subprocess.run(["/bin/bash", "-c", src_stopped], env=env, cwd=self.root,
+                              text=True, capture_output=True, timeout=6)
+        self.assertEqual(res1.returncode, 0, res1.stdout + res1.stderr)
+        self.assertIn("代理内核=fail:FlClash 未运行(检测到 TAG 运行中,请手动切换客户端或启动 FlClash)", res1.stdout)
+        self.assertIn("TUN网卡=fail:检测到多个TUN网卡(2个,请关闭多余VPN软件)", res1.stdout)
+
+        # 场景 2: FlClash 与 TAG 同时运行
+        src_both = harness + "\nproxy_alive() { return 0; }\n" + checkdetail_fn + "\ncheckdetail\n"
+        res2 = subprocess.run(["/bin/bash", "-c", src_both], env=env, cwd=self.root,
+                              text=True, capture_output=True, timeout=6)
+        self.assertEqual(res2.returncode, 0, res2.stdout + res2.stderr)
+        self.assertIn("代理内核=fail:检测到多个代理软件同时运行(FlClash 与 TAG,请彻底退出多余软件)", res2.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

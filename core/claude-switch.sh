@@ -1010,8 +1010,13 @@ log_result() {
     "$0" _support log "$command" "$rc" "$(( ($(date +%s) - started) * 1000 ))" "$summary" >/dev/null 2>&1 || true
 }
 
-# TUN 在线判定:存在 fake-ip 网段地址即视为 TUN 已接管(兼容各种 TUN 设备名)
-tun_up() { ifconfig 2>/dev/null | grep -q 'inet 198\.18\.'; }
+# TUN 在线判定:统计 fake-ip 网段地址数量,仅 1 个时视为正常接管,>1 视为多 TUN 冲突
+tun_count() {
+    local c
+    c=$(ifconfig 2>/dev/null | grep -c 'inet 198\.18\.') || c=0
+    echo "${c:-0}"
+}
+tun_up() { [ "$(tun_count)" -eq 1 ]; }
 
 # 代理客户端显示名(供检查细节输出)
 proxy_name() {
@@ -1082,67 +1087,43 @@ proxy_alive() {
     esac
 }
 
-# 当当前配置的客户端未运行时(或切到了另一款客户端),自动探测系统中实际正在运行的代理客户端
-detect_running_client() {
-    local found="" count=0
-    if tag_alive; then
-        found="tag"; count=$((count + 1))
+# 只读探测除当前配置客户端外,系统中是否还有其他代理客户端在运行(绝不自动修改 PROXY_MODE)
+detect_other_clients() {
+    case "$HOME" in
+        /var/folders/*|/private/var/folders/*|/tmp/*|/private/tmp/*) return 0 ;;
+    esac
+    [ "$PROXY_MODE" = "auto" ] && return 0
+    local list=""
+    if [ "$PROXY_MODE" != "tag" ] && tag_alive; then
+        list="${list:+$list/}TAG"
     fi
-    if pgrep -f verge-mihomo >/dev/null 2>&1; then
-        found="clash-verge"; count=$((count + 1))
+    if [ "$PROXY_MODE" != "clash-verge" ] && pgrep -f verge-mihomo >/dev/null 2>&1; then
+        list="${list:+$list/}Clash Verge"
     fi
-    if pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; then
-        found="flclash"; count=$((count + 1))
+    if [ "$PROXY_MODE" != "flclash" ] && { pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; }; then
+        list="${list:+$list/}FlClash"
     fi
-    if pgrep -f sing-box >/dev/null 2>&1; then
-        found="sing-box"; count=$((count + 1))
+    if [ "$PROXY_MODE" != "sing-box" ] && pgrep -f sing-box >/dev/null 2>&1; then
+        list="${list:+$list/}sing-box"
     fi
-    if pgrep -x ClashX >/dev/null 2>&1; then
-        found="clashx"; count=$((count + 1))
+    if [ "$PROXY_MODE" != "clashx" ] && pgrep -x ClashX >/dev/null 2>&1; then
+        list="${list:+$list/}ClashX"
     fi
-    if pgrep -f Surge >/dev/null 2>&1; then
-        found="surge"; count=$((count + 1))
+    if [ "$PROXY_MODE" != "surge" ] && pgrep -f Surge >/dev/null 2>&1; then
+        list="${list:+$list/}Surge"
     fi
-    if [ "$count" -eq 1 ]; then
-        echo "$found"
-        return 0
-    fi
-    # 若多个客户端同时打开(例如 TAG 断开后仍驻留非 root 子进程),优先识别以 root(UID 0) 运行 TUN 的内核
-    local root_found="" root_count=0
-    if ps -axo uid=,comm= 2>/dev/null | awk '$1 == 0 && $2 == "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin" { found=1 } END { exit !found }'; then
-        root_found="tag"; root_count=$((root_count + 1))
-    fi
-    if ps -axo uid=,comm= 2>/dev/null | awk '$1 == 0 && $2 ~ /FlClashCore$/ { found=1 } END { exit !found }'; then
-        root_found="flclash"; root_count=$((root_count + 1))
-    fi
-    if ps -axo uid=,comm= 2>/dev/null | awk '$1 == 0 && $2 ~ /verge-mihomo$/ { found=1 } END { exit !found }'; then
-        root_found="clash-verge"; root_count=$((root_count + 1))
-    fi
-    [ "$root_count" -eq 1 ] && echo "$root_found"
+    echo "$list"
 }
 
 detect_client_state() {
-    local alive=0 running=""
+    local alive=0 tcnt others
     proxy_alive && alive=1
-    running=$(detect_running_client)
+    tcnt=$(tun_count)
+    others=$(detect_other_clients)
     echo "configured=$PROXY_MODE"
     echo "alive=$alive"
-    echo "running=${running:-none}"
-}
-
-auto_sync_running_client() {
-    [ "$PROXY_MODE" = "auto" ] && return 0
-    local detected
-    detected=$(detect_running_client)
-    [ -n "$detected" ] || return 0
-    [ "$detected" != "$PROXY_MODE" ] || return 0
-    PROXY_MODE="$detected"
-    save_runtime_config 2>/dev/null || true
-    case "$(bodyguard_status)" in
-        fail:客户端不一致*)
-            sync_bodyguard_mode "$detected" 2>/dev/null || true
-            ;;
-    esac
+    echo "tun_count=$tcnt"
+    echo "others=${others:-none}"
 }
 
 # 单文件内嵌 Python 的隔离入口;策略从 WEBRTC_POLICY 或持久化文件读取。
@@ -1320,8 +1301,19 @@ check() {
     load_check_config || { echo "FAIL:检查配置无效，请恢复默认设置"; return 1; }
     fails=""
 
-    proxy_alive || fails="$fails;代理内核未运行"
-    tun_up || fails="$fails;TUN网卡不在线"
+    local others tcnt
+    others=$(detect_other_clients)
+    if ! proxy_alive; then
+        fails="$fails;代理内核未运行${others:+(检测到 $others 运行中)}"
+    elif [ -n "$others" ]; then
+        fails="$fails;检测到多个代理客户端同时运行($(proxy_name) 与 $others)"
+    fi
+    tcnt=$(tun_count)
+    if [ "$tcnt" -gt 1 ]; then
+        fails="$fails;检测到多个TUN网卡冲突(${tcnt}个)"
+    elif [ "$tcnt" -ne 1 ]; then
+        fails="$fails;TUN网卡不在线"
+    fi
 
     trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
     ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
@@ -1507,16 +1499,32 @@ ASEOF
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
 checkdetail() {
     load_check_config || { echo "检查配置无效，请恢复默认设置"; return 1; }
-    auto_sync_running_client
+    local others tcnt
+    others=$(detect_other_clients)
     if proxy_alive; then
-        case "$PROXY_MODE" in
-            shadowrocket) echo '代理内核=ok:Shadowrocket 已连接' ;;
-            *) echo "代理内核=ok:$(proxy_name) 运行中" ;;
-        esac
+        if [ -n "$others" ]; then
+            echo "代理内核=fail:检测到多个代理软件同时运行($(proxy_name) 与 $others,请彻底退出多余软件)"
+        else
+            case "$PROXY_MODE" in
+                shadowrocket) echo '代理内核=ok:Shadowrocket 已连接' ;;
+                *) echo "代理内核=ok:$(proxy_name) 运行中" ;;
+            esac
+        fi
     else
-        echo "代理内核=fail:$(proxy_name) 未运行"
+        if [ -n "$others" ]; then
+            echo "代理内核=fail:$(proxy_name) 未运行(检测到 $others 运行中,请手动切换客户端或启动 $(proxy_name))"
+        else
+            echo "代理内核=fail:$(proxy_name) 未运行"
+        fi
     fi
-    if tun_up; then echo 'TUN网卡=ok'; else echo 'TUN网卡=fail:不在线'; fi
+    tcnt=$(tun_count)
+    if [ "$tcnt" -eq 1 ]; then
+        echo 'TUN网卡=ok'
+    elif [ "$tcnt" -gt 1 ]; then
+        echo "TUN网卡=fail:检测到多个TUN网卡(${tcnt}个,请关闭多余VPN软件)"
+    else
+        echo 'TUN网卡=fail:不在线'
+    fi
     trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
     ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
     loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
