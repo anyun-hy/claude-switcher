@@ -31,6 +31,8 @@ remove_app_bundle "/Applications/Claude Switcher.app" || app_removal_failed=1
 remove_app_bundle "/Applications/Claude切换器.app" || app_removal_failed=1
 remove_app_bundle "$HOME/Desktop/Claude切换器.app" || app_removal_failed=1
 rm -f "$HOME/.local/bin/claude-switch.sh" "$HOME/.local/bin/claude-bodyguard.sh" "$HOME/.local/bin/tz-watchdog.sh" "$HOME/.local/bin/local.claude-bodyguard.plist" "$HOME/.local/bin/local.tz-watchdog.plist" "$HOME/.local/bin/local.claude-update.plist" "$HOME/.local/bin/claude-switch.sh.bak" "$HOME/.local/bin/claude-bodyguard.sh.bak" "$HOME/.local/bin/tz-watchdog.sh.bak"
+rm -f "$HOME/.claude-switcher/stun-probe.py" "$HOME/.claude-switcher/config.env" "$HOME/.claude-switcher/checks.json" "$HOME/.claude-switcher/last-check.txt" "$HOME/.claude-switcher/lastip" "$HOME/.claude-switcher/iphistory.log" "$HOME/.claude-switcher/update.log"
+rm -rf "$HOME/Library/Logs/claude-switch.log" "$HOME/Library/Logs/claude-bodyguard.log" "$HOME/Library/Logs/tz-watchdog.log" "$HOME/Library/Logs/claude-switcher"
 echo ""
 if [ "$app_removal_failed" -eq 0 ]; then
     echo "✅ 已卸载。"
