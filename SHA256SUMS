@@ -1,4 +1,4 @@
-cee6aba688547f3a22b1f22edcab71d16803d2b2df1b6b1f276db4613cf1b893  core/claude-switch.sh
+d3edb05b845e129d95a9f193041dc9a2b04a69febe6a8c0e1f9564d8f5f7d066  core/claude-switch.sh
 2c891f5f3cf392a6bb736dacc65a945afe89ae8e4d88e353b04fd1f9cd792ab1  core/stun-probe.py
 bf3b2d6540eb6f34abaeb398a844c66dc96bf080be5ece220decb8bb8d8ee430  app/main.swift
 2bd9f3c28b77f3e0f25ae926f1db8222ae10f13c98d465dcee31e583c209391e  scripts/build-app.sh

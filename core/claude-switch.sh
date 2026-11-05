@@ -2319,12 +2319,19 @@ self_update() {
         check_out=$(printf '%s\n' "$out" | grep -v '^保镖=fail:客户端不一致')
     fi
     if [ "$check_rc" -ne 0 ] || [ -z "$out" ] || printf '%s\n' "$check_out" | grep -q '=fail'; then
+        failed_items=$(printf '%s\n' "$check_out" | sed -n 's/=fail.*//p' | tr '\n' ',' | sed 's/,$//')
+        fail_reason=""
+        if [ -n "$failed_items" ]; then
+            fail_reason="($failed_items)"
+        elif [ "$check_rc" -ne 0 ]; then
+            fail_reason="(退出码 $check_rc)"
+        fi
         rollback_failed=0
         rollback_update || rollback_failed=1
         if [ "$rollback_failed" -ne 0 ]; then
-            echo "FAIL:新版自检未通过,回滚失败;请从 $BIN/claude-switch.sh.bak 手动恢复"
+            echo "FAIL:新版自检未通过${fail_reason},回滚失败;请从 $BIN/claude-switch.sh.bak 手动恢复"
         else
-            echo "FAIL:新版自检未通过,已自动回滚"
+            echo "FAIL:新版自检未通过${fail_reason},已自动回滚"
         fi
         cleanup_update
         return 1
