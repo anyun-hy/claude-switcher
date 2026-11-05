@@ -513,9 +513,18 @@ final class VM: ObservableObject {
                 ? (result.succeeded ? "更新完成" : "更新失败，请重试")
                 : result.output
             guard result.succeeded else { return }
-            if !result.output.contains("已是最新版本") {
+            // 只有界面 App 被替换时才需要重启；仅更新核心或守护无需中断界面。
+            if result.output.contains("已同步更新："), result.output.contains("界面App") {
                 self.updateText += "\n正在重启 Claude 切换器…"
-                self.onRelaunchRequested?()
+                if let relaunch = self.onRelaunchRequested {
+                    relaunch()
+                } else {
+                    self.updateText += "\n无法自动重启，请退出并重新打开切换器。"
+                }
+            } else if !result.output.contains("已是最新版本") {
+                // 核心或守护发生变化时刷新界面结果，等同于原先重启后的首次检查。
+                self.lastObservedState = ""
+                self.refresh()
             }
         }
     }
@@ -1421,6 +1430,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let vm: VM
     private(set) var mainWindow: NSWindow?
     private var monitorTimer: Timer?
+    private var relaunchProcess: Process?
 
     override init() {
         vm = VM()
@@ -1458,14 +1468,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func relaunchApp() {
+        guard vm.canQuit else {
+            vm.updateText += "\n当前操作尚未结束，无法自动重启；请稍后退出并重新打开切换器。"
+            return
+        }
         let pid = ProcessInfo.processInfo.processIdentifier
         let installed = "/Applications/Claude Switcher.app"
         let appPath = FileManager.default.fileExists(atPath: installed) ? installed : Bundle.main.bundlePath
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", "for i in $(seq 1 50); do kill -0 \(pid) 2>/dev/null || break; sleep 0.1; done; open \"$1\"", "_", appPath]
-        try? p.run()
-        NSApplication.shared.terminate(nil)
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        // 旧进程未退出时不能 open，否则只会重新激活旧实例。
+        p.arguments = ["-c", "for i in $(seq 1 50); do if ! kill -0 \(pid) 2>/dev/null; then open \"$1\"; exit $?; fi; sleep 0.1; done; exit 1", "_", appPath]
+        p.terminationHandler = { [weak self] process in
+            guard process.terminationReason != .exit || process.terminationStatus != 0 else { return }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.relaunchProcess = nil
+                self.vm.updateText += "\n自动重启未完成，请从菜单栏退出并重新打开切换器。"
+                self.vm.showUpdateSheet = true
+            }
+        }
+        relaunchProcess = p
+        do {
+            try p.run()
+        } catch {
+            relaunchProcess = nil
+            vm.updateText += "\n无法启动自动重启，请从菜单栏退出并重新打开切换器。"
+            return
+        }
+        // 活动 sheet 会让 AppKit 的退出请求无法完成；先结束 sheet，再在下一轮主循环退出。
+        vm.showUpdateSheet = false
+        if let window = mainWindow, let sheet = window.attachedSheet { window.endSheet(sheet) }
+        DispatchQueue.main.async { NSApplication.shared.terminate(nil) }
     }
 
     func showMainWindow() {
