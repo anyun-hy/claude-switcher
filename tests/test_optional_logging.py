@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 
@@ -37,6 +38,9 @@ class OptionalLoggingTests(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.home),
                         PATH=str(self.bin) + ":/usr/bin:/bin:/usr/sbin:/sbin",
                         CLAUDE_SWITCHER_PYTHON=sys.executable, PYTHONUTF8="1")
+        # Non-interactive shell startup files can override PATH and bypass stubs.
+        self.env.pop("BASH_ENV", None)
+        self.env.pop("ENV", None)
 
     def support(self, *args, input_text=None):
         return subprocess.run(
@@ -66,6 +70,14 @@ esac''')
         self.stub("networksetup", "echo 'IPv6: Off'")
         self.stub("python3", "echo RESULT:203.0.113.10")
         self.stub("launchctl", "exit 1")
+        names = ("pgrep", "ifconfig", "curl", "dig", "readlink", "defaults",
+                 "networksetup", "python3", "launchctl")
+        probe = subprocess.run(
+            ["/bin/bash", "-c", 'for name in "$@"; do command -v "$name"; done', "probe", *names],
+            text=True, capture_output=True, env=self.env, timeout=5)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertEqual(probe.stdout.splitlines(), [str(self.bin / name) for name in names],
+                         "检查前必须确认所有外部探测命令均指向隔离夹具")
 
     def test_settings_validate_allowlist_and_booleans(self):
         for value in ({"disabled": ["出口IP"]}, {"disabled": ["保镖"]},
@@ -105,6 +117,54 @@ esac''')
                          "三次 dig 应全部来自不可关闭的规则置顶检查")
         curl_count = len(re.findall(r"(?m)^curl$", calls))
         self.assertEqual(curl_count, 1, "禁用 ASN 与生态检查后只应探测出口")
+
+    def test_checkdetail_reports_success_details_and_preserves_first_record(self):
+        self.prepare_checkdetail()
+        command = ["/bin/bash", str(self.core), "checkdetail"]
+        first = subprocess.run(command, text=True, capture_output=True, env=self.env, timeout=10)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        for line in ("TUN网卡=ok:检测通过", "IP一致=ok:首次记录",
+                     "时区=ok:America/New_York", "地区=ok:en_US"):
+            self.assertIn(line, first.stdout.splitlines())
+
+        second = subprocess.run(command, text=True, capture_output=True, env=self.env, timeout=10)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("IP一致=ok:与上次一致", second.stdout.splitlines())
+
+    def test_checkdetail_preserves_failure_and_changed_ip_warnings(self):
+        self.prepare_checkdetail()
+        (self.base / "lastip").write_text("192.0.2.1", encoding="utf-8")
+        self.stub("ifconfig", "printf ''")
+        self.stub("readlink", "echo /var/db/timezone/zoneinfo/Asia/Tokyo")
+        self.stub("defaults", "echo ja_JP")
+        run = subprocess.run(["/bin/bash", str(self.core), "checkdetail"],
+                             text=True, capture_output=True, env=self.env, timeout=10)
+        lines = run.stdout.splitlines()
+        self.assertIn("TUN网卡=fail:不在线", lines)
+        self.assertIn("IP一致=warn:192.0.2.1 → 203.0.113.10", lines)
+        self.assertIn("时区=fail:/var/db/timezone/zoneinfo/Asia/Tokyo", lines)
+        self.assertIn("地区=fail:ja_JP", lines)
+
+    def test_ip_history_warning_overrides_matching_ip_detail(self):
+        self.prepare_checkdetail()
+        (self.base / "lastip").write_text("203.0.113.10", encoding="utf-8")
+        now = int(time.time())
+        (self.base / "iphistory.log").write_text(
+            f"192.0.2.1 {now}\n192.0.2.2 {now}\n", encoding="utf-8")
+        run = subprocess.run(["/bin/bash", str(self.core), "checkdetail"],
+                             text=True, capture_output=True, env=self.env, timeout=10)
+        line = next(line for line in run.stdout.splitlines() if line.startswith("IP一致="))
+        self.assertTrue(line.startswith("IP一致=warn:48h内出口IP变化3次"), line)
+        self.assertNotIn("与上次一致", line)
+
+    def test_disabled_ip_consistency_still_skips_history(self):
+        self.prepare_checkdetail()
+        self.write_settings({"disabled": ["IP一致"]})
+        run = subprocess.run(["/bin/bash", str(self.core), "checkdetail"],
+                             text=True, capture_output=True, env=self.env, timeout=10)
+        self.assertIn("IP一致=skip:用户已禁用", run.stdout.splitlines())
+        self.assertFalse((self.base / "lastip").exists())
+        self.assertFalse((self.base / "iphistory.log").exists())
 
     def test_all_six_optional_names_are_accepted(self):
         self.write_settings({"disabled": list(OPTIONAL)})

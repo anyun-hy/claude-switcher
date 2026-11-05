@@ -101,6 +101,18 @@ struct MenuBarModelTests {
                 try f.idle(vm)
                 try expect(f.calls == ["checkdetail", "get-client", "status"], "启动不应重复检查")
                 try expect(vm.phase == .ready && vm.lastCheckSummary == "通过" && vm.current == "A", "初始状态不一致")
+            case "audit_success_details":
+                try f.audit(["TUN网卡": "ok:检测通过", "IP一致": "ok:与上次一致",
+                             "时区": "ok:Asia/Tokyo", "地区": "ok:ja_JP"])
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                for (name, detail) in [("TUN 网卡", "检测通过"), ("IP 与上次一致", "与上次一致"),
+                                       ("时区", "Asia/Tokyo"), ("地区", "ja_JP")] {
+                    guard let row = vm.rows.first(where: { $0.name == name }) else {
+                        throw TestFailure(description: "缺少检查项：\(name)")
+                    }
+                    try expect(row.state == .ok && row.detail == detail, "检查项详情不正确：\(name)")
+                }
             case "tag_client_recognized":
                 try f.write("client", "client=tag\n")
                 let vm = f.vm()

@@ -9,7 +9,7 @@ import unittest
 
 PROJECT = Path(__file__).resolve().parents[1]
 SCENARIOS = (
-    "startup_once", "tag_client_recognized", "in_app_update_relaunch", "multi_account_status", "first_use_cd_note", "legacy_status_fallback",
+    "startup_once", "audit_success_details", "tag_client_recognized", "in_app_update_relaunch", "multi_account_status", "first_use_cd_note", "legacy_status_fallback",
     "invalid_multi_account_status", "warnings_allowed", "skipped_optional_allowed", "settings_round_trip", "local_status_refresh", "fresh_audit", "failed_check",
     "incomplete_check", "duplicate_check", "duplicate_overwrite", "empty_check",
     "unknown_check_code", "empty_check_code", "nonzero_check", "timeout_check",

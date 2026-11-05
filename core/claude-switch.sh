@@ -1541,7 +1541,7 @@ checkdetail() {
     fi
     tcnt=$(tun_count)
     if [ "$tcnt" -eq 1 ]; then
-        echo 'TUN网卡=ok'
+        echo 'TUN网卡=ok:检测通过'
     elif [ "$tcnt" -gt 1 ]; then
         echo "TUN网卡=fail:检测到多个TUN网卡(${tcnt}个,请关闭多余VPN软件)"
     else
@@ -1558,7 +1558,7 @@ checkdetail() {
         ipst=""; ipdt=""
         if [ -z "$ip" ]; then ipst="fail"; ipdt="未获取到出口IP"
         elif [ -z "$lastip" ]; then ipst="ok"; ipdt="首次记录"
-        elif [ "$ip" = "$lastip" ]; then ipst="ok"
+        elif [ "$ip" = "$lastip" ]; then ipst="ok"; ipdt="与上次一致"
         else ipst="warn"; ipdt="$lastip → $ip"; fi
         [ -n "$ip" ] && echo "$ip" > "$BASE/lastip"
         # IP 审查:48h 内出口 IP 变化 ≥3 次提示账号画像风险(只 warn 不 fail)
@@ -1573,9 +1573,9 @@ checkdetail() {
         optional_result "IP一致" "$ipst" "$ipdt"
     fi
     tz=$(readlink /etc/localtime 2>/dev/null)
-    if [ "$tz" = "/var/db/timezone/zoneinfo/$TZ_TARGET" ]; then echo '时区=ok'; else echo "时区=fail:$tz"; fi
+    if [ "$tz" = "/var/db/timezone/zoneinfo/$TZ_TARGET" ]; then echo "时区=ok:${tz#/var/db/timezone/zoneinfo/}"; else echo "时区=fail:$tz"; fi
     locale=$(defaults read -g AppleLocale 2>/dev/null)
-    if [ "$locale" = "$LOCALE_TARGET" ]; then echo '地区=ok'; else echo "地区=fail:$locale"; fi
+    if [ "$locale" = "$LOCALE_TARGET" ]; then echo "地区=ok:$locale"; else echo "地区=fail:$locale"; fi
     v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
     if echo "$v6" | grep -qi 'off'; then echo 'IPv6=ok:已关闭'; else echo 'IPv6=fail:未关闭'; fi
     if check_disabled "DNS"; then
