@@ -705,15 +705,18 @@ def expected_rules():
     return rules
 
 
-def verify_runtime(clash_dir, group, policy):
+def verify_runtime(clash_dir, group, policy, allow_global=False):
     base, secret = controller_config(clash_dir)
-    state = {
-        "configs": api_get(base, secret, "/configs"),
-        "rules": api_get(base, secret, "/rules"),
-        "proxies": api_get(base, secret, "/proxies"),
-    }
-    if str(state["configs"].get("mode", "")).lower() != "rule":
-        fail("Clash 当前不是 rule 模式")
+    mode = str(api_get(base, secret, "/configs").get("mode", "")).lower()
+    if allow_global and mode == "global":
+        proxies = api_get(base, secret, "/proxies").get("proxies", {})
+        selected = selected_proxy(proxies, "GLOBAL")
+        if str(selected.get("type", "")).lower() in {"", "direct", "pass", "reject", "rejectdrop", "block"}:
+            fail("全局模式：GLOBAL 未选择代理节点")
+        return "全局模式：流量走全局代理（不使用置顶规则）"
+    if mode != "rule":
+        fail("直连模式：置顶规则不生效" if mode == "direct" else "Clash 当前不是 rule 模式")
+    state = {"rules": api_get(base, secret, "/rules"), "proxies": api_get(base, secret, "/proxies")}
     validate_group(state, group, policy)
     rules = state["rules"].get("rules")
     if not isinstance(rules, list):
@@ -739,7 +742,7 @@ def verify_runtime(clash_dir, group, policy):
                     or rule.get("proxy") != group
                     or (rule.get("extra") or {}).get("disabled") is True):
                 fail("运行规则未按策略置顶:" + value)
-    return state
+    return f"规则模式：{len(DOMAINS)} 个域名、{len(PORTS)} 条 UDP 规则已置顶"
 
 
 def rule_strings(group, policy):
@@ -878,6 +881,9 @@ def main():
     if action == "mode":
         base, secret = controller_config(clash_dir)
         print(str(api_get(base, secret, "/configs").get("mode", "")).lower())
+        return 0
+    if action == "status":
+        print(verify_runtime(clash_dir, group, policy, allow_global=True))
         return 0
     if not group or any(char in group for char in ",\r\n"):
         fail("代理组名为空或包含规则分隔符")
@@ -2031,23 +2037,16 @@ update_lock_release() {
     fi
 }
 
-# 原子替换:同目录写临时文件后 mv -f 换 inode。bash 边读边执行脚本,原地 cp 覆盖正在运行的核心
-# 会让旧进程从原字节偏移处继续读取新文件内容并执行。
-atomic_install() {
-    local src="$1" dst="$2" mode="${3:-}" tmp
-    tmp="$(dirname "$dst")/.$(basename "$dst").new.$$"
-    if ! cp "$src" "$tmp" 2>/dev/null; then
-        rm -f "$tmp" 2>/dev/null
-        return 1
-    fi
-    if [ -n "$mode" ] && ! chmod "$mode" "$tmp" 2>/dev/null; then
-        rm -f "$tmp" 2>/dev/null
-        return 1
-    fi
-    if ! mv -f "$tmp" "$dst" 2>/dev/null; then
-        rm -f "$tmp" 2>/dev/null
-        return 1
-    fi
+# 原子安装脚本文件:先写同目录临时文件,再 rename 覆盖目标。
+# 绝不能直接 cp 覆盖目标:更新时正在运行的 bash 持有旧脚本的 fd,并按字节偏移继续读后续语句,
+# 若用 cp 原地覆盖同一 inode(截断后重写),bash 会从新内容中间开始解析。
+install_staged() {  # $1=源文件 $2=目标文件
+    _src="$1"; _dst="$2"
+    _stage="$(dirname "$_dst")/.$(basename "$_dst").new.$$"
+    if ! cp "$_src" "$_stage"; then rm -f "$_stage"; return 1; fi
+    chmod +x "$_stage" 2>/dev/null
+    if ! mv -f "$_stage" "$_dst"; then rm -f "$_stage"; return 1; fi
+    return 0
 }
 
 self_update() {
@@ -2081,9 +2080,10 @@ self_update() {
     tmpd=""
 
     rollback_update() {
+        local rc=0
         if [ "${core_replaced:-0}" -eq 1 ]; then
             if [ "${had_core:-0}" -eq 1 ] && [ -f "$BIN/claude-switch.sh.bak" ]; then
-                atomic_install "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh" +x || true
+                install_staged "$BIN/claude-switch.sh.bak" "$BIN/claude-switch.sh" || rc=1
             else
                 rm -f "$BIN/claude-switch.sh" 2>/dev/null || true
             fi
@@ -2091,7 +2091,7 @@ self_update() {
         fi
         if [ "${stun_replaced:-0}" -eq 1 ]; then
             if [ "${had_stun:-0}" -eq 1 ] && [ -f "$BASE/stun-probe.py.bak" ]; then
-                atomic_install "$BASE/stun-probe.py.bak" "$BASE/stun-probe.py" || true
+                install_staged "$BASE/stun-probe.py.bak" "$BASE/stun-probe.py" || rc=1
             else
                 rm -f "$BASE/stun-probe.py" 2>/dev/null || true
             fi
@@ -2107,11 +2107,12 @@ self_update() {
             rm -f "$CONFIG_ENV.bak" 2>/dev/null || true
             cfg_replaced=0
         fi
+        return $rc
     }
 
     cleanup_update() {
         if [ "${UPDATE_COMMITTED:-0}" -ne 1 ]; then
-            rollback_update
+            rollback_update || true
         else
             rm -f "$BASE/stun-probe.py.bak" "$CONFIG_ENV.bak" 2>/dev/null || true
         fi
@@ -2159,6 +2160,7 @@ self_update() {
     fi
 
     # 读取现有运行配置:优先从 config.env 读取,老版本从已安装脚本头部兜底读取
+    candidate="$NEW/core/claude-switch.sh"
     PM=""; PG=""; CT=""; TZV=""; LCT=""
     if [ -f "$BIN/claude-switch.sh" ]; then
         get_cfg() { grep "^$1=\"" "$BIN/claude-switch.sh" | head -1 | cut -d'"' -f2; }
@@ -2261,10 +2263,26 @@ self_update() {
         fi
     fi
 
-    # 2. 备份并更新用户态配置文件、STUN 探针与核心脚本(核心脚本原样复制,保持与 SHA256SUMS 字节一致)
+    # 2. 备份并更新核心脚本、用户态配置文件与 STUN 探针(核心脚本原样复制,保持与 SHA256SUMS 字节一致)
+    if [ "$core_changed" -eq 1 ]; then
+        if [ -f "$BIN/claude-switch.sh" ]; then
+            if ! cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"; then
+                echo "FAIL:备份现有核心脚本失败,已中止"; cleanup_update; return 1
+            fi
+            had_core=1
+        fi
+        # 必须原子替换:当前进程正在执行的就是该文件
+        if ! install_staged "$candidate" "$BIN/claude-switch.sh"; then
+            echo "FAIL:无法写入核心脚本,已自动回滚"; cleanup_update; return 1
+        fi
+        core_replaced=1
+    fi
+
     if [ -n "$PM" ]; then
         if [ -f "$CONFIG_ENV" ]; then
-            cp "$CONFIG_ENV" "$CONFIG_ENV.bak"
+            if ! cp "$CONFIG_ENV" "$CONFIG_ENV.bak"; then
+                echo "FAIL:备份配置文件失败,已中止"; cleanup_update; return 1
+            fi
             had_cfg=1
         fi
         PROXY_MODE="$PM"; PROXY_GROUP="$PG"; COUNTRY_TARGET="$CT"; TZ_TARGET="$TZV"; LOCALE_TARGET="$LCT"
@@ -2276,40 +2294,38 @@ self_update() {
 
     if [ "$stun_changed" -eq 1 ]; then
         if [ -f "$BASE/stun-probe.py" ]; then
-            cp "$BASE/stun-probe.py" "$BASE/stun-probe.py.bak"
+            if ! cp "$BASE/stun-probe.py" "$BASE/stun-probe.py.bak"; then
+                echo "FAIL:备份 STUN 探针失败,已中止"; cleanup_update; return 1
+            fi
             had_stun=1
         fi
-        if ! atomic_install "$NEW/core/stun-probe.py" "$BASE/stun-probe.py"; then
+        if ! install_staged "$NEW/core/stun-probe.py" "$BASE/stun-probe.py"; then
             echo "FAIL:无法写入 STUN 探针,已自动回滚"; cleanup_update; return 1
         fi
         stun_replaced=1
     fi
 
-    if [ "$core_changed" -eq 1 ]; then
-        if [ -f "$BIN/claude-switch.sh" ]; then
-            cp "$BIN/claude-switch.sh" "$BIN/claude-switch.sh.bak"
-            had_core=1
-        fi
-        # 必须原子替换:当前进程正在执行的就是该文件
-        if ! atomic_install "$NEW/core/claude-switch.sh" "$BIN/claude-switch.sh" +x; then
-            echo "FAIL:无法写入核心脚本,已自动回滚"; cleanup_update; return 1
-        fi
-        core_replaced=1
-    fi
-
     # 3. 先跑更新后自检(在替换 App 或提权同步守护之前执行,保证自检失败时无需回滚系统目录与 App)
+    # root(旧版 LaunchDaemon)下切回真实用户执行,避免 defaults 读到 root 的配置
+    check_rc=0
     if [ "$(id -u)" -eq 0 ]; then
         owner=$(stat -f '%Su' "$UHOME" 2>/dev/null)
-        if [ -n "$owner" ]; then out=$(sudo -H -u "$owner" "$BIN/claude-switch.sh" checkdetail 2>&1); else out=""; fi
+        if [ -n "$owner" ]; then out=$(sudo -H -u "$owner" "$BIN/claude-switch.sh" checkdetail 2>&1) || check_rc=$?; else out=""; check_rc=1; fi
     else
-        out=$("$BIN/claude-switch.sh" checkdetail 2>&1)
+        out=$("$BIN/claude-switch.sh" checkdetail 2>&1) || check_rc=$?
     fi
     check_out="$out"
     if [ "$gui" -eq 1 ] && [ "$daemon_changed" -eq 1 ]; then
         check_out=$(printf '%s\n' "$out" | grep -v '^保镖=fail:客户端不一致')
     fi
-    if [ -z "$out" ] || printf '%s\n' "$check_out" | grep -q '=fail'; then
-        echo "FAIL:新版自检未通过,已自动回滚"
+    if [ "$check_rc" -ne 0 ] || [ -z "$out" ] || printf '%s\n' "$check_out" | grep -q '=fail'; then
+        rollback_failed=0
+        rollback_update || rollback_failed=1
+        if [ "$rollback_failed" -ne 0 ]; then
+            echo "FAIL:新版自检未通过,回滚失败;请从 $BIN/claude-switch.sh.bak 手动恢复"
+        else
+            echo "FAIL:新版自检未通过,已自动回滚"
+        fi
         cleanup_update
         return 1
     fi
@@ -3023,7 +3039,12 @@ case "$operation" in
     fingerprint) fingerprint ;;
     *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto|--gui]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
-rc=$?
+# checkdetail 分支内部已保存返回码;其他分支取 case 的最终状态。
+# 判断本身会改变 $?，所以必须先捕获 dispatch_rc，再按操作类型落 rc。
+dispatch_rc=$?
+if [ "$operation" != "checkdetail" ]; then
+    rc=$dispatch_rc
+fi
 case "$operation" in
     get-check-config|set-check-config|export-diagnostics|detect-client) ;;
     *) log_result "$started_at" "$operation" "$rc" "$summary" ;;

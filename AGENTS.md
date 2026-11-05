@@ -126,16 +126,16 @@ Windows 用户请使用 `windows/` 下的 PowerShell 版本。关键差异与注
 
 Linux 用户使用 `linux/` 下的 bash 版本。**开始之前必须先理解最大的前提差异**：
 
-- **Claude 官方没有 Linux 桌面版**——使用形态是「网页版(浏览器) + Claude Code CLI」。因此：
-  - 账号切换切换的是**浏览器配置目录**（`~/.config/google-chrome` 或 `~/.config/chromium`），即切换 Web 登录态；切换前必须完全退出浏览器
-  - 保镖只终止 `claude` CLI 进程，**不要让它去杀浏览器**（网页端保护交给 TUN + 置顶规则）
+- **账号形态**：桌面 A–D 与浏览器 A/B 相互独立。`desktop A|B|C|D` 启动 Claude Code 桌面会话，A 使用客户端现有配置，B–D 使用各自独立的 Electron、XDG 与 Claude Code 配置目录；`switch A|B` 切换 Chrome/Chromium 浏览器配置目录（`~/.config/google-chrome` 或 `~/.config/chromium`），即切换 Web 登录态，切换前必须完全退出浏览器
+- **桌面与 CLI 退出规则**：直接运行 `desktop` 前须完全退出已有桌面实例及 Code CLI；界面切换或 `desktop-switch A|B|C|D` 会先重新安检，再请求当前用户的 Claude 桌面版与 Code CLI 退出。Code CLI 最多等待 10 秒，桌面端最多等待 90 秒；仍有会话运行时取消切换并保留原槽位。保镖保护 `claude` CLI 与当前用户的 `claude-desktop` 进程，**不要让它去杀浏览器**（网页端保护交给 TUN + 置顶规则）
 - **多客户端**：`PROXY_MODE` 支持 clash-verge / mihomo / sing-box / v2raya / nekobox / hiddify / wireguard / other / auto；非 Clash 客户端不做配置改写，只做 fake-ip 行为检测并提示用户自行加 DOMAIN-SUFFIX 规则；`wireguard` / `other` 为通用虚拟网卡启发式判定
 - **地区自适应**：`COUNTRY_TARGET` / `TZ_TARGET` / `LOCALE_TARGET` 由安装器按出口自动写入；`CN` 出口拒绝安装；换国家节点后手动改这三个值（Linux 版暂无 `set-region` 命令）
 - **常驻服务**：systemd 用户单元（`~/.config/systemd/user/`，免 sudo、登录自启）
 - **系统设置**：时区用 `timedatectl set-timezone`（sudo）；IPv6 用 `sysctl -w net.ipv6.conf.all.disable_ipv6=1` + `/etc/sysctl.d/` 持久化
 - **DNS 查询工具**：`dig` → `nslookup` → `getent` 逐级回退（部分发行版默认无 dig，脚本已内置回退，勿改成 dig 硬依赖）
-- **界面**：无 GUI，终端菜单（`claude-switch menu`）+ CLI 参数
-- **发行版差异**：安装器不区分发行版，但依赖 systemd；非 systemd 发行版（如 Alpine/void 部分配置）需要手工替代保镖常驻方式
+- **界面与依赖**：GTK 3 监测窗口、盾牌托盘、终端菜单（`claude-switch menu`）与 CLI 参数；界面使用系统 Python 3 与 PyGObject，托盘依赖 AppIndicator。桌面切换需要 `flock` 串行化操作，并通过 `systemd-run --user` 在图形会话中启动客户端
+- **Linux 更新检查**：托盘启动时和每 12 小时只读检查上游 main，也可在托盘/窗口选择「检查更新」或运行 `claude-switch update-check`；固定提交并校验 SHA256 后比较已安装文件，不替换文件
+- **发行版差异**：安装器不区分发行版，但依赖 systemd；非 systemd 发行版（如 Alpine/void 部分配置）需要手工替代保镖常驻方式。**未做 Linux 真机与多发行版验收**，静态检查与隔离回归不能视为这些环境已验收
 - 配置目录路径：Clash Verge Linux 版配置在 `~/.config/io.github.clash-verge-rev.clash-verge-rev/`（脚本已兼容两种常见路径）
 
 ## 文件索引
@@ -151,11 +151,13 @@ Linux 用户使用 `linux/` 下的 bash 版本。**开始之前必须先理解�
 
 ## 维护者本机纪律（Agent 必须遵守）
 
-**除非维护者在当次对话中明确要求，否则不得更新/部署维护者本机的已安装版本。** 具体包括：
+**除非维护者在当次对话中明确说明，否则一律不得改动维护者本机的任何安装态、真实配置与系统设置——无论是什么性质的修复或更改。** 下面是常见例子而非穷尽列举；判断标准是"维护者没在当次对话明确要求就不动"，而不是"清单里没写就能动"：
 
 - 不得覆盖 `~/.local/bin/claude-switch.sh`、`~/.local/bin/local.claude-*.plist`
 - 不得重新编译或替换已安装 App（`/Applications/Claude Switcher.app` 或旧版桌面位置）
 - 不得改动 `/Library/Application Support/claude-switcher/`、`/Library/LaunchDaemons/local.claude-*`、`~/Library/LaunchAgents/local.claude-*`
 - 不得触发本机 `update`、不得执行安装器/卸载器
+- 不得改动 `~/.claude-switcher/` 下的真实账号数据与任何配置文件
+- 不得改动 Clash Verge / FlClash 等代理客户端的配置、TUN/系统代理状态，以及时区/网络/DNS 等系统设置
 
 日常开发默认流程：**只修改仓库文件 → 验证（本地只跑不影响安装态的测试/静态检查）→ 提交推送**。维护者已持续授权：每次修复完成并通过适用验证后，可直接提交并推送 `main`，无需逐次确认；推送前仍需 `git fetch origin main` 核对远端，不得覆盖他人工作，也不得提交故意保留的未跟踪交接文档。Issue 回复后可直接关闭，无需逐次确认；已修复的标记为完成，信息不足或不打算继续处理的应选择相应关闭原因，不得伪装成已修复。需要真机验证时，先询问维护者是否允许在本机部署。打 tag、发布 Release、执行安装器/更新器或修改真实账号与代理配置，仍须逐次明确授权。

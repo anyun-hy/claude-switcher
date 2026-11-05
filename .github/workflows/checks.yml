@@ -60,6 +60,26 @@ jobs:
       - name: JavaScript syntax
         run: node --check docs/app.js
 
+  linux:
+    name: Linux desktop and update checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Shell syntax and Linux integration
+        run: |
+          set -euo pipefail
+          for file in linux/*.sh; do
+            bash -n "$file"
+          done
+          python3 -B -m unittest -v tests.test_linux_desktop tests.test_linux_update_check
+
   windows:
     name: Windows PowerShell integration
     runs-on: windows-latest
@@ -67,20 +87,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Client language and ASN checks (Windows PowerShell 5.1)
+      - name: FlClash controller, client language and ASN checks (Windows PowerShell 5.1)
         shell: powershell
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows-client-language-integration.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows-asn-integration.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows-flclash-controller-integration.ps1
           exit $LASTEXITCODE
 
-      - name: Client language and ASN checks (pwsh 7)
+      - name: FlClash controller, client language and ASN checks (pwsh 7)
         shell: pwsh
         run: |
           pwsh -NoProfile -File tests\windows-client-language-integration.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pwsh -NoProfile -File tests\windows-asn-integration.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File tests\windows-flclash-controller-integration.ps1
           exit $LASTEXITCODE
 
       - name: Pinned rules compatibility (Windows PowerShell 5.1)

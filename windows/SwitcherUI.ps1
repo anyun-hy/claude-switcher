@@ -6,6 +6,83 @@ Add-Type -AssemblyName WindowsBase
 $BASE = "$env:USERPROFILE\.claude-switcher"
 $CORE = "$BASE\claude-switch.ps1"
 
+$comboBoxStyles = @"
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="#FF162238"/>
+            <Setter Property="Foreground" Value="#FFE6EDF7"/>
+            <Setter Property="BorderBrush" Value="#FF2A3952"/>
+            <Setter Property="Padding" Value="10,6"/>
+            <Setter Property="SnapsToDevicePixels" Value="True"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <ToggleButton Focusable="False" ClickMode="Press"
+                                          Background="{TemplateBinding Background}"
+                                          BorderBrush="{TemplateBinding BorderBrush}"
+                                          BorderThickness="1"
+                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                                <ToggleButton.Template>
+                                    <ControlTemplate TargetType="ToggleButton">
+                                        <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8">
+                                            <Path HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,12,0" Data="M0,0 L4,4 L8,0" Stroke="#FF9AA9BF" StrokeThickness="1.4"/>
+                                        </Border>
+                                    </ControlTemplate>
+                                </ToggleButton.Template>
+                            </ToggleButton>
+                            <ContentPresenter IsHitTestVisible="False" Margin="12,6,28,6" VerticalAlignment="Center" HorizontalAlignment="Left"
+                                              Content="{TemplateBinding SelectionBoxItem}"
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                              ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}"
+                                              TextElement.Foreground="{TemplateBinding Foreground}"/>
+                            <Popup Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}" AllowsTransparency="True" Focusable="False" PopupAnimation="Slide">
+                                <Border Background="#FF162238" BorderBrush="#FF2A3952" BorderThickness="1" CornerRadius="8" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}" MaxHeight="280" Margin="0,4,0,0">
+                                    <ScrollViewer>
+                                        <ItemsPresenter/>
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Background" Value="#FF101827"/>
+                                <Setter Property="Foreground" Value="#FF6B7280"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Foreground" Value="#FFE6EDF7"/>
+            <Setter Property="Background" Value="#FF162238"/>
+            <Setter Property="Padding" Value="10,8"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBoxItem">
+                        <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter TextElement.Foreground="{TemplateBinding Foreground}"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsHighlighted" Value="True">
+                                <Setter Property="Background" Value="#FF1D2C46"/>
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter Property="Background" Value="#FF1D4ED8"/>
+                                <Setter Property="Foreground" Value="#FFE6EDF7"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Background" Value="#FF101827"/>
+                                <Setter Property="Foreground" Value="#FF6B7280"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+"@
+
 $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -82,10 +159,7 @@ $xaml = @"
             <Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="Focusable" Value="False"/>
             <Setter Property="Padding" Value="0"/>
         </Style>
-        <Style TargetType="ComboBox">
-            <Setter Property="Background" Value="#FF162238"/><Setter Property="Foreground" Value="#FFE6EDF7"/>
-            <Setter Property="BorderBrush" Value="#FF2A3952"/><Setter Property="Padding" Value="10,6"/>
-        </Style>
+        $comboBoxStyles
         <Style TargetType="PasswordBox">
             <Setter Property="Background" Value="#14FFFFFF"/><Setter Property="Foreground" Value="White"/>
             <Setter Property="BorderBrush" Value="#33FFFFFF"/><Setter Property="Padding" Value="10,8"/>
@@ -186,6 +260,8 @@ $xaml = @"
                                 <ComboBoxItem Content="Surge" Tag="surge"/><ComboBoxItem Content="WireGuard" Tag="wireguard"/>
                                 <ComboBoxItem Content="其他 TUN 客户端" Tag="other"/><ComboBoxItem Content="自动识别" Tag="auto"/>
                             </ComboBox>
+                            <TextBlock Text="FlClash 控制端口" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}" Margin="0,12,0,0"/>
+                            <TextBox x:Name="FlClashPort" MinHeight="34" Margin="0,6,0,0" ToolTip="留空表示自动发现。可填 9090 或 127.0.0.1:9090，只接受本机地址"/>
                             <TextBlock Text="切换后自动重新检查" FontSize="10" Foreground="{StaticResource MutedBrush}" Margin="0,8,0,0"/>
                         </StackPanel>
                     </Border>
@@ -310,6 +386,8 @@ $script:currentClient = ''
 $script:currentAccount = 'none'
 $script:archivedAccounts = @()
 $script:suppressClientEvent = $false
+$script:suppressPortEvent = $false
+$script:portLoaded = $false
 $script:uiJob = $null
 $script:uiTimer = $null
 $script:uiOperation = ''
@@ -343,6 +421,7 @@ function Set-Busy([bool]$busy) {
     foreach ($name in @('BtnFix','BtnRefresh','BtnTools','BtnSettings','BtnDiagnostics')) { $win.FindName($name).IsEnabled = -not $busy }
     foreach ($name in @('BtnA','BtnB','BtnC','BtnD')) { $win.FindName($name).IsEnabled = (-not $busy -and $script:environmentReady) }
     $win.FindName('ProxyClient').IsEnabled = (-not $busy -and [bool]$script:currentClient)
+    $win.FindName('FlClashPort').IsEnabled = -not $busy
     $win.FindName('BtnCheckUpdate').IsEnabled = (-not $busy -and -not $script:updateRunning)
 }
 function Invoke-Core([string[]]$coreArgs) {
@@ -437,6 +516,18 @@ function Apply-ClientOutput([string]$Text) {
     $script:suppressClientEvent = $false
     return $true
 }
+function Apply-FlClashPort([string]$Text) {
+    $value = ''
+    foreach ($line in ($Text -split "`r?`n")) { if ($line -match '^port=(.*)$') { $value = $Matches[1] } }
+    if ($value -eq 'auto') { $value = '' }
+    $script:savedFlClashPort = if ($value) { $value } else { 'auto' }
+    $box = $win.FindName('FlClashPort')
+    if (-not $box) { return }
+    $script:suppressPortEvent = $true
+    $box.Text = $value
+    $script:suppressPortEvent = $false
+    $script:portLoaded = $true
+}
 function Apply-StatusOutput([string]$Text) {
     $fields = @{}
     foreach ($token in ($Text -split '\s+')) {
@@ -515,7 +606,8 @@ function Refresh-Checks {
         $checks = if (Test-Path "$base\last-check.txt") { (Get-Content "$base\last-check.txt" -Encoding UTF8) -join "`n" } else { '' }
         $status = (& powershell -NoProfile -ExecutionPolicy Bypass -File $core status 2>$null | Out-String).Trim(); $statusExit = $LASTEXITCODE
         $client = (& powershell -NoProfile -ExecutionPolicy Bypass -File $core get-client 2>$null | Out-String).Trim(); $clientExit = $LASTEXITCODE
-        [pscustomobject]@{ Checks = $checks; CheckExit = $checkExit; Status = $status; StatusExit = $statusExit; Client = $client; ClientExit = $clientExit }
+        $port = (& powershell -NoProfile -ExecutionPolicy Bypass -File $core get-flclash-controller 2>$null | Out-String).Trim()
+        [pscustomobject]@{ Checks = $checks; CheckExit = $checkExit; Status = $status; StatusExit = $statusExit; Client = $client; ClientExit = $clientExit; Port = $port }
     }
     Start-UiOperation 'refresh' $work @($CORE,$BASE)
 }
@@ -530,6 +622,7 @@ function Complete-UiOperation([string]$Operation, $Result) {
         if (-not $Result) { $script:pendingSwitch = ''; $script:environmentReady = $false; Set-Status '检查失败' ([System.Windows.Media.Color]::FromRgb(0xF8,0x71,0x71)); Set-Banner '核心脚本没有返回检查结果' 'error'; Set-Busy $false; return }
         $statusOk = $Result.StatusExit -eq 0 -and (Apply-StatusOutput $Result.Status)
         $clientOk = $Result.ClientExit -eq 0 -and (Apply-ClientOutput $Result.Client)
+        if ($Result.Port) { Apply-FlClashPort $Result.Port }
         $checksOk = Apply-CheckOutput $Result.Checks $Result.CheckExit
         $script:environmentReady = $checksOk -and $statusOk -and $clientOk
         if (-not $statusOk -or -not $clientOk) { $script:environmentReady = $false; Set-Status '状态异常' ([System.Windows.Media.Color]::FromRgb(0xF8,0x71,0x71)); Set-Banner '无法读取账号或代理客户端状态，请更新核心脚本后重试' 'error' }
@@ -555,7 +648,7 @@ function Complete-UiOperation([string]$Operation, $Result) {
         else { Set-Banner $(if ($text) { $text } else { '切换未返回成功结果，请重试' }) 'error' }
         Refresh-Checks; return
     }
-    if ($Operation -in @('set-client','set-region')) {
+    if ($Operation -in @('set-client','set-region','set-flclash-controller')) {
         if ($exit -eq 0 -and $text -match '(?m)^OK:') { Set-Banner ($text -split "`r?`n" | Select-Object -Last 1) 'success' }
         else { Set-Banner $(if ($text) { $text } else { '操作失败，请重试' }) 'error' }
         Refresh-Checks; return
@@ -634,6 +727,9 @@ function Show-SnapshotDialog([string]$Kind, $Owner) {
     if (-not $slots.Count) { [void][System.Windows.MessageBox]::Show($(if ($Kind -eq 'export') { '没有可导出的已归档账号，请先切换一次完成归档' } else { '没有空账号槽位可导入' }), '快照迁移'); return }
     $dialogXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="加密快照迁移" Width="500" Height="420" ResizeMode="NoResize" WindowStartupLocation="CenterOwner" Background="#FF12141D" Foreground="White">
+    <Window.Resources>
+        $comboBoxStyles
+    </Window.Resources>
     <StackPanel Margin="22"><TextBlock x:Name="SnapshotTitle" FontSize="19" FontWeight="Bold"/><TextBlock Text="Windows .csnap 格式；密码无法找回，不与 macOS DMG 兼容" FontSize="11" Foreground="#B3FFFFFF" TextWrapping="Wrap" Margin="0,5,0,14"/>
         <TextBlock Text="账号槽位" FontSize="11"/><ComboBox x:Name="SnapshotSlot" MinHeight="34" Margin="0,4,0,10"/>
         <TextBlock Text="快照文件" FontSize="11"/><Grid Margin="0,4,0,10"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBox x:Name="SnapshotPath" IsReadOnly="True"/><Button x:Name="BtnSnapshotBrowse" Grid.Column="1" Content="浏览…" Padding="12,7" Margin="8,0,0,0"/></Grid>
@@ -747,6 +843,7 @@ $win.FindName('BtnRefresh').Add_Click({ Refresh-Checks })
 $win.FindName('BtnFix').Add_Click({ if (-not $script:isBusy) { Set-Status '修复中' ([System.Windows.Media.Color]::FromRgb(0xFB,0x92,0x3C)); Set-Banner '正在修复…（可能弹出管理员授权框）' 'info'; Start-CommandOperation 'fix' @('fix') } })
 foreach ($slot in @('A','B','C','D')) { $win.FindName("Btn$slot").Add_Click({ Switch-To $slot }.GetNewClosure()) }
 $win.FindName('ProxyClient').Add_SelectionChanged({ if ($script:suppressClientEvent -or $script:isBusy) { return }; $selected = $win.FindName('ProxyClient').SelectedItem; if (-not $selected) { return }; $mode = [string]$selected.Tag; if ($clientModes -contains $mode -and $mode -ne $script:currentClient) { Set-Banner "正在切换代理客户端为 $mode…" 'info'; Start-CommandOperation 'set-client' @('set-client',$mode) } })
+$win.FindName('FlClashPort').Add_LostFocus({ if ($script:suppressPortEvent -or $script:isBusy -or -not $script:portLoaded) { return }; $raw = ([string]$win.FindName('FlClashPort').Text).Trim(); if (-not $raw) { $raw = 'auto' }; if ($raw -eq $script:savedFlClashPort) { return }; Start-CommandOperation 'set-flclash-controller' @('set-flclash-controller',$raw) })
 $win.FindName('BtnTools').Add_Click({ Show-ToolsWindow }); $win.FindName('BtnSettings').Add_Click({ Show-CheckSettings }); $win.FindName('BtnDiagnostics').Add_Click({ Export-DiagnosticLog })
 $win.FindName('BtnCheckUpdate').Add_Click({ if ($script:updateRunning -or $script:isBusy) { return }; Remove-Item -LiteralPath (Join-Path $BASE 'update-check.json') -Force -ErrorAction SilentlyContinue; Start-UpdateCheck $true })
 $win.FindName('BtnLater').Add_Click({ if ($script:checkJob) { Stop-Job $script:checkJob -ErrorAction SilentlyContinue; Remove-Job $script:checkJob -Force -ErrorAction SilentlyContinue; $script:checkJob = $null }; if ($script:checkTimer) { $script:checkTimer.Stop() }; $win.FindName('UpdateBar').Visibility = 'Collapsed'; Write-UpdateCache 'dismissed' $(if ($script:latestVersion) { [string]$script:latestVersion } else { '' }) })

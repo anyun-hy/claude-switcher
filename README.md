@@ -105,7 +105,7 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 **系统要求**：macOS · Clash Verge / FlClash / TAG / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）· Claude 桌面版 · python3
 
 > **Windows 用户**：[`windows/`](windows/) 目录提供 Windows 版（PowerShell + WPF，Beta），安装与注意事项见 [windows/README.md](windows/README.md)。
-> **Linux 用户**：[`linux/`](linux/) 目录提供 Linux 版（bash + systemd，Beta），设计取舍（无官方桌面版→切换浏览器登录态）见 [linux/README.md](linux/README.md)。
+> **Linux 用户**：[`linux/`](linux/) 目录提供 Linux 版（bash + systemd，Beta），支持从应用菜单打开 GTK 监测窗口、点击托盘查看 14 项安检摘要、显示发行版，并通过已安装的 claude-desktop 启动 Claude Code 桌面会话。使用说明见 [linux/README.md](linux/README.md)。
 
 ### 上游发行包
 
@@ -498,6 +498,11 @@ Bug 反馈和功能建议仍建议提交 Issue，便于跟踪与处理。
 ## 帮忙吆喝一声
 
 如果这个工具让你少被封了一个号，希望有条件的佬哥能帮我们在 [Linux.do](https://linux.do) 论坛发个帖子推荐一下——仓库地址 <https://github.com/YOURSJEYO/claude-switcher>，一句话定位：**"Claude 账号的 Fail-Closed 环境保护罩：硬性安全项不过就物理上不让启动"**。让更多被风控折磨的兄弟少走弯路。
+
+## 致谢
+
+- [@XuCe](https://github.com/XuCe) —— Linux 桌面版的主体工作：GTK 监测窗口、托盘菜单、A–D 桌面槽位切换与 Claude Code 启动联动（[#40](https://github.com/YOURSJEYO/claude-switcher/pull/40)）
+- [@ArmedHelicopter](https://github.com/ArmedHelicopter) —— Windows 端 FlClash 控制端口自动发现（[#36](https://github.com/YOURSJEYO/claude-switcher/pull/36)）与深色主题 ComboBox 可见性修复（[#37](https://github.com/YOURSJEYO/claude-switcher/pull/37)），并在 Windows 真机完成了冒烟验证
 
 ## Star History
 
