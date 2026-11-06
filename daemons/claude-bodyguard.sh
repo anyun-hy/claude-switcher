@@ -4,6 +4,29 @@
 LOG="__HOME__/Library/Logs/claude-bodyguard.log"
 MODE="__PROXY_MODE__"
 HOME_DIR="__HOME__"
+HEALTH_SCHEMA=1
+HEALTH_ERROR=0
+HEALTH_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
+HEALTH_FILE="$HEALTH_DIR/claude-bodyguard-health"
+
+# A completion heartbeat is published next to the installed root-owned script,
+# never in a user-writable home directory. Fixture copies write beside themselves.
+record_health() {
+    local rc=$? result=ok tmp
+    trap - EXIT
+    [ "$rc" -eq 0 ] && [ "$HEALTH_ERROR" -eq 0 ] || result=error
+    tmp=$(mktemp "$HEALTH_DIR/.claude-bodyguard-health.XXXXXX") || exit 1
+    if ! {
+        printf 'schema=1\ntime=%s\nmode=%s\nresult=%s\n' "$(date +%s)" "$MODE" "$result" > "$tmp" &&
+        chmod 644 "$tmp" &&
+        mv -f "$tmp" "$HEALTH_FILE"
+    }; then
+        rm -f "$tmp"
+        exit 1
+    fi
+    exit "$rc"
+}
+trap record_health EXIT
 
 # 安装用户 UID: root 守护从 __HOME__ 属主推导,只处理该用户的 CLI 进程。
 # 推导失败宁可不杀,也不按进程名全系统扫描(避免误伤其他用户与 claude-switcher 自身)。
@@ -12,6 +35,7 @@ if [ "$(id -u)" -eq 0 ]; then
 else
     INSTALL_UID=$(id -u)
 fi
+case "$INSTALL_UID" in ''|*[!0-9]*) HEALTH_ERROR=1 ;; esac
 
 ok=1
 
@@ -27,7 +51,8 @@ tag_alive() {
 }
 
 # TUN 在线判定:必须存在且仅存在 1 个 fake-ip 网段地址(0 个或多个 TUN 均视为异常并关闭 Claude)
-[ "$(ifconfig 2>/dev/null | grep -c 'inet 198\.18\.')" -eq 1 ] || ok=0
+interfaces=$(ifconfig 2>/dev/null) || { HEALTH_ERROR=1; ok=0; }
+[ "$(printf '%s\n' "$interfaces" | grep -c 'inet 198\.18\.')" -eq 1 ] || ok=0
 
 # 内核在线判定:按安装时识别的客户端分派
 case "$MODE" in
@@ -73,20 +98,30 @@ esac
 # Claude Code CLI 进程: native claude/claude.exe 与 npm/bun 的 @anthropic-ai/claude-code。
 # 过滤思路与 core/claude-switch.sh 的 cli_pids 一致: 先按安装用户 UID 圈定,再看进程名/CLI 入口参数。
 cli_pids() {
+    local processes
     [ -n "$INSTALL_UID" ] || return 0
-    ps -axo pid=,uid=,comm=,args= | awk -v uid="$INSTALL_UID" '
+    processes=$(ps -axo pid=,uid=,comm=,args=) || return 1
+    printf '%s\n' "$processes" | awk -v uid="$INSTALL_UID" '
         $2 == uid && ($3 ~ /(^|\/)(claude|claude\.exe)$/ ||
         ($3 ~ /(^|\/)(node|bun)$/ && $5 ~ /(^|\/)@anthropic-ai\/claude-code\/(bin\/claude(\.exe)?|cli\.js)$/)) { print $1 }'
 }
 
 if [ "$ok" -eq 0 ]; then
     if pgrep -f '/Applications/Claude.app/Contents/MacOS/Claude' >/dev/null 2>&1; then
-        pkill -f '/Applications/Claude.app/Contents/MacOS/Claude'
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 代理离线(内核或TUN丢失),已自动关闭 Claude" >>"$LOG"
+        if pkill -f '/Applications/Claude.app/Contents/MacOS/Claude'; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 代理离线(内核或TUN丢失),已自动关闭 Claude" >>"$LOG"
+        else
+            HEALTH_ERROR=1
+        fi
     fi
-    pids=$(cli_pids)
+    pids=$(cli_pids) || HEALTH_ERROR=1
     if [ -n "$pids" ]; then
-        kill -TERM $pids 2>/dev/null
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 代理离线(内核或TUN丢失),已自动关闭 Claude Code CLI" >>"$LOG"
+        if kill -TERM $pids 2>/dev/null; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 代理离线(内核或TUN丢失),已自动关闭 Claude Code CLI" >>"$LOG"
+        else
+            HEALTH_ERROR=1
+        fi
     fi
 fi
+[ "$HEALTH_ERROR" -eq 0 ] || exit 1
+exit 0

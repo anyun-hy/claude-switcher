@@ -170,6 +170,41 @@ struct MenuBarModelTests {
             let name = CommandLine.arguments[1]
             let f = try Fixture()
             switch name {
+            case "bodyguard_history":
+                try f.audit(["保镖": "ok:巡检在线（2秒前完成）"])
+                let audit = try String(contentsOf: f.root.appendingPathComponent("audit"), encoding: .utf8)
+                try f.write("audit", audit + "#保镖事件=2026-11-07 01:19:15 检测到代理或TUN异常，执行关闭保护\n")
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try expect(vm.phase == .ready && vm.rows.count == 14, "历史事件不能新增检查或覆盖在线状态")
+                try expect(vm.rows.first { $0.name == "保镖在线" }?.detail == "巡检在线（2秒前完成）", "当前状态不能混入历史离线事件")
+                try expect(vm.guardLastEvent.contains("2026-11-07 01:19:15"), "历史保护事件应可单独查看")
+                try f.audit(["保镖": "ok:巡检在线（1秒前完成）"])
+                vm.refresh(); try f.idle(vm)
+                try expect(vm.guardLastEvent.isEmpty, "重查不能残留上一轮的事件说明")
+            case "bodyguard_offline":
+                try f.audit(["保镖": "fail:保镖离线或巡检超时"])
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try expect(vm.phase == .failed && vm.rows.first { $0.name == "保镖在线" }?.state == .fail, "离线保镖必须显示失败")
+                try expect(ContentView(vm: vm).summaryState == .fail, "离线保镖不能显示绿色总览")
+                try f.deniedSwitch(vm)
+            case "bodyguard_legacy":
+                let vm = f.vm()
+                for detail in ["待命", "2026-11-07 01:19:15 代理离线(内核或TUN丢失),已自动关闭"] {
+                    try f.audit(["保镖": "ok:" + detail])
+                    vm.refresh(); try f.idle(vm)
+                    try expect(vm.phase == .failed, "旧核心仅凭注册或历史日志不能通过")
+                    try expect(vm.rows.first { $0.name == "保镖在线" }?.detail.contains("旧核心") == true, "应提示更新核心")
+                    try expect(vm.guardLastEvent.isEmpty == (detail == "待命"), "旧历史日志应与当前状态分开")
+                }
+            case "bodyguard_not_optional":
+                let vm = f.vm()
+                for status in ["warn:临时异常", "skip:用户已禁用"] {
+                    try f.audit(["保镖": status])
+                    vm.refresh(); try f.idle(vm)
+                    try expect(vm.phase == .failed && vm.rows.first { $0.name == "保镖在线" }?.state == .fail, "保镖不能跳过或降级")
+                }
             case "startup_once":
                 let vm = f.vm()
                 vm.start(); vm.start()
@@ -374,7 +409,7 @@ struct MenuBarModelTests {
             case "dashboard_layout":
                 try f.write("client", "client=tag\n")
                 try f.write("status", "current=A hasA=1 hasB=1 hasC=0 hasD=0 accounts=A,B accB=900M@2026-11-05\n")
-                let details = ["代理内核": "ok:TAG 运行中", "TUN网卡": "ok:检测通过", "出口IP": "ok:203.0.113.10/JP", "IP一致": "ok:与上次一致", "时区": "ok:Asia/Tokyo", "地区": "ok:ja_JP", "IPv6": "ok:已关闭", "DNS": "ok:走隧道", "WebRTC": "ok:STUN 仅返回代理出口地址", "保镖": "ok:最近一次保护事件（示例）", "规则置顶": "ok:行为检测通过", "客户端语言": "ok:跟随系统（英文）", "ASN属性": "ok:Example Residential", "生态可达性": "ok:claude.ai:403 api:401"]
+                let details = ["代理内核": "ok:TAG 运行中", "TUN网卡": "ok:检测通过", "出口IP": "ok:203.0.113.10/JP", "IP一致": "ok:与上次一致", "时区": "ok:Asia/Tokyo", "地区": "ok:ja_JP", "IPv6": "ok:已关闭", "DNS": "ok:走隧道", "WebRTC": "ok:STUN 仅返回代理出口地址", "保镖": "ok:巡检在线（2秒前完成）", "规则置顶": "ok:行为检测通过", "客户端语言": "ok:跟随系统（英文）", "ASN属性": "ok:Example Residential", "生态可达性": "ok:claude.ai:403 api:401"]
                 try f.audit(details)
                 let vm = f.vm()
                 vm.start(); try f.idle(vm)
@@ -389,7 +424,16 @@ struct MenuBarModelTests {
                 try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-warning", size: NSSize(width: 1060, height: 760))
                 warning["DNS"] = "fail:未走隧道，请检查客户端 DNS 配置"
                 try f.audit(warning); vm.refresh(); try f.idle(vm)
-                try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-failed", size: NSSize(width: 1060, height: 760))
+                let clientHeight = NSHostingView(rootView: ContentView(vm: vm).clientCard.frame(width: 292)).fittingSize.height
+                let retryHeight = NSHostingView(rootView: ContentView(vm: vm).retryCard.frame(width: 292).buttonStyle(ClaudeActionStyle())).fittingSize.height
+                try expect(clientHeight <= 70 && retryHeight <= 76, "代理选择与空错误提示不能挤占账号区域")
+                for dark in [false, true] {
+                    try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-failed-\(dark ? "dark" : "light")", size: NSSize(width: 1060, height: 760), dark: dark)
+                }
+                vm.banner = String(repeating: "错误详情较长时应保持卡片紧凑，可悬停查看完整信息。", count: 12)
+                let longHeight = NSHostingView(rootView: ContentView(vm: vm).retryCard.frame(width: 292).buttonStyle(ClaudeActionStyle())).fittingSize.height
+                try expect(longHeight <= 110, "长错误内容不能无限撑高右侧卡片")
+                try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-long-error", size: NSSize(width: 1060, height: 760))
                 try f.write("check-delay", "0.8")
                 vm.refresh()
                 try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-loading", size: NSSize(width: 1060, height: 760))

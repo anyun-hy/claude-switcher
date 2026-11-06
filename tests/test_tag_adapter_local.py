@@ -43,6 +43,7 @@ class TagAdapterTests(unittest.TestCase):
                         CLAUDE_SWITCHER_PYTHON=sys.executable)
         # Non-interactive Bash can source BASH_ENV and silently replace PATH.
         self.env.pop("BASH_ENV", None)
+        self.env.pop("ENV", None)
         self.stub("launchctl", "exit 1")
 
     def stub(self, name, body):
@@ -94,12 +95,16 @@ esac''')
         self.assertEqual(self.core.read_bytes(), before)
 
     def test_guard_mode_mismatch_cannot_pass(self):
+        self.stub("launchctl", '''n=$(cat "$HOME/runs" 2>/dev/null || echo 0)
+n=$((n + 1)); echo "$n" > "$HOME/runs"
+printf 'state = not running\\nruns = %s\\nlast exit code = 0\\n' "$n"''')
+        self.stub("sleep", "exit 0")
         guard = self.root / "guard.sh"
         guard.write_text('MODE="tag"\n')
         text = self.core.read_text(encoding="utf-8").replace(
             "/Library/Application Support/claude-switcher/claude-bodyguard.sh", str(guard))
         harness = (function(text, "bodyguard_status")
-                   + '\nlaunchctl() { return 0; }\nPROXY_MODE=tag\nbodyguard_status\n')
+                   + '\nPROXY_MODE=tag\nbodyguard_status\n')
         run = subprocess.run(["/bin/bash", "-c", harness], env=self.env,
                              text=True, capture_output=True, timeout=5)
         self.assertIn("ok:", run.stdout)
@@ -113,13 +118,14 @@ esac''')
         (self.home / "Library/Logs").mkdir(parents=True)
         self.env.update(FAKE_TAG="present", FAKE_TUN="up", TAG_EXE=TAG_EXE,
                         KILL_MARKER=str(marker))
-        self.stub("ifconfig", '[ "$FAKE_TUN" = up ] && echo "inet 198.18.0.1"')
+        self.stub("ifconfig", 'if [ "$FAKE_TUN" = up ]; then echo "inet 198.18.0.1"; fi')
         self.stub("pgrep", '''case "$*" in
     *mihomo-universal-tag-darwin*) [ "$FAKE_TAG" = missing ] && exit 1; echo 321 ;;
     *Claude.app*) echo 654 ;;
     *) exit 1 ;;
 esac''')
-        self.stub("ps", '''case "$FAKE_TAG" in
+        self.stub("ps", '''[ "$1" = -axo ] && exit 0
+case "$FAKE_TAG" in
     present) echo "$TAG_EXE" ;;
     spoof) echo /usr/bin/other-process ;;
     *) exit 1 ;;

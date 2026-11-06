@@ -91,6 +91,7 @@ final class VM: ObservableObject {
     @Published var banner = ""
     @Published var note = ""
     @Published var fingerprint = ""
+    @Published private(set) var guardLastEvent = ""
     @Published private(set) var isBusy = false
     @Published private(set) var lastCheckSummary = "尚未检查"
     @Published var updateText = ""
@@ -151,7 +152,7 @@ final class VM: ObservableObject {
     var onRelaunchRequested: (() -> Void)?
 
     init(core: String = NSHomeDirectory() + "/.local/bin/claude-switch.sh",
-         checkTimeout: TimeInterval = 45, operationTimeout: TimeInterval = 180,
+         checkTimeout: TimeInterval = 65, operationTimeout: TimeInterval = 180,
          updateTimeout: TimeInterval = 600) {
         self.core = core
         self.checkTimeout = checkTimeout
@@ -306,6 +307,7 @@ final class VM: ObservableObject {
         lastCheckSummary = "检查中"
         banner = ""
         note = ""
+        guardLastEvent = ""
         for i in rows.indices { rows[i].state = .pending; rows[i].detail = "" }
         run(["checkdetail"], timeout: checkTimeout) { result in
             var allOk = result.succeeded
@@ -319,6 +321,10 @@ final class VM: ObservableObject {
                 "客户端语言": "客户端语言", "ASN属性": "ASN 属性", "生态可达性": "生态可达性",
             ]
             for line in result.output.split(separator: "\n") {
+                if line.hasPrefix("#保镖事件=") {
+                    self.guardLastEvent = String(line.dropFirst("#保镖事件=".count))
+                    continue
+                }
                 let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
                 guard parts.count == 2, let rowName = keyMap[parts[0]],
                       let idx = self.rows.firstIndex(where: { $0.name == rowName }) else { continue }
@@ -332,6 +338,19 @@ final class VM: ObservableObject {
                 default: self.rows[idx].state = .fail; allOk = false
                 }
                 self.rows[idx].detail = status.count > 1 ? status[1] : ""
+                if rowName == "保镖在线", self.rows[idx].state == .warn || self.rows[idx].state == .skip {
+                    self.rows[idx].state = .fail
+                    self.rows[idx].detail = "保镖必须在线，不能跳过或降级为警告"
+                    allOk = false
+                }
+                if rowName == "保镖在线", self.rows[idx].state == .ok,
+                   (self.rows[idx].detail == "待命" ||
+                    self.rows[idx].detail.range(of: #"^\d{4}-\d{2}-\d{2} "#, options: .regularExpression) != nil) {
+                    self.guardLastEvent = self.rows[idx].detail == "待命" ? "" : self.rows[idx].detail
+                    self.rows[idx].state = .fail
+                    self.rows[idx].detail = "旧核心未验证巡检在线，请更新核心后重查"
+                    allOk = false
+                }
             }
             if !result.succeeded {
                 self.banner = result.output.isEmpty ? "核心脚本执行失败" : result.output
@@ -1220,7 +1239,8 @@ struct ContentView: View {
                         .foregroundColor(row.state == .warn ? ClaudeTheme.warning : ClaudeTheme.muted)
                         .lineLimit(1).truncationMode(.middle)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .help(row.detail)
+                        .help(row.name == "保镖在线" && !vm.guardLastEvent.isEmpty
+                              ? row.detail + "\n上次保护事件：" + vm.guardLastEvent : row.detail)
                     Label(row.state.label, systemImage: row.state.symbol)
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(row.state.color)
@@ -1239,14 +1259,23 @@ struct ContentView: View {
     }
 
     var clientCard: some View {
-        ClaudeSurface(title: "代理客户端", subtitle: "选择后重新检查环境") {
-            Picker("代理客户端", selection: Binding(get: { vm.currentClient }, set: { vm.setClient($0) })) {
-                ForEach(VM.clientChoices, id: \.key) { Text($0.label).tag($0.key) }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Text("代理客户端").font(.system(size: 13, weight: .semibold))
+                Spacer(minLength: 0)
+                Picker("代理客户端", selection: Binding(get: { vm.currentClient }, set: { vm.setClient($0) })) {
+                    ForEach(VM.clientChoices, id: \.key) { Text($0.label).tag($0.key) }
+                }
+                .labelsHidden().pickerStyle(.menu).frame(width: 142).controlSize(.regular)
+                .disabled(vm.isBusy || vm.isSwitchingClient)
             }
-            .labelsHidden().frame(maxWidth: .infinity).controlSize(.large)
-            .disabled(vm.isBusy || vm.isSwitchingClient)
             if vm.isSwitchingClient { Label("正在同步客户端…", systemImage: "clock").font(.caption) }
         }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ClaudeTheme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.cardBorder))
     }
 
     var accountCard: some View {
@@ -1316,15 +1345,27 @@ struct ContentView: View {
     }
 
     var retryCard: some View {
-        ClaudeSurface(title: vm.phase == .fixing ? "正在修复" : "需要处理未通过项") {
-            Text(vm.banner).font(.caption).foregroundColor(ClaudeTheme.error)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
                 if vm.phase == .fixing { ProgressView().controlSize(.small) }
+                Text(vm.phase == .fixing ? "正在修复" : "检查未通过")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer(minLength: 0)
                 Button("一键修复") { vm.fixAll() }.buttonStyle(ClaudeActionStyle(primary: true))
                 Button("重查") { vm.refresh() }
-            }.disabled(vm.isBusy)
+            }
+            .controlSize(.small)
+            .disabled(vm.isBusy)
+            if !vm.banner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(vm.banner).font(.caption).foregroundColor(ClaudeTheme.error)
+                    .lineLimit(2).truncationMode(.tail).help(vm.banner)
+            }
         }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ClaudeTheme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.cardBorder))
     }
 
     var footer: some View {

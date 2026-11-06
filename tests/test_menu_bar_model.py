@@ -9,6 +9,7 @@ import unittest
 
 PROJECT = Path(__file__).resolve().parents[1]
 SCENARIOS = (
+    "bodyguard_history", "bodyguard_offline", "bodyguard_legacy", "bodyguard_not_optional",
     "network_preview_readonly", "network_level_invalidates_plan", "network_apply_and_validate",
     "network_restart_keeps_interlock", "network_failed_validation_and_rollback",
     "network_cancel_and_invalid_report", "network_layout",

@@ -23,15 +23,24 @@ class SetClientTests(unittest.TestCase):
         self.guard.write_text('MODE="clash-verge"\n', encoding="utf-8")
         self.fakebin = self.root / "bin"
         self.fakebin.mkdir()
+        self.env = dict(os.environ, HOME=str(self.root), PATH=f"{self.fakebin}:/usr/bin:/bin")
+        for key in ("BASH_ENV", "ENV"):
+            self.env.pop(key, None)
         fake_launchctl = self.fakebin / "launchctl"
-        fake_launchctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_launchctl.write_text("""#!/bin/sh
+n=$(cat "$HOME/guard-runs" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$HOME/guard-runs"
+printf 'state = not running\\nruns = %s\\nlast exit code = 0\\n' "$n"
+""", encoding="utf-8")
         fake_launchctl.chmod(0o755)
+        self.stub("sleep", "#!/bin/sh\nexit 0\n")
         source = SCRIPT.read_text(encoding="utf-8")
         source = source.replace("/Library/Application Support/claude-switcher/claude-bodyguard.sh", str(self.guard))
         self.copy.write_text(source, encoding="utf-8")
 
     def run_set(self, mode):
-        env = dict(os.environ, CLAUDE_SWITCHER_CORE=str(self.copy),
+        env = dict(self.env, CLAUDE_SWITCHER_CORE=str(self.copy),
                    HOME=str(self.root), PATH=f"{self.fakebin}:/usr/bin:/bin")
         return subprocess.run(["/bin/bash", str(self.copy), "set-client", mode],
                               env=env, text=True, capture_output=True, timeout=10)
@@ -67,7 +76,7 @@ class SetClientTests(unittest.TestCase):
         (self.fakebin / "pkill").write_text("#!/bin/sh\ntouch \"$CLAUDE_SWITCHER_TEST_ROOT/pkill-called\"\n", encoding="utf-8")
         for name in ("ifconfig", "pgrep", "pkill"):
             (self.fakebin / name).chmod(0o755)
-        env = dict(os.environ, HOME=str(self.root), CLAUDE_SWITCHER_TEST_ROOT=str(self.root),
+        env = dict(self.env, HOME=str(self.root), CLAUDE_SWITCHER_TEST_ROOT=str(self.root),
                    PATH=f"{self.fakebin}:/usr/bin:/bin")
         run = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=5)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
@@ -88,7 +97,7 @@ class SetClientTests(unittest.TestCase):
         path.chmod(0o755)
 
     def run_guard(self, script):
-        env = dict(os.environ, HOME=str(self.root), CLAUDE_SWITCHER_TEST_ROOT=str(self.root),
+        env = dict(self.env, HOME=str(self.root), CLAUDE_SWITCHER_TEST_ROOT=str(self.root),
                    PATH=f"{self.fakebin}:/usr/bin:/bin")
         # enable -n kill: 让脚本的 kill 走 PATH 桩而不是内建,便于断言目标 PID
         return subprocess.run(["/bin/bash", "-c", 'enable -n kill\n. "$1"', "guard", str(script)],
@@ -190,7 +199,7 @@ class SetClientTests(unittest.TestCase):
     def test_gui_set_client_syncs_stale_bodyguard_mode(self):
         self.stub("osascript",
                   f"#!/bin/sh\n/usr/bin/sed -i '' 's/^MODE=\"[^\"]*\"/MODE=\"flclash\"/' '{self.guard}'\n")
-        env = dict(os.environ, CLAUDE_SWITCHER_CORE=str(self.copy),
+        env = dict(self.env, CLAUDE_SWITCHER_CORE=str(self.copy),
                    HOME=str(self.root), PATH=f"{self.fakebin}:/usr/bin:/bin")
         result = subprocess.run(["/bin/bash", str(self.copy), "set-client", "flclash", "--gui"],
                                 env=env, text=True, capture_output=True, timeout=10)
@@ -210,8 +219,8 @@ class SetClientTests(unittest.TestCase):
         match = re.search(r"(?ms)^bodyguard_status\(\) \{\n.*?^\}", core)
         self.assertIsNotNone(match, "bodyguard status needs current installed MODE validation")
         self.assertIn('echo "保镖=$(bodyguard_status)"', core)
-        cmd = match.group(0) + '\nlaunchctl() { return 0; }\nPROXY_MODE="shadowrocket"\nbodyguard_status\n'
-        env = dict(os.environ, HOME=str(self.root), PATH=f"{self.fakebin}:/usr/bin:/bin")
+        cmd = match.group(0) + '\nPROXY_MODE="shadowrocket"\nbodyguard_status\n'
+        env = self.env
         run = subprocess.run(["/bin/bash", "-c", cmd], cwd=self.root, env=env,
                              text=True, capture_output=True, timeout=5)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
@@ -241,9 +250,8 @@ networksetup() { echo 'IPv6: off'; }
 dig() { echo '198.18.0.1'; }
 webrtc_status() { echo 'ok:fixture'; }
 route_ok() { return 0; }
-launchctl() { return 0; }
 """
-        env = dict(os.environ, HOME=str(self.root), PATH=f"{self.fakebin}:/usr/bin:/bin")
+        env = self.env
         src = harness + '\n' + guard_fn + '\n' + check_fn + '\ncheck\n'
         fail = subprocess.run(["/bin/bash", "-c", src], env=env, cwd=self.root,
                               text=True, capture_output=True, timeout=6)
@@ -283,7 +291,7 @@ bodyguard_status() { echo 'ok:运行中'; }
 route_ok() { return 0; }
 route_detail() { echo 'ok:fixture'; }
 """
-        env = dict(os.environ, HOME=str(self.root), PATH=f"{self.fakebin}:/usr/bin:/bin")
+        env = self.env
         # 场景 1: 当前配置的 FlClash 已关闭，但检测到 TAG 运行中，且有 2 个 TUN 网卡
         src_stopped = harness + "\nproxy_alive() { return 1; }\n" + checkdetail_fn + "\ncheckdetail\n"
         res1 = subprocess.run(["/bin/bash", "-c", src_stopped], env=env, cwd=self.root,

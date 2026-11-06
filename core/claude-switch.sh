@@ -2058,8 +2058,9 @@ webrtc_status() {
 # 保镖脚本由 root 安装，MODE 在安装时写死。核心切客户端后必须检测模式一致性，
 # 否则旧保镖可能按错误的代理进程状态关闭 Claude，单看 launchctl 在线会误报成功。
 bodyguard_status() {
-    if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
-        echo 'fail:未安装'
+    local snapshot
+    if ! snapshot=$(launchctl print system/local.claude-bodyguard 2>/dev/null); then
+        echo 'fail:保镖离线（系统服务未注册或不可访问）'
         return
     fi
     local guard="/Library/Application Support/claude-switcher/claude-bodyguard.sh"
@@ -2077,9 +2078,100 @@ bodyguard_status() {
         echo "fail:客户端不一致(核心=$PROXY_MODE,保镖=$guard_mode;请点一键修复或重新运行安装器同步)"
         return
     fi
-    local lastkill
-    lastkill=$(tail -1 "$HOME/Library/Logs/claude-bodyguard.log" 2>/dev/null | cut -c1-40)
-    echo "ok:${lastkill:-待命}"
+    local heartbeat="${guard%/*}/claude-bodyguard-health" modern=0
+    local attempt last_exit runs baseline="" state reason="未收到有效巡检记录"
+    local record fields schema stamp mode result now age attributes
+    grep -q '^HEALTH_SCHEMA=1$' "$guard" && modern=1
+    # New daemons publish a root-owned completion heartbeat. Legacy installations
+    # remain compatible only when an actual successful run is observed, never
+    # merely because launchd knows the service. All observation is read-only.
+    for attempt in $(seq 0 15); do
+        last_exit=$(printf '%s\n' "$snapshot" | awk '$1=="last" && $2=="exit" && $3=="code" && $4=="=" && $5 ~ /^-?[0-9]+$/ {print $5; exit}')
+        if [ -n "$last_exit" ] && [ "$last_exit" -ne 0 ]; then
+            echo "fail:保镖巡检异常（最近退出码 ${last_exit}）"
+            return
+        fi
+        if [ "$modern" -eq 1 ]; then
+            if [ -L "$heartbeat" ] || { [ -e "$heartbeat" ] && [ ! -f "$heartbeat" ]; }; then
+                echo 'fail:保镖巡检记录类型异常'
+                return
+            fi
+            if [ -r "$heartbeat" ]; then
+                attributes=$(stat -f '%u:%Lp' "$heartbeat" 2>/dev/null)
+                if [ "$attributes" != "0:644" ]; then
+                    echo 'fail:保镖巡检记录权限异常（应为 root 所有、644）'
+                    return
+                fi
+                record=$(cat "$heartbeat")
+                fields=$(printf '%s\n' "$record" | awk -F= '
+                    NF!=2 {bad=1}
+                    $1=="schema" {s=$2; a++}
+                    $1=="time" {t=$2; b++}
+                    $1=="mode" {m=$2; c++}
+                    $1=="result" {r=$2; d++}
+                    END {if(!bad && NR==4 && a==1 && b==1 && c==1 && d==1) print s "|" t "|" m "|" r}')
+                IFS='|' read -r schema stamp mode result <<< "$fields"
+                case "$stamp" in
+                    ''|*[!0-9]*) echo 'fail:保镖巡检记录无效'; return ;;
+                esac
+                if [ "$schema" != "1" ] || [ "${#stamp}" -gt 12 ] ||
+                   { [ "$result" != "ok" ] && [ "$result" != "error" ]; }; then
+                    echo 'fail:保镖巡检记录无效'
+                    return
+                fi
+                now=$(date +%s)
+                age=$((now - 10#$stamp))
+                if [ "$mode" = "$PROXY_MODE" ] && [ "$age" -ge 0 ] && [ "$age" -le 30 ]; then
+                    if [ "$result" = "error" ]; then
+                        echo 'fail:保镖最近巡检或保护操作失败'
+                    else
+                        echo "ok:巡检在线（${age}秒前完成）"
+                    fi
+                    return
+                fi
+                reason="保镖离线或巡检超时（30秒内无当前客户端的成功记录）"
+            fi
+        else
+            runs=$(printf '%s\n' "$snapshot" | awk '/^[[:space:]]*runs = [0-9]+[[:space:]]*$/ {print $3; exit}')
+            state=$(printf '%s\n' "$snapshot" | sed -n 's/^[[:space:]]*state = //p' | head -1)
+            case "$runs" in
+                ''|*[!0-9]*) echo 'fail:旧保镖运行状态无法验证，请更新系统守护'; return ;;
+            esac
+            if [ -z "$baseline" ]; then
+                baseline="$runs"
+            elif [ "$runs" -lt "$baseline" ]; then
+                echo 'fail:保镖服务在检查期间重新载入，请重查'
+                return
+            elif [ "$runs" -gt "$baseline" ] && [ "$last_exit" = "0" ]; then
+                case "$state" in
+                    "not running"|waiting|exited)
+                        echo 'ok:巡检在线（本轮执行成功；兼容旧保镖）'
+                        return ;;
+                esac
+            fi
+            reason="保镖离线或巡检停滞（15秒内未观察到成功完成）"
+        fi
+        [ "$attempt" -eq 15 ] && break
+        sleep 1
+        if ! snapshot=$(launchctl print system/local.claude-bodyguard 2>/dev/null); then
+            echo 'fail:保镖离线（检查期间服务不可访问）'
+            return
+        fi
+    done
+    echo "fail:$reason"
+}
+
+# Historical enforcement is separate from live health, and only known,
+# credential-free event formats are exposed as an optional UI comment.
+bodyguard_last_event() {
+    local line timestamp
+    line=$(tail -1 "$HOME/Library/Logs/claude-bodyguard.log" 2>/dev/null)
+    timestamp=$(printf '%s\n' "$line" | sed -n 's/^\([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\) .*/\1/p')
+    [ -n "$timestamp" ] || return 0
+    case "$line" in
+        *"代理离线(内核或TUN丢失),已自动关闭 Claude"*|*"检测到代理/TUN状态变化("*"已自动关闭 Claude"*)
+            printf '#保镖事件=%s 检测到代理或TUN异常，执行关闭保护\n' "$timestamp" ;;
+    esac
 }
 
 # 同步 root 保镖脚本中的 MODE(需管理员权限;仅允许白名单客户端名称)
@@ -2177,6 +2269,7 @@ checkdetail() {
         optional_result "WebRTC" "$wrst" "$wrdt"
     fi
     echo "保镖=$(bodyguard_status)"
+    if declare -F bodyguard_last_event >/dev/null; then bodyguard_last_event; fi
     # 置顶规则:Clash Verge 验证运行内核;全局模式下规则不适用(全部流量已走代理)
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         if [ "$(clash_mode)" = "global" ]; then
