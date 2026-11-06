@@ -24,6 +24,28 @@ private func pump(_ seconds: TimeInterval) {
     RunLoop.current.run(until: Date().addingTimeInterval(seconds))
 }
 
+private func render<V: View>(_ root: V, name: String, size: NSSize, dark: Bool = false) throws {
+    _ = NSApplication.shared
+    let view = NSHostingView(rootView: root.environment(\.colorScheme, dark ? .dark : .light))
+    let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)!
+    let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.appearance = appearance
+    view.appearance = appearance
+    window.contentView = view
+    pump(0.1)
+    view.layoutSubtreeIfNeeded()
+    try expect(view.fittingSize.width <= size.width + 1 && view.fittingSize.height <= size.height + 1, "界面不能撑出窗口：\(name)")
+    if let directory = ProcessInfo.processInfo.environment["CLAUDE_SWITCHER_TEST_RENDER_DIR"],
+       let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        guard let data = bitmap.representation(using: .png, properties: [:]) else { throw TestFailure(description: "无法渲染：\(name)") }
+        try data.write(to: URL(fileURLWithPath: directory).appendingPathComponent(name + ".png"))
+    }
+    window.contentView = nil
+    window.close()
+}
+
 private final class Fixture {
     let root: URL
     let core: URL
@@ -211,23 +233,62 @@ struct MenuBarModelTests {
                 try expect(f.calls == ["cli-current"] && !FileManager.default.fileExists(atPath: marker.path), "界面子进程不能继承覆盖命令的 Bash 启动配置")
             case "tools_layout":
                 try f.write("tool-config", "{\"keepPaths\":\"# 通用配置\\nsettings.json\\nskills/\\n\",\"policy\":\"proxy\",\"country\":\"JP\",\"timezone\":\"Asia/Tokyo\",\"locale\":\"ja_JP\",\"client\":\"tag\"}")
-                _ = NSApplication.shared
                 let vm = f.vm()
-                for section in ["cli", "snapshot", "network", "keep"] {
-                    let view = NSHostingView(rootView: ToolsView(vm: vm, initialSection: section))
-                    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 660), styleMask: [.borderless], backing: .buffered, defer: false)
-                    window.contentView = view
-                    pump(0.1); try f.idle(vm)
-                    view.layoutSubtreeIfNeeded()
-                    try expect(view.fittingSize.width <= 681 && view.fittingSize.height <= 661, "工具布局不能撑出窗口")
-                    if let directory = ProcessInfo.processInfo.environment["CLAUDE_SWITCHER_TEST_RENDER_DIR"],
-                       let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
-                        view.cacheDisplay(in: view.bounds, to: bitmap)
-                        let data = bitmap.representation(using: .png, properties: [:])
-                        try data?.write(to: URL(fileURLWithPath: directory).appendingPathComponent("tools-\(section).png"))
+                vm.start(); try f.idle(vm)
+                let before = f.calls.count
+                for dark in [false, true] {
+                    for destination in ToolsView.destinations {
+                        try render(ToolsView(vm: vm, initialSection: destination.id),
+                                   name: "tools-\(destination.id)-\(dark ? "dark" : "light")", size: NSSize(width: 900, height: 700), dark: dark)
+                        try f.idle(vm)
                     }
-                    window.contentView = nil
                 }
+                try expect(f.calls.dropFirst(before).allSatisfy { $0 == "get-tool-config" }, "浏览工具页面只能读取配置")
+            case "dashboard_layout":
+                try f.write("client", "client=tag\n")
+                try f.write("status", "current=A hasA=1 hasB=1 hasC=0 hasD=0 accounts=A,B accB=900M@2026-11-05\n")
+                let details = ["代理内核": "ok:TAG 运行中", "TUN网卡": "ok:检测通过", "出口IP": "ok:203.0.113.10/JP", "IP一致": "ok:与上次一致", "时区": "ok:Asia/Tokyo", "地区": "ok:ja_JP", "IPv6": "ok:已关闭", "DNS": "ok:走隧道", "WebRTC": "ok:STUN 仅返回代理出口地址", "保镖": "ok:最近一次保护事件（示例）", "规则置顶": "ok:行为检测通过", "客户端语言": "ok:跟随系统（英文）", "ASN属性": "ok:Example Residential", "生态可达性": "ok:claude.ai:403 api:401"]
+                try f.audit(details)
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                for dark in [false, true] {
+                    try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-\(dark ? "dark" : "light")", size: NSSize(width: 1060, height: 760), dark: dark)
+                }
+                try render(ContentView(vm: vm).frame(width: 860, height: 620), name: "dashboard-compact", size: NSSize(width: 860, height: 620))
+                var warning = details
+                warning["IP一致"] = "warn:48h 内多个出口记录，建议固定节点"
+                warning["WebRTC"] = "skip:用户已禁用"
+                try f.audit(warning); vm.refresh(); try f.idle(vm)
+                try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-warning", size: NSSize(width: 1060, height: 760))
+                warning["DNS"] = "fail:未走隧道，请检查客户端 DNS 配置"
+                try f.audit(warning); vm.refresh(); try f.idle(vm)
+                try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-failed", size: NSSize(width: 1060, height: 760))
+                try f.write("check-delay", "0.8")
+                vm.refresh()
+                try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-loading", size: NSSize(width: 1060, height: 760))
+                try f.idle(vm)
+                try f.write("check-config", "{\"disabled\":[],\"allowOptionalFailures\":false,\"logging\":true}")
+                vm.updateText = "OK:已是最新版本（隔离界面示例）\n核心、界面与校验清单一致。"
+                for dark in [false, true] {
+                    let suffix = dark ? "dark" : "light"
+                    try render(CheckSettingsView(vm: vm), name: "settings-\(suffix)", size: NSSize(width: 640, height: 680), dark: dark)
+                    try render(UpdateSheet(vm: vm), name: "update-\(suffix)", size: NSSize(width: 640, height: 400), dark: dark)
+                    try render(FingerprintView(text: "字体=ok:示例结果\nGPU=ok:示例设备\n显示=ok:示例分辨率\n虚拟机=ok:示例结果"), name: "fingerprint-\(suffix)", size: NSSize(width: 640, height: 460), dark: dark)
+                    try render(AIPromptSheet(text: "这是隔离界面验证使用的示例提示词。\n\n请先阅读 AGENTS.md，再按授权范围执行操作。"), name: "handoff-\(suffix)", size: NSSize(width: 640, height: 520), dark: dark)
+                }
+            case "dashboard_status":
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try expect(ContentView(vm: vm).summaryState == .ok, "全部通过时应显示通过状态")
+                try f.audit(["IP一致": "warn:示例警告"])
+                vm.refresh(); try f.idle(vm)
+                try expect(ContentView(vm: vm).summaryState == .warn && ContentView(vm: vm).summaryTitle.contains("留意"), "警告不能显示为环境全部正常")
+                try f.audit(["WebRTC": "skip:用户已禁用"])
+                vm.refresh(); try f.idle(vm)
+                try expect(ContentView(vm: vm).summaryState == .skip && ContentView(vm: vm).summaryTitle.contains("跳过"), "跳过必须在总览明确说明")
+                try f.audit(["TUN网卡": "fail:示例断开"])
+                vm.refresh(); try f.idle(vm)
+                try expect(ContentView(vm: vm).summaryState == .fail && ContentView(vm: vm).summaryTitle.contains("未通过"), "硬性失败必须显示未通过")
             case "tag_client_recognized":
                 try f.write("client", "client=tag\n")
                 let vm = f.vm()

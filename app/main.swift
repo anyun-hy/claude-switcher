@@ -827,49 +827,38 @@ final class VM: ObservableObject {
 // MARK: - Claude 风格外观
 
 enum ClaudeTheme {
-    // 纸感暖色基底 (Warm Parchment / Alabaster)
-    static let bgTop = Color(red: 0.984, green: 0.976, blue: 0.961)         // #FAF9F5
-    static let bgBottom = Color(red: 0.957, green: 0.945, blue: 0.925)      // #F4F1EC
-    static let card = Color.white                                           // #FFFFFF
-    static let cardBorder = Color(red: 0.898, green: 0.882, blue: 0.855)   // #E5E1DA
-    static let divider = Color(red: 0.941, green: 0.929, blue: 0.910)      // #F0ECE8
-    static let iconWell = Color(red: 0.965, green: 0.953, blue: 0.937)     // #F6F3EF
-
-    // 字体色阶 (Editorial Ink & Warm Stone)
-    static let ink = Color(red: 0.165, green: 0.153, blue: 0.141)          // #2A2724
-    static let muted = Color(red: 0.455, green: 0.435, blue: 0.412)        // #746F69
-
-    // Claude 标志性陶土橙 (Anthropic Claude Terracotta)
-    static let terracotta = Color(red: 0.847, green: 0.447, blue: 0.329)   // #D87254
-    static let terracottaDeep = Color(red: 0.761, green: 0.369, blue: 0.259) // #C25E42
-    static let terracottaTint = Color(red: 0.847, green: 0.447, blue: 0.329).opacity(0.09)
-
-    // 自然柔和状态色
-    static let success = Color(red: 0.180, green: 0.490, blue: 0.322)       // #2E7D52 (Sage Green)
-
-    static let warning = Color(red: 0.722, green: 0.431, blue: 0.094)       // #B86E18 (Warm Amber)
-    static let warningBorder = Color(red: 0.961, green: 0.863, blue: 0.718) // #F5DCB7
-
-    static let error = Color(red: 0.761, green: 0.282, blue: 0.212)         // #C24836 (Claude Terracotta Red)
+    private static func adaptive(_ light: UInt32, _ dark: UInt32) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let hex = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+            return NSColor(srgbRed: Double((hex >> 16) & 255) / 255,
+                           green: Double((hex >> 8) & 255) / 255,
+                           blue: Double(hex & 255) / 255, alpha: 1)
+        })
+    }
+    static let bgTop = adaptive(0xF6F5F1, 0x1E211F)
+    static let bgBottom = bgTop
+    static let card = adaptive(0xFFFEFC, 0x292D29)
+    static let cardBorder = adaptive(0xDFE2DB, 0x444A43)
+    static let divider = adaptive(0xEBEDE7, 0x3A403A)
+    static let iconWell = adaptive(0xEFEFE9, 0x343A33)
+    static let sidebar = adaptive(0xEEEFE9, 0x242823)
+    static let ink = adaptive(0x292F29, 0xECEDE7)
+    static let muted = adaptive(0x687166, 0xB0B9AD)
+    static let terracotta = adaptive(0xB45A42, 0xDC947B)
+    static let terracottaDeep = adaptive(0xA94E38, 0xE4A38D)
+    static let terracottaTint = adaptive(0xF4E5DD, 0x44332B)
+    static let onAccent = adaptive(0xFFFFFF, 0x242823)
+    static let success = adaptive(0x326B4C, 0x92C5A2)
+    static let warning = adaptive(0x94661D, 0xE1BA78)
+    static let warningBorder = adaptive(0xE8D7B4, 0x645436)
+    static let error = adaptive(0xB0463C, 0xF0A096)
 }
 
 // MARK: - Claude 优雅背景
 
 struct ClaudeBackground: View {
     var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [ClaudeTheme.bgTop, ClaudeTheme.bgBottom],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            RadialGradient(
-                colors: [ClaudeTheme.terracotta.opacity(0.04), Color.clear],
-                center: .top,
-                startRadius: 0,
-                endRadius: 400
-            )
-        }
+        ClaudeTheme.bgTop
         .ignoresSafeArea()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
@@ -891,7 +880,7 @@ struct ClaudeIconButton: View {
             Image(systemName: systemName)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundColor(isHovered ? ClaudeTheme.ink : ClaudeTheme.muted)
-                .frame(width: 28, height: 28)
+                .frame(width: 36, height: 36)
                 .background(isHovered ? ClaudeTheme.iconWell : ClaudeTheme.card.opacity(0.85))
                 .clipShape(RoundedRectangle(cornerRadius: 7.5))
                 .overlay(
@@ -907,11 +896,63 @@ struct ClaudeIconButton: View {
     }
 }
 
+struct ClaudeActionStyle: ButtonStyle {
+    var primary = false
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .semibold))
+            .padding(.horizontal, 14)
+            .frame(minHeight: 36)
+            .foregroundColor(!isEnabled ? ClaudeTheme.muted : (primary ? ClaudeTheme.onAccent : ClaudeTheme.ink))
+            .background(!isEnabled ? ClaudeTheme.iconWell : (primary ? ClaudeTheme.terracotta : ClaudeTheme.card))
+            .clipShape(RoundedRectangle(cornerRadius: 9))
+            .overlay(RoundedRectangle(cornerRadius: 9).stroke(primary ? Color.clear : ClaudeTheme.cardBorder))
+            .opacity(configuration.isPressed && isEnabled ? 0.72 : 1)
+    }
+}
+
+struct ClaudeSurface<Content: View>: View {
+    var title: String
+    var subtitle: String = ""
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if !title.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).font(.system(size: 14, weight: .semibold))
+                    if !subtitle.isEmpty { Text(subtitle).font(.caption).foregroundColor(ClaudeTheme.muted) }
+                }
+            }
+            content
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ClaudeTheme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.cardBorder))
+    }
+}
+
+extension RowState {
+    var label: String {
+        switch self { case .pending: return "检查中"; case .ok: return "通过"; case .warn: return "警告"; case .fail: return "未通过"; case .skip: return "已跳过" }
+    }
+    var color: Color {
+        switch self { case .ok: return ClaudeTheme.success; case .warn: return ClaudeTheme.warning; case .fail: return ClaudeTheme.error; case .pending, .skip: return ClaudeTheme.muted }
+    }
+    var symbol: String {
+        switch self { case .ok: return "checkmark.circle.fill"; case .warn: return "exclamationmark.triangle.fill"; case .fail: return "xmark.circle.fill"; case .skip: return "minus.circle"; case .pending: return "clock" }
+    }
+}
+
 // MARK: - 视图
 
 struct ContentView: View {
     @ObservedObject var vm: VM
-    var height: CGFloat = 900
+    var height: CGFloat = 760
     @State private var showNotice = false
     @State private var showFingerprint = false
     @State private var showAIPrompt = false
@@ -919,261 +960,188 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             ClaudeBackground()
-            VStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 20) {
                 header
-                HStack {
-                    Text("环境检查").font(.caption.weight(.semibold)).foregroundColor(ClaudeTheme.muted)
-                    Spacer()
-                    statusPill
-                }
-                // 小屏上窗口高度会被系统可见区域压缩,让卡片区可滚动而不是被裁切
+                overview
                 ScrollView {
-                    VStack(spacing: 16) {
-                        checksCard
-                        clientCard
-                        if vm.phase == .ready || vm.phase == .switching || vm.phase == .done {
-                            accountCard
-                        } else if vm.coreMissing {
-                            setupCard
-                        } else if vm.phase == .failed || vm.phase == .fixing {
-                            retryCard
+                    HStack(alignment: .top, spacing: 20) {
+                        checksCard.frame(maxWidth: .infinity)
+                        VStack(spacing: 16) {
+                            clientCard
+                            if vm.coreMissing { setupCard }
+                            else {
+                                if vm.phase == .failed || vm.phase == .fixing { retryCard }
+                                accountCard
+                            }
                         }
+                        .frame(width: 292)
                     }
-                    .frame(maxWidth: .infinity)
+                    .padding(1)
                 }
                 footer
             }
-            .padding(16)
+            .padding(24)
         }
+        .font(.system(size: 13))
+        .foregroundColor(ClaudeTheme.ink)
+        .buttonStyle(ClaudeActionStyle())
+        .tint(ClaudeTheme.terracottaDeep)
         .sheet(isPresented: $showAIPrompt) { AIPromptSheet(text: vm.aiPrompt) }
         .sheet(isPresented: $vm.showSettingsSheet) { CheckSettingsView(vm: vm) }
         .sheet(isPresented: $vm.showToolsSheet) { ToolsView(vm: vm) }
-        .frame(width: 440, height: height)
-        .preferredColorScheme(.light)
+        .sheet(isPresented: $showNotice) { NoticeView() }
+        .sheet(isPresented: $showFingerprint) { FingerprintView(text: vm.fingerprint) }
+        .sheet(isPresented: $vm.showUpdateSheet) { UpdateSheet(vm: vm) }
+        .frame(minWidth: 860, idealWidth: 1060, maxWidth: .infinity,
+               minHeight: 620, idealHeight: height, maxHeight: .infinity)
+    }
+
+    var summaryState: RowState {
+        if vm.phase == .checking || vm.phase == .fixing || vm.phase == .switching { return .pending }
+        if vm.phase == .failed { return .fail }
+        if vm.rows.contains(where: { $0.state == .fail }) { return .fail }
+        if vm.rows.contains(where: { $0.state == .warn }) { return .warn }
+        if vm.rows.contains(where: { $0.state == .pending }) { return .pending }
+        if vm.rows.contains(where: { $0.state == .skip }) { return .skip }
+        return .ok
+    }
+
+    var summaryTitle: String {
+        switch vm.phase {
+        case .checking: return "正在检查环境"
+        case .failed: return vm.coreMissing ? "需要安装核心脚本" : "环境检查未通过"
+        case .switching: return "正在切换账号"
+        case .fixing: return "正在修复环境"
+        default:
+            switch summaryState {
+            case .warn: return "检查完成，有项目需要留意"
+            case .skip: return "硬性检查通过，部分项目已跳过"
+            case .ok: return "检查通过，可以选择账号"
+            case .pending: return "等待检查结果"
+            case .fail: return "环境检查未通过"
+            }
+        }
     }
 
     var header: some View {
-        HStack(spacing: 11) {
-            // Claude 风格陶土盾牌徽标
-            ZStack {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(
-                        LinearGradient(
-                            colors: [ClaudeTheme.terracotta, ClaudeTheme.terracottaDeep],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .frame(width: 40, height: 40)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10)
-                            .stroke(Color.white.opacity(0.22), lineWidth: 1)
-                    )
-                    .shadow(color: ClaudeTheme.terracotta.opacity(0.24), radius: 3.5, x: 0, y: 1.5)
-
-                Image(systemName: "shield.lefthalf.filled")
-                    .font(.system(size: 19, weight: .medium))
-                    .foregroundColor(.white)
+        HStack(spacing: 12) {
+            Image(systemName: "shield.lefthalf.filled")
+                .font(.system(size: 23, weight: .medium))
+                .foregroundColor(ClaudeTheme.terracottaDeep)
+                .frame(width: 48, height: 48)
+                .background(ClaudeTheme.terracottaTint)
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Claude 切换器").font(.system(size: 24, weight: .bold, design: .serif))
+                Text("环境检查与账号启动").font(.caption).foregroundColor(ClaudeTheme.muted)
             }
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Claude 账号切换器")
-                    .font(.system(size: 16, weight: .bold, design: .serif))
-                    .foregroundColor(ClaudeTheme.ink)
-                Text("安全检查 · 切换 · 启动")
-                    .font(.system(size: 11, weight: .regular))
-                    .foregroundColor(ClaudeTheme.muted)
-            }
-
             Spacer()
-
-            ClaudeIconButton(
-                systemName: "waveform.path.ecg",
-                help: "设备指纹体检(字体/GPU/虚拟机)",
-                disabled: vm.isBusy
-            ) {
-                showFingerprint = true
-                vm.inspectFingerprint()
-            }
-
-            ClaudeIconButton(
-                systemName: "gearshape",
-                help: "检查设置与诊断日志"
-            ) {
-                vm.showSettingsSheet = true
-            }
-
-            ClaudeIconButton(
-                systemName: "info.circle",
-                help: "安全防护体系公告"
-            ) {
-                showNotice = true
-            }
-
+            Button { vm.refresh() } label: { Label("重新检查", systemImage: "arrow.clockwise") }
+                .disabled(vm.isBusy)
+            Button { vm.showToolsSheet = true } label: { Label("工具箱", systemImage: "square.grid.2x2") }
+                .buttonStyle(ClaudeActionStyle(primary: true))
+                .disabled(vm.isBusy || vm.checkingUpdate)
+            ClaudeIconButton(systemName: "gearshape", help: "检查设置与诊断日志") { vm.showSettingsSheet = true }
         }
-        .sheet(isPresented: $showNotice) { NoticeView() }
-        .sheet(isPresented: $showFingerprint) { FingerprintView(text: vm.fingerprint) }
     }
 
-    var statusPill: some View {
-        let (txt, color): (String, Color) = {
-            switch vm.phase {
-            case .checking: return ("检查中", ClaudeTheme.terracottaDeep)
-            case .ready: return ("环境安全", ClaudeTheme.success)
-            case .failed: return ("检查未过", ClaudeTheme.error)
-            case .switching: return ("切换中", ClaudeTheme.terracottaDeep)
-            case .fixing: return ("修复中", ClaudeTheme.terracottaDeep)
-            case .done: return ("完成", ClaudeTheme.success)
-            }
-        }()
-        return Text(txt)
-            .font(.caption.bold())
-            .padding(.horizontal, 10).padding(.vertical, 5)
-            .background(color.opacity(0.18))
-            .foregroundColor(color)
-            .clipShape(Capsule())
-    }
-
-    var checksCard: some View {
-        VStack(spacing: 0) {
-            ForEach(Array(vm.rows.enumerated()), id: \.element.id) { idx, row in
-                HStack(spacing: 10) {
-                    // 左侧图标容器
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(ClaudeTheme.iconWell)
-                            .frame(width: 24, height: 24)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .stroke(ClaudeTheme.divider, lineWidth: 0.5)
-                            )
-                        Image(systemName: row.icon)
-                            .font(.system(size: 11.5, weight: .medium))
-                            .foregroundColor(ClaudeTheme.muted)
-                    }
-
-                    Text(row.name)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(ClaudeTheme.ink)
-
-                    Spacer(minLength: 8)
-
-                    if !row.detail.isEmpty {
-                        Text(row.detail)
-                            .font(.system(size: 11.5, weight: .regular, design: isMonospace(row.detail) ? .monospaced : .default))
-                            .foregroundColor(row.state == .warn ? ClaudeTheme.warning : ClaudeTheme.muted)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-
-                    stateIcon(row.state)
-                }
-                .padding(.vertical, 5.5)
-                .padding(.horizontal, 12)
-
-                if idx < vm.rows.count - 1 {
-                    Divider()
-                        .overlay(ClaudeTheme.divider)
-                        .padding(.leading, 46)
-                }
-            }
-        }
-        .background(ClaudeTheme.card)
-        .clipShape(RoundedRectangle(cornerRadius: 13))
-        .overlay(
-            RoundedRectangle(cornerRadius: 13)
-                .stroke(ClaudeTheme.cardBorder, lineWidth: 1)
-        )
-        .shadow(color: Color(red: 0.2, green: 0.16, blue: 0.12).opacity(0.035), radius: 6, x: 0, y: 2)
-    }
-
-    private func isMonospace(_ str: String) -> Bool {
-        str.contains(".") || str.contains(":") || str.contains("/")
-    }
-
-    var clientCard: some View {
-        HStack(spacing: 10) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(ClaudeTheme.iconWell)
-                    .frame(width: 24, height: 24)
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(ClaudeTheme.divider, lineWidth: 0.5))
-                Image(systemName: "network")
-                    .font(.system(size: 11.5, weight: .medium))
-                    .foregroundColor(ClaudeTheme.muted)
-            }
-            Text("代理客户端").font(.system(size: 13, weight: .medium)).foregroundColor(ClaudeTheme.ink)
-            Spacer()
-            if vm.isSwitchingClient {
-                ProgressView().scaleEffect(0.6).frame(width: 16, height: 16)
-            }
-            Picker("", selection: Binding(
-                get: { vm.currentClient },
-                set: { vm.setClient($0) }
-            )) {
-                ForEach(VM.clientChoices, id: \.key) { choice in
-                    Text(choice.label).tag(choice.key)
-                }
-            }
-            .labelsHidden()
-            .frame(width: 150)
-            .disabled(vm.isBusy || vm.isSwitchingClient)
-        }
-        .padding(.vertical, 7)
-        .padding(.horizontal, 12)
-        .background(ClaudeTheme.card)
-        .clipShape(RoundedRectangle(cornerRadius: 13))
-        .overlay(RoundedRectangle(cornerRadius: 13).stroke(ClaudeTheme.cardBorder, lineWidth: 1))
-        .shadow(color: Color(red: 0.2, green: 0.16, blue: 0.12).opacity(0.035), radius: 6, x: 0, y: 2)
-    }
-
-    func stateIcon(_ s: RowState) -> some View {
-        Group {
-            switch s {
-            case .pending: ProgressView().scaleEffect(0.55).frame(width: 16, height: 16)
-            case .ok: Image(systemName: "checkmark.circle.fill").foregroundColor(ClaudeTheme.success)
-            case .warn: Image(systemName: "exclamationmark.triangle.fill").foregroundColor(ClaudeTheme.warning)
-            case .fail: Image(systemName: "xmark.octagon.fill").foregroundColor(ClaudeTheme.error)
-            case .skip: Image(systemName: "minus.circle").foregroundColor(ClaudeTheme.muted)
-            }
-        }
-        .font(.callout)
-    }
-
-    var accountCard: some View {
-        VStack(spacing: 12) {
-            if vm.phase == .switching {
-                HStack(spacing: 8) {
-                    ProgressView().scaleEffect(0.7)
-                    Text(vm.banner).font(.callout).foregroundColor(ClaudeTheme.ink)
-                }
-                .frame(maxWidth: .infinity).padding(.vertical, 10)
-            } else if vm.phase == .done {
-                VStack(spacing: 4) {
-                    Label(vm.banner, systemImage: "checkmark.circle.fill").foregroundColor(ClaudeTheme.success).font(.callout.bold())
-                    if !vm.note.isEmpty { Text(vm.note).font(.caption).foregroundColor(ClaudeTheme.warning).multilineTextAlignment(.center) }
-                }
-                .frame(maxWidth: .infinity).padding(.vertical, 10)
+    private var overview: some View {
+        HStack(spacing: 16) {
+            if summaryState == .pending {
+                ProgressView().controlSize(.regular).frame(width: 28, height: 28)
             } else {
-                HStack(spacing: 6) {
-                    Text("当前账号").font(.caption).foregroundColor(ClaudeTheme.muted)
-                    Text(vm.current).font(.caption.bold())
-                        .padding(.horizontal, 8).padding(.vertical, 3)
-                        .background(ClaudeTheme.terracottaTint).foregroundColor(ClaudeTheme.terracottaDeep)
-                        .clipShape(Capsule())
-                    Spacer()
+                Image(systemName: summaryState.symbol).font(.system(size: 26)).foregroundColor(summaryState.color)
+            }
+            VStack(alignment: .leading, spacing: 5) {
+                Text(summaryTitle).font(.system(size: 16, weight: .semibold))
+                Text("最近检查：\(vm.lastCheckSummary)").font(.caption).foregroundColor(ClaudeTheme.muted)
+            }
+            Spacer()
+            ForEach([RowState.ok, .warn, .fail, .skip], id: \.label) { state in
+                VStack(spacing: 4) {
+                    Text("\(vm.rows.filter { $0.state == state }.count)")
+                        .font(.system(size: 20, weight: .semibold, design: .rounded)).monospacedDigit()
+                    Text(state.label).font(.caption2)
                 }
-                LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
-                    ForEach(VM.accountLetters, id: \.self) { t in
-                        accountButton(t, subtitle: accountSubtitle(t))
-                    }
-                }
+                .foregroundColor(state.color)
+                .frame(width: 52)
             }
         }
-        .padding(12)
+        .padding(20)
         .background(ClaudeTheme.card)
         .clipShape(RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.cardBorder))
+    }
+
+    var checksCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("环境检查").font(.system(size: 15, weight: .semibold))
+                Spacer()
+                Text("\(vm.rows.count) 项").font(.caption).foregroundColor(ClaudeTheme.muted)
+                Button { showFingerprint = true; vm.inspectFingerprint() } label: {
+                    Label("设备指纹", systemImage: "waveform.path.ecg")
+                }.disabled(vm.isBusy)
+            }.padding(.horizontal, 16).padding(.vertical, 10)
+            Divider().overlay(ClaudeTheme.divider)
+            ForEach(Array(vm.rows.enumerated()), id: \.element.id) { index, row in
+                HStack(spacing: 12) {
+                    Image(systemName: row.icon)
+                        .font(.system(size: 13)).foregroundColor(ClaudeTheme.muted)
+                        .frame(width: 20)
+                    Text(row.name).font(.system(size: 12.5, weight: .medium))
+                        .frame(width: 116, alignment: .leading)
+                    Text(row.detail.isEmpty ? "—" : row.detail)
+                        .font(.system(size: 12))
+                        .foregroundColor(row.state == .warn ? ClaudeTheme.warning : ClaudeTheme.muted)
+                        .lineLimit(1).truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .help(row.detail)
+                    Label(row.state.label, systemImage: row.state.symbol)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(row.state.color)
+                        .frame(width: 62, alignment: .leading)
+                }
+                .padding(.horizontal, 16).frame(minHeight: 31)
+                .accessibilityElement(children: .combine)
+                if index < vm.rows.count - 1 {
+                    Divider().overlay(ClaudeTheme.divider).padding(.leading, 48)
+                }
+            }
+        }
+        .background(ClaudeTheme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.cardBorder))
+    }
+
+    var clientCard: some View {
+        ClaudeSurface(title: "代理客户端", subtitle: "选择后重新检查环境") {
+            Picker("代理客户端", selection: Binding(get: { vm.currentClient }, set: { vm.setClient($0) })) {
+                ForEach(VM.clientChoices, id: \.key) { Text($0.label).tag($0.key) }
+            }
+            .labelsHidden().frame(maxWidth: .infinity).controlSize(.large)
+            .disabled(vm.isBusy || vm.isSwitchingClient)
+            if vm.isSwitchingClient { Label("正在同步客户端…", systemImage: "clock").font(.caption) }
+        }
+    }
+
+    var accountCard: some View {
+        ClaudeSurface(title: "账号", subtitle: "每次启动前重新完成环境检查") {
+            HStack {
+                Text("当前账号").font(.caption).foregroundColor(ClaudeTheme.muted)
+                Spacer()
+                Text(VM.accountLetters.contains(vm.current) ? "账号 \(vm.current)" : "待确认")
+                    .font(.system(size: 13, weight: .semibold)).foregroundColor(ClaudeTheme.terracottaDeep)
+            }
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+                ForEach(VM.accountLetters, id: \.self) { accountButton($0, subtitle: accountSubtitle($0)) }
+            }
+            if vm.phase == .switching || vm.phase == .done {
+                Text(vm.banner).font(.caption).foregroundColor(vm.phase == .done ? ClaudeTheme.success : ClaudeTheme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !vm.note.isEmpty { Text(vm.note).font(.caption).foregroundColor(ClaudeTheme.warning) }
+            }
+        }
     }
 
     func accountSubtitle(_ t: String) -> String {
@@ -1191,53 +1159,32 @@ struct ContentView: View {
 
     func accountButton(_ t: String, subtitle: String) -> some View {
         Button { vm.switchTo(t) } label: {
-            VStack(spacing: 4) {
-                Text("账号 \(t)").font(.headline).foregroundColor(vm.current == t ? .white : ClaudeTheme.ink)
-                Text(subtitle).font(.caption2).foregroundColor(vm.current == t ? .white.opacity(0.9) : ClaudeTheme.muted)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text(t).font(.system(size: 24, weight: .medium, design: .serif))
+                    Spacer()
+                    if vm.current == t { Image(systemName: "checkmark.circle.fill").font(.caption) }
+                }
+                Text(subtitle).font(.system(size: 10.5)).lineLimit(2).frame(minHeight: 26, alignment: .topLeading)
             }
-            .frame(maxWidth: .infinity).padding(.vertical, 14)
-            .background(
-                vm.current == t
-                ? LinearGradient(colors: [ClaudeTheme.terracotta, ClaudeTheme.terracottaDeep], startPoint: .top, endPoint: .bottom)
-                : LinearGradient(colors: [ClaudeTheme.iconWell, ClaudeTheme.iconWell], startPoint: .top, endPoint: .bottom)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(vm.current == t ? ClaudeTheme.terracotta : ClaudeTheme.cardBorder, lineWidth: 1.2))
+            .foregroundColor(vm.current == t ? ClaudeTheme.terracottaDeep : ClaudeTheme.ink)
+            .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+            .background(vm.current == t ? ClaudeTheme.terracottaTint : ClaudeTheme.iconWell)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(vm.current == t ? ClaudeTheme.terracotta.opacity(0.4) : Color.clear))
         }
         .buttonStyle(.plain)
-        .disabled(vm.isBusy)
+        .disabled(vm.isBusy || vm.phase == .failed || vm.phase == .checking || vm.coreMissing)
+        .opacity(vm.isBusy || vm.phase == .failed || vm.phase == .checking || vm.coreMissing ? 0.5 : 1)
+        .accessibilityLabel("账号 \(t)，\(subtitle)")
+        .help(vm.current == t ? "启动当前账号" : "切换到账号 \(t)")
     }
 
     var setupCard: some View {
-        VStack(spacing: 10) {
-            Text("还差一步：安装核心脚本").font(.callout.bold()).foregroundColor(ClaudeTheme.ink)
-            Text(vm.banner).font(.caption).foregroundColor(ClaudeTheme.muted).multilineTextAlignment(.center)
-            HStack(spacing: 10) {
-                Button { openURL("https://github.com/YOURSJEYO/claude-switcher/releases/latest") } label: {
-                    Label("打开下载页", systemImage: "arrow.down.circle")
-                        .font(.callout.bold())
-                        .padding(.horizontal, 18).padding(.vertical, 8)
-                        .background(LinearGradient(colors: [ClaudeTheme.terracotta, ClaudeTheme.terracottaDeep], startPoint: .leading, endPoint: .trailing))
-                        .foregroundColor(.white)
-                        .clipShape(Capsule())
-                }
-                .buttonStyle(.plain)
-                Button { openURL("https://github.com/YOURSJEYO/claude-switcher#安装") } label: {
-                    Label("安装说明", systemImage: "book")
-                        .font(.callout.bold())
-                        .padding(.horizontal, 18).padding(.vertical, 8)
-                        .background(ClaudeTheme.iconWell)
-                        .foregroundColor(ClaudeTheme.ink)
-                        .clipShape(Capsule())
-                }
-                .buttonStyle(.plain)
-            }
+        ClaudeSurface(title: "需要安装核心脚本", subtitle: "安装完成后重新检查") {
+            Text(vm.banner).font(.caption).foregroundColor(ClaudeTheme.muted)
+            Button("打开安装说明") { openURL("https://github.com/anyun-hy/claude-switcher#安装") }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity)
-        .background(ClaudeTheme.error.opacity(0.07))
-        .clipShape(RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.error.opacity(0.25)))
     }
 
     private func openURL(_ text: String) {
@@ -1245,74 +1192,30 @@ struct ContentView: View {
     }
 
     var retryCard: some View {
-        VStack(spacing: 10) {
-            if vm.phase == .fixing {
-                HStack(spacing: 8) {
-                    ProgressView().scaleEffect(0.7)
-                    Text(vm.banner).font(.callout).foregroundColor(ClaudeTheme.ink)
-                }
-            } else {
-                if !vm.banner.isEmpty {
-                    Text(vm.banner).font(.callout).foregroundColor(ClaudeTheme.error).multilineTextAlignment(.center)
-                }
-                Text("存在未通过项，可一键修复或手动处理后重试").font(.caption).foregroundColor(ClaudeTheme.muted)
-                HStack(spacing: 10) {
-                    Button { vm.fixAll() } label: {
-                        Label("一键修复", systemImage: "wand.and.stars")
-                            .font(.callout.bold())
-                            .padding(.horizontal, 18).padding(.vertical, 8)
-                            .background(LinearGradient(colors: [ClaudeTheme.terracotta, ClaudeTheme.terracottaDeep], startPoint: .leading, endPoint: .trailing))
-                            .foregroundColor(.white)
-                            .clipShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(vm.isBusy)
-                    Button { vm.refresh() } label: {
-                        Label("重新检查", systemImage: "arrow.clockwise")
-                            .font(.callout.bold())
-                            .padding(.horizontal, 18).padding(.vertical, 8)
-                            .background(ClaudeTheme.iconWell)
-                            .foregroundColor(ClaudeTheme.ink)
-                            .clipShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(vm.isBusy)
-                }
-            }
+        ClaudeSurface(title: vm.phase == .fixing ? "正在修复" : "需要处理未通过项") {
+            Text(vm.banner).font(.caption).foregroundColor(ClaudeTheme.error)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                if vm.phase == .fixing { ProgressView().controlSize(.small) }
+                Button("一键修复") { vm.fixAll() }.buttonStyle(ClaudeActionStyle(primary: true))
+                Button("重查") { vm.refresh() }
+            }.disabled(vm.isBusy)
         }
-        .frame(maxWidth: .infinity)
-        .padding(12)
-        .background(ClaudeTheme.card)
-        .clipShape(RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.warningBorder))
     }
 
     var footer: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "lock.shield").font(.caption2)
-            Text("硬性安全项必须通过；灰色跳过不表示检查通过").font(.caption2)
+        HStack(spacing: 16) {
+            Label("硬性安全项必须通过；跳过不表示通过", systemImage: "lock.shield")
+                .font(.system(size: 11)).foregroundColor(ClaudeTheme.muted)
             Spacer()
-            Button {
-                vm.checkUpdate()
-                vm.showUpdateSheet = true
-            } label: {
-                Text("检查更新").font(.caption2).foregroundColor(ClaudeTheme.muted)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("检查更新")
-            Button { vm.showToolsSheet = true } label: {
-                Text("工具").font(.caption2).foregroundColor(ClaudeTheme.muted)
-            }
-            .buttonStyle(.plain)
-            .disabled(vm.isBusy || vm.checkingUpdate)
-            Button { showAIPrompt = true } label: {
-                Text("AI 配置").font(.caption2).foregroundColor(ClaudeTheme.muted)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("AI 配置")
+            Button("防护说明") { showNotice = true }
+            Button("AI 交接") { showAIPrompt = true }
+            Button("检查更新") { vm.checkUpdate(); vm.showUpdateSheet = true }
+                .disabled(vm.isBusy || vm.checkingUpdate)
         }
+        .font(.caption)
+        .buttonStyle(.plain)
         .foregroundColor(ClaudeTheme.muted)
-        .sheet(isPresented: $vm.showUpdateSheet) { UpdateSheet(vm: vm) }
     }
 }
 
@@ -1332,6 +1235,16 @@ struct ToolsView: View {
     @State private var proxyConfig: URL?
     @State private var pending: Confirmation?
 
+    static let destinations: [(id: String, title: String, icon: String, subtitle: String)] = [
+        ("cli", "Claude Code", "terminal", "检查命令行环境，选择项目并启动会话。"),
+        ("snapshot", "加密账号快照", "externaldrive", "在不同设备之间迁移已归档的桌面账号。"),
+        ("region", "地区设置", "globe.asia.australia", "更换国家节点后，重新锁定地区目标。"),
+        ("proxy", "代理诊断", "network", "通过指定代理检查 Claude 网页与 API 的传输。"),
+        ("browser", "隔离浏览器", "safari", "用独立的临时浏览器会话打开链接。"),
+        ("keep", "跨账号保留", "doc.on.doc", "管理切换账号时共享的通用文件。"),
+        ("policy", "WebRTC 策略", "waveform.path", "为支持的客户端选择 UDP 修复策略。")
+    ]
+
     private enum Confirmation: String, Identifiable {
         case region, policy, keep
         var id: String { rawValue }
@@ -1339,69 +1252,54 @@ struct ToolsView: View {
 
     init(vm: VM, initialSection: String = "cli") {
         self.vm = vm
-        _section = State(initialValue: initialSection)
+        _section = State(initialValue: initialSection == "network" ? "region" : initialSection)
+    }
+
+    private var destination: (id: String, title: String, icon: String, subtitle: String) {
+        Self.destinations.first { $0.id == section } ?? Self.destinations[0]
     }
 
     var body: some View {
-        ZStack {
-            ClaudeBackground()
-            VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("工具").font(.system(size: 22, weight: .bold, design: .serif))
-                        Text("Claude Code、账号快照与环境维护").font(.caption).foregroundColor(ClaudeTheme.muted)
+        HStack(spacing: 0) {
+            sidebar
+            Rectangle().fill(ClaudeTheme.cardBorder).frame(width: 1)
+            VStack(alignment: .leading, spacing: 20) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(destination.title).font(.system(size: 24, weight: .bold, design: .serif))
+                        Text(destination.subtitle).font(.system(size: 12)).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
-                    Button("关闭") { dismiss() }.disabled(vm.toolRunning)
+                    ClaudeIconButton(systemName: "xmark", help: "关闭工具箱", disabled: vm.toolRunning) { dismiss() }
                         .keyboardShortcut(.cancelAction)
                 }
-                Picker("工具分类", selection: $section) {
-                    Text("Claude Code").tag("cli")
-                    Text("账号快照").tag("snapshot")
-                    Text("网络与地区").tag("network")
-                    Text("共享设置").tag("keep")
-                }
-                .pickerStyle(.segmented)
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         switch section {
                         case "cli": cliSection
                         case "snapshot": snapshotSection
-                        case "network": networkSection
+                        case "region": regionSection
+                        case "proxy": proxySection
+                        case "browser": browserSection
+                        case "policy": policySection
                         default: keepSection
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(2)
+                    .padding(1)
                     .disabled(vm.isBusy || vm.checkingUpdate || vm.coreMissing)
                 }
-                Divider()
-                HStack {
-                    if vm.toolRunning { ProgressView().controlSize(.small) }
-                    Text(vm.toolRunning ? "正在执行" : (vm.toolFailed ? "操作未完成" : "执行结果"))
-                        .font(.caption.weight(.semibold))
-                        .foregroundColor(vm.toolFailed ? ClaudeTheme.error : ClaudeTheme.muted)
-                    Spacer()
-                    Button("刷新工具配置") { vm.loadTools() }.disabled(vm.isBusy || vm.checkingUpdate)
-                        .font(.caption)
-                }
-                ScrollView {
-                    Text(vm.toolOutput.isEmpty ? "选择工具后，这里会显示结果。" : vm.toolOutput)
-                        .font(.system(size: 12, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding(12)
-                .frame(height: 110)
-                .background(ClaudeTheme.card)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
+                resultPanel
             }
             .padding(24)
+            .background(ClaudeTheme.bgTop)
         }
-        .frame(width: 680, height: 660)
+        .frame(width: 900, height: 700)
+        .font(.system(size: 13))
         .foregroundColor(ClaudeTheme.ink)
+        .buttonStyle(ClaudeActionStyle())
         .tint(ClaudeTheme.terracottaDeep)
-        .preferredColorScheme(.light)
+        .controlSize(.large)
         .interactiveDismissDisabled(vm.toolRunning)
         .onAppear { vm.loadTools() }
         .onDisappear { password = ""; repeatedPassword = ""; proxyAddress = "" }
@@ -1423,122 +1321,215 @@ struct ToolsView: View {
         }
     }
 
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            HStack(spacing: 10) {
+                Image(systemName: "square.grid.2x2.fill").font(.title3).foregroundColor(ClaudeTheme.terracottaDeep)
+                Text("工具箱").font(.system(size: 18, weight: .semibold, design: .serif))
+            }.padding(.horizontal, 12)
+            VStack(spacing: 5) {
+                ForEach(Self.destinations, id: \.id) { item in
+                    Button { section = item.id } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: item.icon).frame(width: 18)
+                            Text(item.title).font(.system(size: 13, weight: section == item.id ? .semibold : .regular))
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 12).frame(height: 42)
+                        .foregroundColor(section == item.id ? ClaudeTheme.terracottaDeep : ClaudeTheme.ink)
+                        .background(section == item.id ? ClaudeTheme.terracottaTint : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 9))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(section == item.id ? .isSelected : [])
+                }
+            }
+            Spacer()
+            VStack(alignment: .leading, spacing: 8) {
+                Text("当前工作环境").font(.system(size: 10, weight: .semibold)).foregroundColor(ClaudeTheme.muted)
+                Label(VM.accountLetters.contains(vm.current) ? "桌面账号 \(vm.current)" : "账号待确认", systemImage: "person.crop.circle")
+                Label(VM.clientChoices.first { $0.key == vm.currentClient }?.label ?? "客户端待确认", systemImage: "network")
+            }
+            .font(.caption).padding(12)
+            Divider()
+            Button("刷新工具配置") { vm.loadTools() }
+                .disabled(vm.isBusy || vm.checkingUpdate)
+                .font(.caption).padding(.horizontal, 12)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 24)
+        .frame(width: 188)
+        .background(ClaudeTheme.sidebar)
+    }
+
+    private var resultPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                if vm.toolRunning { ProgressView().controlSize(.small) }
+                else { Image(systemName: vm.toolFailed ? "exclamationmark.circle" : "text.alignleft") }
+                Text(vm.toolRunning ? "正在执行，请稍候" : (vm.toolFailed ? "操作未完成" : "最近一次操作"))
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                if vm.toolRunning { Text("完成后在这里显示结果").font(.caption) }
+            }
+            .foregroundColor(vm.toolFailed ? ClaudeTheme.error : ClaudeTheme.muted)
+            ScrollView {
+                Text(vm.coreMissing ? "请先在主窗口安装核心脚本，再使用这些工具。" : (vm.toolOutput.isEmpty ? "选择功能并执行后，这里会显示结果。" : vm.toolOutput))
+                    .font(.system(size: 12, design: .monospaced)).lineSpacing(4)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }.frame(height: 86)
+        }
+        .padding(16)
+        .background(ClaudeTheme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(vm.toolFailed ? ClaudeTheme.warningBorder : ClaudeTheme.cardBorder))
+    }
+
     private func description(_ text: String) -> some View {
-        Text(text).font(.caption).foregroundColor(ClaudeTheme.muted).fixedSize(horizontal: false, vertical: true)
+        Text(text).font(.system(size: 12)).lineSpacing(3).foregroundColor(ClaudeTheme.muted)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private var cliSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label("Claude Code", systemImage: "terminal").font(.headline)
-            description("检查命令行版的安装与版本，按当前桌面槽位打开 Claude Code。B–D 的 CLI 需要分别登录，桌面快照不包含 CLI 数据。")
-            HStack {
-                Button("检查安装与版本") { vm.inspectCLI() }
-                Button("查看当前 CLI 槽位") { vm.inspectCLISlot() }
+            ClaudeSurface(title: "安装与账号", subtitle: "CLI 槽位表示目录映射，不代表已登录") {
+                HStack {
+                    Button("检查安装与版本") { vm.inspectCLI() }
+                    Button("查看当前 CLI 槽位") { vm.inspectCLISlot() }
+                }
+                description("B–D 的 CLI 需要分别登录；桌面账号快照不包含独立 CLI 数据。")
             }
-            Divider()
-            Text("项目文件夹").font(.subheadline.weight(.semibold))
-            HStack {
-                Text(project?.path ?? "请选择 Claude Code 要使用的项目文件夹")
-                    .font(.caption).lineLimit(2).textSelection(.enabled)
-                Spacer()
-                Button("选择文件夹…") { project = selectFile(directory: true) ?? project }
+            ClaudeSurface(title: "打开项目") {
+                HStack(spacing: 12) {
+                    Image(systemName: "folder").font(.title3).foregroundColor(ClaudeTheme.muted)
+                    Text(project?.path ?? "尚未选择项目文件夹")
+                        .font(.system(size: 12)).lineLimit(2).textSelection(.enabled).help(project?.path ?? "")
+                    Spacer()
+                    Button("选择文件夹…") { project = selectFile(directory: true) ?? project }
+                }
+                HStack {
+                    Button("启动 Claude Code") { if let project = project { vm.launchCLI(project: project, resume: false) } }
+                        .buttonStyle(ClaudeActionStyle(primary: true))
+                    Button("选择历史会话") { if let project = project { vm.launchCLI(project: project, resume: true) } }
+                }.disabled(project == nil)
+                description("对话和登录在终端完成。首次可能需要允许控制终端，启动前仍执行环境检查。")
             }
-            HStack {
-                Button("启动 Claude Code") { if let project = project { vm.launchCLI(project: project, resume: false) } }
-                    .buttonStyle(.borderedProminent)
-                Button("选择历史会话") { if let project = project { vm.launchCLI(project: project, resume: true) } }
-            }
-            .disabled(project == nil)
-            description("交互式对话和登录会在终端中进行，启动前仍由核心检查环境。首次打开终端时，macOS 可能请求自动化授权。")
         }
     }
 
     private var snapshotSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label("加密账号快照", systemImage: "externaldrive.badge.person.crop").font(.headline)
-            Picker("操作", selection: $importing) {
-                Text("导出快照").tag(false)
-                Text("导入快照").tag(true)
-            }.pickerStyle(.segmented)
-            Picker("账号槽位", selection: $account) {
-                ForEach(VM.accountLetters, id: \.self) { slot in
-                    Text("账号 \(slot) · \(slot == vm.current ? "当前" : (vm.archived.contains(slot) ? "已归档" : "未归档"))").tag(slot)
+            ClaudeSurface(title: importing ? "导入加密快照" : "导出加密快照") {
+                Picker("操作", selection: $importing) {
+                    Text("导出快照").tag(false)
+                    Text("导入快照").tag(true)
+                }.pickerStyle(.segmented).labelsHidden()
+                Picker("账号槽位", selection: $account) {
+                    ForEach(VM.accountLetters, id: \.self) { slot in
+                        Text("账号 \(slot) · \(slot == vm.current ? "当前" : (vm.archived.contains(slot) ? "已归档" : "未归档"))").tag(slot)
+                    }
                 }
+                description(importing
+                    ? "目标须为当前未使用的空槽位，且与镜像的账号标记一致。不会覆盖已有快照。"
+                    : "只能导出当前未使用的已归档槽位。当前账号需先在主窗口切换到其他账号。")
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(importing ? "镜像密码" : "设置镜像密码").font(.system(size: 12, weight: .medium))
+                    SecureField(importing ? "输入镜像密码" : "至少 8 位", text: $password)
+                    if !importing { SecureField("再次输入密码", text: $repeatedPassword) }
+                }
+                Button(importing ? "选择镜像并导入…" : "选择位置并导出…") { transferSnapshot() }
+                    .buttonStyle(ClaudeActionStyle(primary: true))
+                    .disabled(account == vm.current || (importing ? vm.archived.contains(account) : !vm.archived.contains(account)) || password.isEmpty || (!importing && (password.count < 8 || password != repeatedPassword)))
             }
-            description(importing
-                ? "只导入到未使用、没有存档的槽位；镜像中的账号标记须与目标一致。服务端登录过期时仍需重新登录。"
-                : "只能导出已归档、当前未使用的槽位。当前槽位需先在主窗口切换到其他账号后再导出。")
-            SecureField(importing ? "镜像密码" : "设置密码（至少 8 位）", text: $password)
-            if !importing { SecureField("再次输入密码", text: $repeatedPassword) }
-            Button(importing ? "选择镜像并导入…" : "选择位置并导出…") { transferSnapshot() }
-                .buttonStyle(.borderedProminent)
-                .disabled(account == vm.current || (importing ? vm.archived.contains(account) : !vm.archived.contains(account)) || password.isEmpty || (!importing && (password.count < 8 || password != repeatedPassword)))
-            description("采用 macOS 加密 DMG；不包含独立 Claude Code 配置。密码无法找回。导入或导出期间请等待完成。")
+            description("macOS 加密 DMG · 密码无法找回 · 不包含独立 CLI 数据。导入或导出期间请等待完成。")
         }
         .textFieldStyle(.roundedBorder)
         .onChange(of: importing) { _ in password = ""; repeatedPassword = "" }
     }
 
-    private var networkSection: some View {
+    private var regionSection: some View {
+        ClaudeSurface(title: "当前地区目标") {
+            Label(vm.regionTarget, systemImage: "globe.asia.australia")
+                .font(.system(size: 15, weight: .medium)).textSelection(.enabled)
+            description("更换其他国家的代理节点后，按当前出口重新锁定国家、时区与地区格式。")
+            Divider()
+            description("将修改系统地区设置，并可能请求管理员授权。操作完成后自动重新检查环境。")
+            Button("按当前出口重设地区…") { pending = .region }
+                .buttonStyle(ClaudeActionStyle(primary: true))
+        }
+    }
+
+    private var browserSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            GroupBox("地区目标") {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(vm.regionTarget).font(.caption).textSelection(.enabled)
-                    description("更换其他国家的节点后，按当前出口重新锁定目标。")
-                    Button("按当前出口重设地区…") { pending = .region }
-                }.frame(maxWidth: .infinity, alignment: .leading)
+            ClaudeSurface(title: "打开链接", subtitle: "支持 http 和 https") {
+                TextField("https://…", text: $address).accessibilityLabel("要隔离打开的网址")
+                Button("隔离打开链接") { vm.openIsolated(address); address = "" }
+                    .buttonStyle(ClaudeActionStyle(primary: true)).disabled(address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                description("使用独立的临时浏览器配置。退出隔离浏览器后清理本次会话，不保留本次登录。")
             }
-            GroupBox("隔离浏览器") {
-                VStack(alignment: .leading, spacing: 8) {
-                    TextField("https://…", text: $address)
-                    HStack {
-                        Button("隔离打开链接") { vm.openIsolated(address); address = "" }
-                        Button("打开 Web 指纹检测") { vm.openIsolated("https://yoursjeyo.github.io/claude-switcher/") }
-                    }
-                    description("使用一次性浏览器配置；窗口关闭后会话丢弃。Web 检测页可补充 Canvas 和 WebGL 检查。")
-                }.frame(maxWidth: .infinity, alignment: .leading)
-            }
-            GroupBox("指定代理诊断") {
-                VStack(alignment: .leading, spacing: 8) {
-                    SecureField("代理地址（含协议和端口）", text: $proxyAddress)
-                        .disabled(proxyConfig != nil)
-                    HStack {
-                        Button("选择私有 JSON…") { proxyConfig = selectFile(directory: false, types: [.json]) ?? proxyConfig }
-                        if let config = proxyConfig {
-                            Text(config.lastPathComponent).font(.caption).lineLimit(1)
-                            Button("清除文件") { proxyConfig = nil }
-                        }
-                        Spacer()
-                        Button("诊断代理") { vm.diagnoseProxy(address: proxyAddress, config: proxyConfig); proxyAddress = "" }
-                    }
-                    description("只测试所选代理到 Claude 网页和 API 的传输。401/403 是认证或访问限制，不表示账号可用；此诊断不提供启动许可。")
-                }.frame(maxWidth: .infinity, alignment: .leading)
-            }
-            GroupBox("WebRTC 修复策略") {
-                VStack(alignment: .leading, spacing: 8) {
-                    Picker("UDP 策略", selection: $vm.webrtcPolicy) {
-                        Text("走代理（保留通话能力）").tag("proxy")
-                        Text("拒绝相关端口（可能影响通话）").tag("reject")
-                    }
-                    Button("应用策略并修复…") { pending = .policy }
-                    description(vm.supportsWebRTCPolicy ? "仅影响支持的客户端；应用后重新检查。" : "当前客户端需自行管理规则，切换器不会修改 TAG 等客户端的策略。")
-                }.frame(maxWidth: .infinity, alignment: .leading)
-                    .disabled(!vm.supportsWebRTCPolicy)
+            ClaudeSurface(title: "Web 指纹检测", subtitle: "补充 Canvas 与 WebGL 的浏览器检测") {
+                Button("打开 Web 指纹检测页") { vm.openIsolated("https://yoursjeyo.github.io/claude-switcher/") }
             }
         }.textFieldStyle(.roundedBorder)
     }
 
+    private var proxySection: some View {
+        ClaudeSurface(title: "指定诊断入口", subtitle: "填写代理地址，或选择包含代理地址的私有 JSON 文件") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("代理地址").font(.system(size: 12, weight: .medium))
+                SecureField("协议://地址:端口", text: $proxyAddress)
+                    .disabled(proxyConfig != nil).accessibilityLabel("用于诊断的代理地址")
+            }
+            HStack {
+                Button("选择私有 JSON…") { proxyConfig = selectFile(directory: false, types: [.json]) ?? proxyConfig }
+                if let config = proxyConfig {
+                    Label(config.lastPathComponent, systemImage: "doc").font(.caption).lineLimit(1)
+                    Button("清除文件") { proxyConfig = nil }
+                }
+            }
+            Divider()
+            description("只测试 Claude 网页和 API 的网络传输。401 表示尚未认证，403 表示访问受限，均不代表账号已可用。")
+            Button("开始诊断") { vm.diagnoseProxy(address: proxyAddress, config: proxyConfig); proxyAddress = "" }
+                .buttonStyle(ClaudeActionStyle(primary: true))
+                .disabled(proxyConfig == nil && proxyAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }.textFieldStyle(.roundedBorder)
+    }
+
+    private var policySection: some View {
+        ClaudeSurface(title: "UDP 修复策略") {
+            if !vm.supportsWebRTCPolicy {
+                Label("当前客户端需自行管理规则", systemImage: "info.circle")
+                    .font(.system(size: 13, weight: .medium)).foregroundColor(ClaudeTheme.warning)
+                description("此入口仅适用于 Clash Verge 和 FlClash。切换器不会通过这里改写 TAG 等客户端的规则。")
+            }
+            VStack(alignment: .leading, spacing: 16) {
+                Picker("UDP 策略", selection: $vm.webrtcPolicy) {
+                    Text("走代理 · 保留通话能力").tag("proxy")
+                    Text("拒绝相关端口 · 可能影响通话").tag("reject")
+                }.pickerStyle(.radioGroup)
+                Button("应用策略并修复…") { pending = .policy }
+                    .buttonStyle(ClaudeActionStyle(primary: true))
+            }.disabled(!vm.supportsWebRTCPolicy)
+            description("应用会执行一键修复，可能修改规则、重启代理并请求管理员授权，结束后重新检查环境。")
+        }
+    }
+
     private var keepSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label("跨账号保留", systemImage: "doc.on.doc").font(.headline)
-            description("每行一个相对于 Claude 数据目录的路径，例如 settings.json 或 skills/。# 开头为注释，留空关闭。保存后从下次切换开始生效。")
+        ClaudeSurface(title: "保留路径", subtitle: "每行一个相对于 Claude 数据目录的路径；留空关闭") {
             TextEditor(text: $vm.keepPaths)
                 .font(.system(size: 12, design: .monospaced))
-                .frame(height: 140)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(ClaudeTheme.divider))
+                .scrollContentBackground(.hidden)
+                .padding(8).frame(height: 150)
+                .background(ClaudeTheme.bgTop)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(ClaudeTheme.cardBorder))
                 .accessibilityLabel("跨账号保留路径列表")
-            description("只共享通用配置。绝对路径、包含 .. 的路径和符号链接会被拒绝；不要放登录凭据、Cookie、设备标识或缓存。")
-            Button("保存保留列表…") { pending = .keep }.buttonStyle(.borderedProminent)
+            description("例如 settings.json、skills/。仅共享通用配置，不要加入登录凭据、Cookie、设备标识或缓存。绝对路径、.. 和符号链接会被拒绝。")
+            HStack {
+                Button("保存保留列表…") { pending = .keep }.buttonStyle(ClaudeActionStyle(primary: true))
+                Text("从下次切换开始生效").font(.caption).foregroundColor(ClaudeTheme.muted)
+            }
         }
     }
 
@@ -1576,25 +1567,24 @@ struct CheckSettingsView: View {
     var body: some View {
         ZStack {
             ClaudeBackground()
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 20) {
                 HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("检查设置").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
-                        Text("安全项始终强制执行；跳过不等于通过").font(.caption).foregroundColor(ClaudeTheme.muted)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("检查设置").font(.system(size: 24, weight: .bold, design: .serif))
+                        Text("硬性检查始终执行；跳过不表示通过").font(.caption).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
-                    Button { dismiss() } label: {
-                        Image(systemName: "xmark.circle.fill").font(.title2).foregroundColor(ClaudeTheme.muted)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("关闭")
+                    ClaudeIconButton(systemName: "xmark", help: "关闭检查设置") { dismiss() }
                 }
-
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        GroupBox("可自定义的非关键检查") {
-                            VStack(alignment: .leading, spacing: 10) {
-                                ForEach(VM.optionalChecks, id: \.key) { item in
+                    VStack(spacing: 16) {
+                        ClaudeSurface(title: "可选检查", subtitle: "关闭后停止对应探测，并显示为“已跳过”") {
+                            ForEach(VM.optionalChecks, id: \.key) { item in
+                                HStack {
+                                    Text(item.label)
+                                    Spacer()
+                                    Text(vm.disabledChecks.contains(item.key) ? "关闭" : "开启")
+                                        .font(.caption).foregroundColor(ClaudeTheme.muted)
                                     Toggle(item.label, isOn: Binding(
                                         get: { !vm.disabledChecks.contains(item.key) },
                                         set: { enabled in
@@ -1602,54 +1592,49 @@ struct CheckSettingsView: View {
                                             else { vm.disabledChecks.insert(item.key) }
                                         }
                                     ))
+                                    .labelsHidden().toggleStyle(.switch).controlSize(.small)
                                 }
-                                Text("关闭后会真正跳过对应探测，并以灰色“已跳过”显示。出口国家、代理/TUN、Kill-Switch、保镖、账号归档和更新校验不可关闭。")
-                                    .font(.caption2).foregroundColor(ClaudeTheme.muted)
                             }
-                            .padding(.vertical, 6)
                         }
-
-                        GroupBox("失败处理与日志") {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Toggle("将上述非关键项的失败降为警告", isOn: $vm.allowOptionalFailures)
-                                Text("只影响这 6 项；不会放宽任何硬性安全项，也不会自动关闭检测。")
-                                    .font(.caption2).foregroundColor(ClaudeTheme.muted)
+                        ClaudeSurface(title: "失败处理与日志") {
+                            HStack {
+                                Text("将非关键项失败降为警告")
+                                Spacer()
+                                Toggle("将非关键项失败降为警告", isOn: $vm.allowOptionalFailures)
+                                    .labelsHidden().toggleStyle(.switch).controlSize(.small)
+                            }
+                            Text("仅影响上面的六项；代理、TUN、出口国家、保镖等硬性检查始终强制执行。")
+                                .font(.caption).foregroundColor(ClaudeTheme.muted)
+                            Divider()
+                            HStack {
+                                Text("记录脱敏客户端日志")
+                                Spacer()
                                 Toggle("记录脱敏客户端日志", isOn: $vm.loggingEnabled)
-                                Text("仅记录版本、命令、退出码、耗时和检查状态，不记录 IP、凭据或账号内容。")
-                                    .font(.caption2).foregroundColor(ClaudeTheme.muted)
+                                    .labelsHidden().toggleStyle(.switch).controlSize(.small)
                             }
-                            .padding(.vertical, 6)
+                            Text("仅记录操作、耗时和状态，不包含 IP、凭据、账号内容或代理配置。")
+                                .font(.caption).foregroundColor(ClaudeTheme.muted)
+                            Button("导出脱敏诊断日志…") { vm.exportDiagnostics() }.disabled(vm.settingsBusy)
                         }
-
-                        GroupBox("问题排查") {
-                            VStack(alignment: .leading, spacing: 9) {
-                                Button("导出脱敏诊断日志…") { vm.exportDiagnostics() }
-                                    .disabled(vm.settingsBusy)
-                                Text("日志：~/Library/Logs/claude-switcher/client.log")
-                                    .font(.caption2).foregroundColor(ClaudeTheme.muted).textSelection(.enabled)
-                            }
-                            .padding(.vertical, 6)
-                        }
-                    }
+                    }.padding(1)
                 }
-
                 if !vm.settingsMessage.isEmpty {
                     Text(vm.settingsMessage).font(.caption).foregroundColor(ClaudeTheme.muted)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 HStack {
-                    Button("恢复默认") { vm.restoreCheckDefaults() }.disabled(vm.settingsBusy)
+                    Button("恢复默认选项") { vm.restoreCheckDefaults() }.disabled(vm.settingsBusy)
                     Spacer()
-                    if vm.settingsBusy { ProgressView().scaleEffect(0.65) }
+                    if vm.settingsBusy { ProgressView().controlSize(.small) }
                     Button("保存并重新检查") { vm.saveCheckConfig() }
-                        .buttonStyle(.borderedProminent).tint(ClaudeTheme.terracottaDeep)
+                        .buttonStyle(ClaudeActionStyle(primary: true))
                         .disabled(vm.settingsBusy || vm.isBusy)
                 }
-            }
-            .padding(20)
+            }.padding(24)
         }
-        .frame(width: 520, height: 610)
-        .preferredColorScheme(.light)
+        .font(.system(size: 13)).foregroundColor(ClaudeTheme.ink)
+        .buttonStyle(ClaudeActionStyle()).tint(ClaudeTheme.terracottaDeep)
+        .frame(width: 640, height: 680)
         .onAppear { vm.loadCheckConfig() }
     }
 }
@@ -1663,9 +1648,9 @@ struct FingerprintView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("设备指纹体检").font(.headline).foregroundColor(ClaudeTheme.ink)
+                Text("设备指纹体检").font(.system(size: 24, weight: .bold, design: .serif)).foregroundColor(ClaudeTheme.ink)
                 Spacer()
-                Button("关闭") { dismiss() }.buttonStyle(.borderedProminent).tint(ClaudeTheme.terracottaDeep)
+                ClaudeIconButton(systemName: "xmark", help: "关闭设备指纹体检") { dismiss() }
             }
             Text("字体地区特征 + GPU/虚拟机特征；Canvas/WebGL 请用 Web 检测页")
                 .font(.caption).foregroundColor(ClaudeTheme.muted)
@@ -1677,9 +1662,8 @@ struct FingerprintView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .padding(20)
-        .frame(width: 520, height: 420)
-        .preferredColorScheme(.light)
+        .padding(24)
+        .frame(width: 640, height: 460)
         .background(ClaudeTheme.bgTop)
     }
 }
@@ -1694,76 +1678,47 @@ struct UpdateSheet: View {
     var body: some View {
         ZStack {
             ClaudeBackground()
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 20) {
                 HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("版本更新").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
-                        Text("检查并在应用内直接更新核心、界面与系统守护").font(.caption).foregroundColor(ClaudeTheme.muted)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("版本更新").font(.system(size: 24, weight: .bold, design: .serif))
+                        Text("更新核心、界面与系统守护").font(.caption).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
-                    Button { dismiss() } label: {
-                        Image(systemName: "xmark.circle.fill").font(.title2).foregroundColor(ClaudeTheme.muted)
+                    ClaudeIconButton(systemName: "xmark", help: "关闭版本更新", disabled: vm.updating) { dismiss() }
+                }
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 8) {
+                        if vm.checkingUpdate || vm.updating { ProgressView().controlSize(.small) }
+                        Text(vm.updating ? "正在更新，请等待完成" : (vm.checkingUpdate ? "正在检查版本" : "更新结果"))
+                            .font(.system(size: 12, weight: .semibold)).foregroundColor(ClaudeTheme.muted)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(vm.updating)
-                    .accessibilityLabel("关闭")
+                    ScrollView {
+                        Text(vm.updateText.isEmpty ? "点击“重新检查”获取版本状态。" : vm.updateText)
+                            .font(.system(size: 12, design: .monospaced)).lineSpacing(4)
+                            .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(height: 138)
                 }
-
-                ScrollView {
-                    Text(vm.updateText.isEmpty ? "尚未检查" : vm.updateText)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(ClaudeTheme.ink)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding(12)
-                .frame(height: 110)
-                .background(ClaudeTheme.card)
+                .padding(16).background(ClaudeTheme.card)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(ClaudeTheme.cardBorder))
-
-                HStack(spacing: 10) {
+                HStack {
                     Button { vm.performUpdate() } label: {
-                        Label(vm.updating ? "正在更新…" : "立即更新", systemImage: "arrow.down.circle.fill")
-                            .font(.callout.bold())
-                            .padding(.horizontal, 16).padding(.vertical, 7)
-                            .background(LinearGradient(colors: [ClaudeTheme.terracotta, ClaudeTheme.terracottaDeep], startPoint: .leading, endPoint: .trailing))
-                            .foregroundColor(.white)
-                            .clipShape(Capsule())
+                        Label(vm.updating ? "正在更新…" : "立即更新", systemImage: "arrow.down.circle")
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(ClaudeActionStyle(primary: true))
                     .disabled(vm.checkingUpdate || vm.updating || vm.isBusy)
-
-                    Button { vm.checkUpdate() } label: {
-                        Label(vm.checkingUpdate ? "检查中…" : "重新检查", systemImage: "arrow.clockwise")
-                            .font(.callout.bold())
-                            .padding(.horizontal, 16).padding(.vertical, 7)
-                            .background(ClaudeTheme.iconWell)
-                            .foregroundColor(ClaudeTheme.ink)
-                            .clipShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(vm.checkingUpdate || vm.updating || vm.isBusy)
-
-                    Button { copyUpdateCommand() } label: {
-                        Label(copied ? "已复制" : "复制更新命令", systemImage: copied ? "checkmark" : "doc.on.doc")
-                            .font(.callout.bold())
-                            .padding(.horizontal, 16).padding(.vertical, 7)
-                            .background(ClaudeTheme.iconWell)
-                            .foregroundColor(ClaudeTheme.ink)
-                            .clipShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
+                    Button("重新检查") { vm.checkUpdate() }.disabled(vm.checkingUpdate || vm.updating || vm.isBusy)
                     Spacer()
+                    Button(copied ? "命令已复制" : "复制更新命令") { copyUpdateCommand() }
                 }
-
-                Text("点击「立即更新」将在应用内完成 SHA256 校验、核心与界面更新（守护脚本变更时会请求管理员授权），更新后自动重启；自检不通过会自动回滚。")
-                    .font(.caption2).foregroundColor(ClaudeTheme.muted)
-            }
-            .padding(20)
+                Text("会先校验文件并自检；自检失败自动回滚。需要同步系统守护时请求管理员授权，仅界面 App 更新后自动重启。")
+                    .font(.caption).foregroundColor(ClaudeTheme.muted).fixedSize(horizontal: false, vertical: true)
+            }.padding(24)
         }
-        .frame(width: 520, height: 300)
-        .preferredColorScheme(.light)
+        .font(.system(size: 13)).foregroundColor(ClaudeTheme.ink)
+        .buttonStyle(ClaudeActionStyle()).tint(ClaudeTheme.terracottaDeep)
+        .frame(width: 640, height: 400)
     }
 
     private func copyUpdateCommand() {
@@ -1787,7 +1742,7 @@ struct AIPromptSheet: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("AI 交接提示词").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
+                        Text("AI 交接提示词").font(.system(size: 24, weight: .bold, design: .serif)).foregroundColor(ClaudeTheme.ink)
                         Text("复制后粘贴给本地 AI，让它先读 AGENTS.md 再动手").font(.caption).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
@@ -1814,20 +1769,14 @@ struct AIPromptSheet: View {
                 HStack {
                     Button { copyPrompt() } label: {
                         Label(copied ? "已复制" : "复制", systemImage: copied ? "checkmark" : "doc.on.doc")
-                            .font(.callout.bold())
-                            .padding(.horizontal, 18).padding(.vertical, 7)
-                            .background(LinearGradient(colors: [ClaudeTheme.terracotta, ClaudeTheme.terracottaDeep], startPoint: .leading, endPoint: .trailing))
-                            .foregroundColor(.white)
-                            .clipShape(Capsule())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(ClaudeActionStyle(primary: true))
                     Spacer()
                 }
             }
             .padding(20)
         }
-        .frame(width: 520, height: 480)
-        .preferredColorScheme(.light)
+        .frame(width: 640, height: 520)
     }
 
     private func copyPrompt() {
@@ -1859,7 +1808,7 @@ struct NoticeView: View {
             VStack(spacing: 0) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("安全防护体系公告").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
+                        Text("安全防护体系公告").font(.system(size: 24, weight: .bold, design: .serif)).foregroundColor(ClaudeTheme.ink)
                         Text("Security Architecture Bulletin").font(.caption).foregroundColor(ClaudeTheme.muted)
                     }
                     Spacer()
@@ -1899,7 +1848,6 @@ struct NoticeView: View {
             }
         }
         .frame(width: 460, height: 620)
-        .preferredColorScheme(.light)
     }
 }
 
@@ -1987,11 +1935,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func showMainWindow() {
         vm.prepareToShow()
         if mainWindow == nil {
-            let style: NSWindow.StyleMask = [.titled, .closable, .miniaturizable]
+            let style: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
             let titleHeight = NSWindow.frameRect(forContentRect: .zero, styleMask: style).height
-            let height = min(CGFloat(900), (NSScreen.main?.visibleFrame.height ?? 900) - titleHeight)
+            let height = min(CGFloat(760), (NSScreen.main?.visibleFrame.height ?? 840) - titleHeight - 24)
+            let width = min(CGFloat(1060), (NSScreen.main?.visibleFrame.width ?? 1100) - 32)
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 440, height: height),
+                contentRect: NSRect(x: 0, y: 0, width: width, height: height),
                 styleMask: style,
                 backing: .buffered, defer: false
             )
@@ -2000,7 +1949,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.titleVisibility = .hidden
             window.isMovableByWindowBackground = true
             window.isReleasedWhenClosed = false
-            window.standardWindowButton(.zoomButton)?.isEnabled = false
+            window.contentMinSize = NSSize(width: 860, height: 620)
             window.contentView = NSHostingView(rootView: ContentView(vm: vm, height: height))
             window.delegate = self
             window.center()
