@@ -9,6 +9,9 @@ import unittest
 
 PROJECT = Path(__file__).resolve().parents[1]
 SCENARIOS = (
+    "network_preview_readonly", "network_level_invalidates_plan", "network_apply_and_validate",
+    "network_restart_keeps_interlock", "network_failed_validation_and_rollback",
+    "network_cancel_and_invalid_report", "network_layout",
     "tools_config", "tools_snapshot_password", "tools_invalid_inputs", "tools_proxy_privacy",
     "tools_mutation_reaudit", "tools_terminal_quoting", "tools_shell_isolation", "tools_layout", "dashboard_layout", "dashboard_status",
     "startup_once", "audit_success_details", "tag_client_recognized", "in_app_update_relaunch", "multi_account_status", "first_use_cd_note", "legacy_status_fallback",

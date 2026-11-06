@@ -58,6 +58,8 @@ private final class Fixture {
         try write("audit", auditKeys.map { "\($0)=ok" }.joined(separator: "\n") + "\n")
         try write("status", "current=A hasA=1 hasB=0\n")
         try write("switch-output", "OK:已切换到账号 B\n")
+        try write("network-state", "{\"schema\":1,\"kind\":\"network_rebuild\",\"pending\":false,\"canRollback\":false}")
+        try networkPlan()
         try write("core-script", """
         #!/bin/bash
         root="$(cd "$(dirname "$0")" && pwd)"
@@ -82,6 +84,29 @@ private final class Fixture {
           open-safe) echo 'OK:已打开' ;;
           diagnose-proxy) printf '%s' "$CLAUDE_SWITCHER_PROXY_URL" > "$root/proxy-env"; cat "$root/diagnostics" ;;
           set-region) delay tools; echo 'OK:地区已更新'; result tools ;;
+          network-rebuild)
+            case "$2" in
+              state) cat "$root/network-state"; result network-state ;;
+              preview) delay network-preview; cat "$root/network-preview"; result network-preview ;;
+              apply)
+                delay network-apply
+                if [ -f "$root/network-apply-output" ]; then cat "$root/network-apply-output"; else
+                  echo '{"schema":1,"kind":"network_rebuild","success":true,"pending":true,"canRollback":true,"message":"所选网络操作已完成，等待验收"}'
+                  echo 'current=A hasA=1 hasB=0 network_rebuild=1' > "$root/status"
+                  echo '{"schema":1,"kind":"network_rebuild","pending":true,"canRollback":true}' > "$root/network-state"
+                fi
+                result network-apply ;;
+              rollback) echo '{"schema":1,"kind":"network_rebuild","success":true,"pending":true,"message":"已切回旧位置"}'; result network-rollback ;;
+              validate)
+                if [ -f "$root/network-validate-exit" ]; then
+                  echo '{"schema":1,"kind":"network_rebuild","success":false,"pending":true,"message":"保护环境尚未恢复"}'
+                else
+                  echo '{"schema":1,"kind":"network_rebuild","success":true,"pending":false,"message":"保护检查通过"}'
+                  echo 'current=A hasA=1 hasB=0' > "$root/status"
+                fi
+                result network-validate ;;
+              *) exit 2 ;;
+            esac ;;
           *) exit 2 ;;
         esac
         """)
@@ -92,6 +117,25 @@ private final class Fixture {
 
     func write(_ name: String, _ value: String) throws {
         try value.write(to: root.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+
+    func networkPlan(level: Int = 1, blocked: [String] = []) throws {
+        let value: [String: Any] = [
+            "schema": 1, "kind": "network_rebuild", "level": level, "token": String(repeating: "a", count: 64),
+            "location": "Automatic", "services": [
+                ["name": "Wi-Fi", "device": "en0", "enabled": true],
+                ["name": "USB Ethernet", "device": "en7", "enabled": true],
+                ["name": "Spare LAN", "device": "en3", "enabled": false],
+            ],
+            "automatic": ["刷新系统 DNS 缓存", "重新连接 Wi-Fi 与以太网服务；保持停用服务的原状态",
+                          "第 3 层建立干净网络位置，使用 DHCP 和自动 IPv6，旧位置保留供回退"],
+            "manual": ["特殊虚拟接口需要在所属软件中重新启用", "恢复代理与原有保护策略，再检查出口、DNS 和原生 UDP",
+                       "确认联网正常后，可在系统设置中移除旧网络位置"],
+            "blocked": blocked, "preserved": ["Wi-Fi 已保存网络、密码、自动加入偏好", "代理订阅与节点", "Claude 账号"],
+            "canApply": blocked.isEmpty, "pending": false
+        ]
+        let data = try JSONSerialization.data(withJSONObject: value)
+        try data.write(to: root.appendingPathComponent("network-preview"))
     }
 
     func audit(_ changes: [String: String] = [:]) throws {
@@ -155,6 +199,89 @@ struct MenuBarModelTests {
                 let saved = try String(contentsOf: f.root.appendingPathComponent("saved-keep"), encoding: .utf8)
                 let decoded = try JSONSerialization.jsonObject(with: Data(saved.utf8), options: [.fragmentsAllowed]) as? String
                 try expect(decoded == "settings.json\n", "列表必须作为一个 JSON 参数传递")
+            case "network_preview_readonly":
+                let vm = f.vm()
+                vm.previewNetworkRebuild(); try f.idle(vm)
+                try expect(f.calls == ["network-rebuild preview 1"], "预检不能执行修改或环境审计")
+                try expect(vm.networkPlan?.services.count == 3 && vm.networkPlan?.canApply == true, "应包含全机不同网卡")
+                vm.applyNetworkRebuild(confirmed: false)
+                try expect(f.calls.count == 1 && vm.toolFailed, "没有确认不能执行")
+            case "network_level_invalidates_plan":
+                let vm = f.vm()
+                vm.previewNetworkRebuild(); try f.idle(vm)
+                vm.networkLevel = 3
+                try expect(vm.networkPlan == nil, "改变层级必须作废旧预检")
+                vm.applyNetworkRebuild(confirmed: true)
+                try expect(f.calls.count == 1 && !vm.networkPending, "旧清单不能执行另一层级")
+                try f.networkPlan(level: 3, blocked: ["请先退出 FlClash"])
+                vm.previewNetworkRebuild(); try f.idle(vm)
+                vm.applyNetworkRebuild(confirmed: true)
+                try expect(f.calls.count == 2 && vm.toolFailed, "存在阻塞事项不得执行")
+            case "network_apply_and_validate":
+                try f.write("network-apply-delay", "0.15")
+                let vm = f.vm(operationTimeout: 0.01)
+                vm.start(); try f.idle(vm)
+                vm.previewNetworkRebuild(); try f.idle(vm)
+                vm.applyNetworkRebuild(confirmed: true)
+                try expect(!vm.canQuit, "执行中不能退出界面")
+                try f.idle(vm)
+                try expect(vm.networkPending && vm.phase == .failed && !vm.toolFailed, "执行结束不能冒充保护恢复")
+                let before = f.calls.count
+                vm.switchTo("B")
+                vm.openIsolated("https://example.test")
+                vm.launchCLI(project: f.root, resume: false)
+                try expect(f.calls.count == before, "待验收时不得启动桌面、CLI 或隔离浏览器")
+                vm.validateNetworkProtection(); try f.idle(vm)
+                try expect(!vm.networkPending && vm.phase == .ready, "完整检查通过后才能解除锁定")
+            case "network_restart_keeps_interlock":
+                try f.write("status", "current=A hasA=1 hasB=0 network_rebuild=1")
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                try expect(vm.networkPending && vm.phase == .failed && vm.lastCheckSummary == "待验收", "重启不能绕过待验收状态")
+                try expect(ContentView(vm: vm).summaryTitle == "网络重建后等待验收", "主界面应显示维护状态")
+                let before = f.calls.count
+                vm.switchTo("B")
+                try expect(f.calls.count == before, "重启后不得调用切换")
+            case "network_failed_validation_and_rollback":
+                try f.write("network-state", "{\"schema\":1,\"kind\":\"network_rebuild\",\"pending\":true,\"canRollback\":true}")
+                try f.write("status", "current=A hasA=1 hasB=0 network_rebuild=1")
+                let vm = f.vm()
+                vm.loadNetworkState(); try f.idle(vm)
+                vm.rollbackNetworkRebuild(); try f.idle(vm)
+                try expect(vm.networkPending && vm.toolOutput == "已切回旧位置", "切回位置也不能跳过验收")
+                try f.write("network-validate-exit", "1")
+                vm.validateNetworkProtection(); try f.idle(vm)
+                try expect(vm.networkPending && vm.phase == .failed && vm.toolFailed, "检查失败必须保留锁定")
+            case "network_cancel_and_invalid_report":
+                let vm = f.vm()
+                vm.previewNetworkRebuild(); try f.idle(vm)
+                try f.write("network-apply-output", "{\"schema\":1,\"kind\":\"network_rebuild\",\"success\":false,\"pending\":false,\"message\":\"已取消授权\"}")
+                try f.write("network-apply-exit", "1")
+                vm.applyNetworkRebuild(confirmed: true); try f.idle(vm)
+                try expect(!vm.networkPending && vm.toolFailed && vm.toolOutput == "已取消授权", "取消应显示未执行")
+                try f.write("network-preview", "{\"schema\":1,\"kind\":\"network_rebuild\",\"level\":1}")
+                vm.previewNetworkRebuild(); try f.idle(vm)
+                try expect(vm.networkPlan == nil && vm.toolFailed, "不完整清单不能被接受")
+            case "network_layout":
+                let vm = f.vm()
+                for level in [1, 2, 3] {
+                    vm.networkLevel = level
+                    try f.networkPlan(level: level)
+                    vm.previewNetworkRebuild(); try f.idle(vm)
+                    for dark in [false, true] {
+                        try render(ToolsView(vm: vm, initialSection: "rebuild"),
+                                   name: "network-level-\(level)-\(dark ? "dark" : "light")",
+                                   size: NSSize(width: 900, height: 700), dark: dark)
+                        try f.idle(vm)
+                    }
+                }
+                try f.write("network-state", "{\"schema\":1,\"kind\":\"network_rebuild\",\"pending\":true,\"canRollback\":true}")
+                vm.loadNetworkState(); try f.idle(vm)
+                try render(ToolsView(vm: vm, initialSection: "rebuild"), name: "network-pending",
+                           size: NSSize(width: 900, height: 700))
+                try f.idle(vm)
+                try expect(f.calls.allSatisfy { $0.hasPrefix("network-rebuild state") || $0.hasPrefix("network-rebuild preview") },
+                           "渲染只能读取预检与状态，不能修改网络")
             case "tools_snapshot_password":
                 try f.write("status", "current=A hasA=1 hasB=1 hasC=0 hasD=0 accounts=A,B\n")
                 let vm = f.vm()
@@ -243,7 +370,7 @@ struct MenuBarModelTests {
                         try f.idle(vm)
                     }
                 }
-                try expect(f.calls.dropFirst(before).allSatisfy { $0 == "get-tool-config" }, "浏览工具页面只能读取配置")
+                try expect(f.calls.dropFirst(before).allSatisfy { $0 == "get-tool-config" || $0 == "network-rebuild state" }, "浏览工具页面只能读取配置和状态")
             case "dashboard_layout":
                 try f.write("client", "client=tag\n")
                 try f.write("status", "current=A hasA=1 hasB=1 hasC=0 hasD=0 accounts=A,B accB=900M@2026-11-05\n")

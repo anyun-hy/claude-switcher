@@ -26,6 +26,27 @@ struct AccountStamp: Equatable {
     let date: String
 }
 
+struct NetworkRebuildPlan: Decodable {
+    struct Service: Decodable, Identifiable {
+        let name: String
+        let device: String
+        let enabled: Bool
+        var id: String { name + ":" + device }
+    }
+    let schema: Int
+    let kind: String
+    let level: Int
+    let token: String
+    let location: String
+    let services: [Service]
+    let automatic: [String]
+    let manual: [String]
+    let blocked: [String]
+    let preserved: [String]
+    let canApply: Bool
+    let pending: Bool
+}
+
 // 超时回调与 waitUntilExit 在不同队列上执行。
 private final class ProcessDeadline {
     private let lock = NSLock()
@@ -92,6 +113,12 @@ final class VM: ObservableObject {
     @Published var keepPaths = ""
     @Published var webrtcPolicy = "proxy"
     @Published private(set) var regionTarget = "尚未读取"
+    @Published var networkLevel = 1 {
+        didSet { if oldValue != networkLevel { networkPlan = nil } }
+    }
+    @Published private(set) var networkPlan: NetworkRebuildPlan?
+    @Published private(set) var networkPending = false
+    @Published private(set) var networkCanRollback = false
     var terminalLauncher: ((String, @escaping (CoreResult) -> Void) -> Void)?
 
     static let optionalChecks: [(key: String, label: String)] = [
@@ -225,7 +252,7 @@ final class VM: ObservableObject {
 
     // 只读检测客户端是否关闭、是否开启了多个 TUN 或其他代理软件;发现状态变化时仅触发重新检查,绝不自动切换客户端配置
     func pollClientStateIfNeeded() {
-        guard started, !isBusy, !updating, !isSwitchingClient, !isPollingClient, coreAvailable() else { return }
+        guard started, !isBusy, !updating, !networkPending, !isSwitchingClient, !isPollingClient, coreAvailable() else { return }
         isPollingClient = true
         run(["detect-client"], timeout: 5) { result in
             self.isPollingClient = false
@@ -333,8 +360,12 @@ final class VM: ObservableObject {
                         }
                         self.lastCheckSummary = "失败"
                     }
-                    self.phase = passed && statusOK ? .ready : .failed
-                    done(passed && statusOK)
+                    if self.networkPending {
+                        self.banner = "网络重建尚未验收。请在“工具 → Mac 网络重建”恢复并检查保护环境。"
+                        self.lastCheckSummary = "待验收"
+                    }
+                    self.phase = passed && statusOK && !self.networkPending ? .ready : .failed
+                    done(passed && statusOK && !self.networkPending)
                 }
             }
         }
@@ -380,6 +411,9 @@ final class VM: ObservableObject {
         current = account == "none" ? "未初始化" : account
         stamps = parsed
         archived = known
+        guard ["0", "1"].contains(fields["network_rebuild"] ?? "0") else { return reset() }
+        networkPending = fields["network_rebuild"] == "1"
+        if networkPending { phase = .failed }
         return true
     }
 
@@ -639,7 +673,7 @@ final class VM: ObservableObject {
     }
 
     func launchCLI(project: URL, resume: Bool) {
-        guard !isBusy, !checkingUpdate, coreAvailable() else { return }
+        guard !isBusy, !networkPending, !checkingUpdate, coreAvailable() else { return }
         guard Self.accountLetters.contains(current) else {
             rejectTool("请先在主窗口初始化并确认当前账号。")
             return
@@ -668,8 +702,97 @@ final class VM: ObservableObject {
 
     func resetRegion() { tool(["set-region"], reaudit: true) }
 
+    private static func networkObject(_ output: String) -> [String: Any]? {
+        guard let start = output.firstIndex(of: "{"), let data = String(output[start...]).data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              value["schema"] as? Int == 1, value["kind"] as? String == "network_rebuild" else { return nil }
+        return value
+    }
+
+    func loadNetworkState() {
+        tool(["network-rebuild", "state"]) { result in
+            guard result.succeeded, let value = Self.networkObject(result.output),
+                  let pending = value["pending"] as? Bool else {
+                self.rejectTool("无法读取网络重建状态。请更新核心后重试；不会执行清理。")
+                return
+            }
+            self.networkPending = pending
+            self.networkCanRollback = value["canRollback"] as? Bool ?? false
+            self.toolOutput = pending
+                ? "存在待验收的网络重建。请先恢复网络、启用代理，再检查保护环境。"
+                : "尚未执行网络重建。选择层级后，先预检并查看清单。"
+        }
+    }
+
+    func previewNetworkRebuild() {
+        guard !isBusy, (1...3).contains(networkLevel) else { return }
+        networkPlan = nil
+        let level = networkLevel
+        tool(["network-rebuild", "preview", String(level)]) { result in
+            guard result.succeeded, let value = Self.networkObject(result.output),
+                  let data = try? JSONSerialization.data(withJSONObject: value),
+                  let plan = try? JSONDecoder().decode(NetworkRebuildPlan.self, from: data),
+                  plan.level == level, self.networkLevel == level,
+                  plan.token.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+                  !plan.services.isEmpty, plan.canApply == plan.blocked.isEmpty else {
+                let message = Self.networkObject(result.output)?["message"] as? String
+                self.rejectTool(message ?? "预检结果不完整，不能执行。请重新预检。")
+                return
+            }
+            self.networkPlan = plan
+            self.networkPending = plan.pending
+            self.toolOutput = plan.canApply ? "预检完成。请核对自动处理项、手动事项与保留项，再确认执行。"
+                : plan.blocked.joined(separator: "\n")
+        }
+    }
+
+    func applyNetworkRebuild(confirmed: Bool) {
+        guard !isBusy, !checkingUpdate, coreAvailable() else { return }
+        guard confirmed, let plan = networkPlan, plan.canApply, !plan.pending,
+              plan.level == networkLevel, !networkPending else {
+            rejectTool("请先完成当前层级预检，并确认已了解断网和参数变化。")
+            return
+        }
+        networkPlan = nil
+        networkPending = true
+        phase = .failed
+        lastCheckSummary = "待验收"
+        for i in rows.indices { rows[i].state = .pending; rows[i].detail = "网络重建后需重新检查" }
+        banner = "网络重建期间及验收前，暂不允许启动 Claude。"
+        // Never terminate an authorized network operation midway through service reconfiguration.
+        tool(["network-rebuild", "apply", String(plan.level), plan.token], timeout: nil) { result in
+            self.receiveNetworkResult(result)
+        }
+    }
+
+    private func receiveNetworkResult(_ result: CoreResult) {
+        guard let value = Self.networkObject(result.output), let message = value["message"] as? String else {
+            rejectTool("未收到完整的网络操作结果。请读取重建状态；启动保护暂不解除。")
+            return
+        }
+        if let pending = value["pending"] as? Bool { networkPending = pending }
+        networkCanRollback = value["canRollback"] as? Bool ?? networkCanRollback
+        if !networkPending { networkCanRollback = false }
+        toolOutput = message
+        toolFailed = !result.succeeded || value["success"] as? Bool != true
+        if networkPending { phase = .failed; lastCheckSummary = "待验收" }
+    }
+
+    func rollbackNetworkRebuild() {
+        guard networkPending, networkCanRollback else { rejectTool("没有可以切回的旧位置。"); return }
+        networkPlan = nil
+        tool(["network-rebuild", "rollback"], timeout: nil) { result in self.receiveNetworkResult(result) }
+    }
+
+    func validateNetworkProtection() {
+        guard networkPending else { rejectTool("当前没有待验收的网络重建。"); return }
+        tool(["network-rebuild", "validate"], timeout: nil, reaudit: true) { result in
+            self.receiveNetworkResult(result)
+        }
+    }
+
     func openIsolated(_ address: String) {
-        guard !isBusy else { return }
+        guard !isBusy, !networkPending else { return }
         let address = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URLComponents(string: address), let scheme = url.scheme?.lowercased(),
               ["http", "https"].contains(scheme), !(url.host ?? "").isEmpty,
@@ -775,7 +898,7 @@ final class VM: ObservableObject {
     }
 
     func switchTo(_ target: String) {
-        guard !isBusy, Self.accountLetters.contains(target) else { return }
+        guard !isBusy, !networkPending, Self.accountLetters.contains(target) else { return }
         hideAfterSwitch?.cancel()
         isBusy = true
         switchRequested = true
@@ -1007,6 +1130,7 @@ struct ContentView: View {
     }
 
     var summaryTitle: String {
+        if vm.networkPending { return "网络重建后等待验收" }
         switch vm.phase {
         case .checking: return "正在检查环境"
         case .failed: return vm.coreMissing ? "需要安装核心脚本" : "环境检查未通过"
@@ -1234,19 +1358,21 @@ struct ToolsView: View {
     @State private var proxyAddress = ""
     @State private var proxyConfig: URL?
     @State private var pending: Confirmation?
+    @State private var networkAcknowledged = false
 
     static let destinations: [(id: String, title: String, icon: String, subtitle: String)] = [
         ("cli", "Claude Code", "terminal", "检查命令行环境，选择项目并启动会话。"),
         ("snapshot", "加密账号快照", "externaldrive", "在不同设备之间迁移已归档的桌面账号。"),
         ("region", "地区设置", "globe.asia.australia", "更换国家节点后，重新锁定地区目标。"),
         ("proxy", "代理诊断", "network", "通过指定代理检查 Claude 网页与 API 的传输。"),
+        ("rebuild", "Mac 网络重建", "arrow.triangle.2.circlepath", "分级刷新、复位或重建整台 Mac 的系统网络。"),
         ("browser", "隔离浏览器", "safari", "用独立的临时浏览器会话打开链接。"),
         ("keep", "跨账号保留", "doc.on.doc", "管理切换账号时共享的通用文件。"),
         ("policy", "WebRTC 策略", "waveform.path", "为支持的客户端选择 UDP 修复策略。")
     ]
 
     private enum Confirmation: String, Identifiable {
-        case region, policy, keep
+        case region, policy, keep, networkApply, networkRollback
         var id: String { rawValue }
     }
 
@@ -1273,21 +1399,34 @@ struct ToolsView: View {
                     ClaudeIconButton(systemName: "xmark", help: "关闭工具箱", disabled: vm.toolRunning) { dismiss() }
                         .keyboardShortcut(.cancelAction)
                 }
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        switch section {
-                        case "cli": cliSection
-                        case "snapshot": snapshotSection
-                        case "region": regionSection
-                        case "proxy": proxySection
-                        case "browser": browserSection
-                        case "policy": policySection
-                        default: keepSection
+                ScrollViewReader { scroll in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            switch section {
+                            case "cli": cliSection
+                            case "snapshot": snapshotSection
+                            case "region": regionSection
+                            case "proxy": proxySection
+                            case "rebuild": networkSection
+                            case "browser": browserSection
+                            case "policy": policySection
+                            default: keepSection
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(1)
+                        .disabled(vm.isBusy || vm.checkingUpdate || vm.coreMissing)
+                    }
+                    .onChange(of: vm.networkPlan?.token) { token in
+                        if section == "rebuild", token != nil, !vm.networkPending {
+                            scroll.scrollTo("network-plan", anchor: .top)
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(1)
-                    .disabled(vm.isBusy || vm.checkingUpdate || vm.coreMissing)
+                    .onAppear {
+                        if section == "rebuild", vm.networkPlan != nil, !vm.networkPending {
+                            DispatchQueue.main.async { scroll.scrollTo("network-plan", anchor: .top) }
+                        }
+                    }
                 }
                 resultPanel
             }
@@ -1301,10 +1440,22 @@ struct ToolsView: View {
         .tint(ClaudeTheme.terracottaDeep)
         .controlSize(.large)
         .interactiveDismissDisabled(vm.toolRunning)
-        .onAppear { vm.loadTools() }
+        .onAppear { if section == "rebuild" { vm.loadNetworkState() } else { vm.loadTools() } }
+        .onChange(of: section) { if $0 == "rebuild" { vm.loadNetworkState() } }
+        .onChange(of: vm.networkLevel) { _ in networkAcknowledged = false }
         .onDisappear { password = ""; repeatedPassword = ""; proxyAddress = "" }
         .alert(item: $pending) { action in
             switch action {
+            case .networkApply:
+                return Alert(title: Text("执行第 \(vm.networkLevel) 层网络重置？"),
+                             message: Text("将修改预检清单中的全机网络服务，可能断网。Wi-Fi 已保存网络、密码和自动加入偏好保留。第 3 层将建立新位置并使用 DHCP／自动 IPv6；原位置保留供回退。恢复代理并验收前，切换器不会启动 Claude。"),
+                             primaryButton: .destructive(Text("确认并请求授权")) { vm.applyNetworkRebuild(confirmed: networkAcknowledged); networkAcknowledged = false },
+                             secondaryButton: .cancel())
+            case .networkRollback:
+                return Alert(title: Text("切回旧网络位置？"),
+                             message: Text("请先退出代理／VPN 软件。切回后仍需重新检查保护环境，不会自动启动 Claude。"),
+                             primaryButton: .default(Text("切回旧位置")) { vm.rollbackNetworkRebuild() },
+                             secondaryButton: .cancel())
             case .region:
                 return Alert(title: Text("按当前出口重设地区？"),
                              message: Text("将探测当前出口，修改目标国家、系统地区格式和时区，并同步时区看门狗。可能请求管理员授权；完成后会重新检查。"),
@@ -1472,6 +1623,91 @@ struct ToolsView: View {
                 Button("打开 Web 指纹检测页") { vm.openIsolated("https://yoursjeyo.github.io/claude-switcher/") }
             }
         }.textFieldStyle(.roundedBorder)
+    }
+
+    private var networkSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            ClaudeSurface(title: "保留 Wi-Fi 连接信息", subtitle: "覆盖整台 Mac 的系统网络服务") {
+                Label("已保存网络、密码和自动加入偏好始终保留", systemImage: "lock.shield")
+                    .font(.system(size: 13, weight: .medium))
+                description("不忽略 Wi-Fi，不清空钥匙串，不删除代理订阅、节点或 Claude 账号。执行前请正常退出 Claude 和 Claude Code。")
+            }
+            if vm.networkPending {
+                ClaudeSurface(title: "网络操作待验收", subtitle: "普通联网与代理保护分别检查") {
+                    description("先恢复网络，再重新开启代理、TUN 和原有安全设置。完成检查前，启动和账号切换保持锁定；关闭窗口或重启切换器不会解除锁定。")
+                    HStack {
+                        Button("检查保护环境") { vm.validateNetworkProtection() }
+                            .buttonStyle(ClaudeActionStyle(primary: true))
+                        if vm.networkCanRollback {
+                            Button("切回旧位置…") { pending = .networkRollback }
+                        }
+                    }
+                    Button("重新读取重建状态") { vm.loadNetworkState() }
+                }
+            }
+            ClaudeSurface(title: "选择重置深度", subtitle: "层级不会自动升级，预检不会修改网络") {
+                Picker("重置层级", selection: $vm.networkLevel) {
+                    Text("1 · 连接刷新 — 按原有配置重新连接").tag(1)
+                    Text("2 · 参数复位 — 清除全机手动 DNS 与代理设置").tag(2)
+                    Text("3 · 深度重建 — 新网络位置与默认网络服务").tag(3)
+                }
+                .pickerStyle(.radioGroup)
+                .disabled(vm.networkPending)
+                if vm.networkLevel == 3 {
+                    description("第 3 层将 IPv4 改为 DHCP、IPv6 改为自动配置，并保留旧位置供回退。静态地址和特殊虚拟服务可能需要手动重新配置。恢复 Claude 保护前仍须按原有要求处理 IPv6。")
+                }
+                HStack {
+                    Button("只读预检") { networkAcknowledged = false; vm.previewNetworkRebuild() }
+                        .buttonStyle(ClaudeActionStyle(primary: true))
+                        .disabled(vm.networkPending)
+                    Button("打开系统网络设置") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.network") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                }
+            }
+            if let plan = vm.networkPlan {
+                ClaudeSurface(title: "本次执行清单", subtitle: "当前位置：\(plan.location) · \(plan.services.count) 个服务") {
+                    ForEach(plan.services) { service in
+                        HStack {
+                            Label(service.name, systemImage: service.device == "en0" ? "network" : "cable.connector")
+                            Spacer()
+                            Text("\(service.device) · \(service.enabled ? "启用" : "停用")")
+                                .font(.system(size: 11, design: .monospaced)).foregroundColor(ClaudeTheme.muted)
+                        }
+                    }
+                    Divider()
+                    Text("自动处理").font(.system(size: 12, weight: .semibold))
+                    networkLines(plan.automatic, symbol: "arrow.triangle.2.circlepath", color: ClaudeTheme.ink)
+                    Text("需要手动处理／确认").font(.system(size: 12, weight: .semibold))
+                    networkLines(plan.manual, symbol: "hand.raised", color: ClaudeTheme.muted)
+                    if !plan.blocked.isEmpty {
+                        Divider()
+                        networkLines(plan.blocked, symbol: "exclamationmark.triangle", color: ClaudeTheme.error)
+                    }
+                    Toggle("我已核对清单，了解断网和参数变化，并确认保留 Wi-Fi 信息",
+                           isOn: $networkAcknowledged)
+                        .toggleStyle(.checkbox)
+                        .disabled(!plan.canApply)
+                    Button("执行第 \(plan.level) 层重置…") { pending = .networkApply }
+                        .buttonStyle(ClaudeActionStyle(primary: true))
+                        .disabled(!plan.canApply || !networkAcknowledged || vm.networkPending)
+                }
+                .id("network-plan")
+            }
+        }
+    }
+
+    private func networkLines(_ lines: [String], symbol: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                Label(line, systemImage: symbol)
+                    .font(.system(size: 12)).foregroundColor(color)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
     }
 
     private var proxySection: some View {

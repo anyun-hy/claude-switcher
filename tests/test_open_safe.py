@@ -21,6 +21,8 @@ class OpenSafeTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
         self.fake = self.root / "fake-chrome"
         self.fake.write_text(
             "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$FAKE_LOG\"\nsleep 2\n",
@@ -30,9 +32,12 @@ class OpenSafeTests(unittest.TestCase):
 
     def run_open(self, url):
         env = dict(os.environ,
+                   HOME=str(self.home),
                    CLAUDE_SWITCHER_CHROME=str(self.fake),
                    CLAUDE_SWITCHER_SKIP_NET_CHECK="1",
                    FAKE_LOG=str(self.log))
+        env.pop("BASH_ENV", None)
+        env.pop("ENV", None)
         return subprocess.run(["/bin/bash", str(SCRIPT), "open-safe", url],
                               env=env, text=True, capture_output=True, timeout=30)
 

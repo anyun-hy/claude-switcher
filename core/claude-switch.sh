@@ -1,8 +1,517 @@
 #!/bin/bash
 # Claude 账号切换器 - 核心脚本 (通用版)
-# 用法: claude-switch.sh check | status | switch A|B|C|D | checkdetail | fix | set-region | update [--check|--auto] | diagnose-proxy
+# 用法: claude-switch.sh check | status | switch A|B|C|D | checkdetail | fix | set-region | update [--check|--auto] | diagnose-proxy | network-rebuild
 set -u
 export LC_ALL=en_US.UTF-8
+
+if [ "${1:-}" = "_network-rebuild" ]; then
+    shift
+    exec "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$@" <<'PY_NETWORK_REBUILD'
+"""Mac-wide maintenance. Only fixed Apple binaries run with administrator privileges.
+
+Wi-Fi profiles/passwords are never edited. Tests inject Runner; production has no test mode.
+"""
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+
+NET = "/usr/sbin/networksetup"
+ROOT_LOCK = Path("/var/run/local.claude-switcher.network-rebuild.lock")
+PRESERVED = ["Wi-Fi 已保存网络、密码、自动加入偏好", "代理订阅和节点", "Claude 账号与个人文件"]
+QUERIES = ("-getinfo", "-getdnsservers", "-getsearchdomains", "-getwebproxy",
+           "-getsecurewebproxy", "-getsocksfirewallproxy", "-getautoproxyurl",
+           "-getproxyautodiscovery", "-getproxybypassdomains")
+MUTATIONS = {"-setnetworkserviceenabled", "-setdnsservers", "-setsearchdomains",
+             "-setwebproxystate", "-setsecurewebproxystate", "-setsocksfirewallproxystate",
+             "-setautoproxystate", "-setproxyautodiscovery", "-setproxybypassdomains",
+             "-createlocation", "-switchtolocation", "-createnetworkservice",
+             "-setdhcp", "-setv6automatic", "-deletelocation"}
+NETWORK_APPS = {"FlClash": "FlClash", "FlClashCore": "FlClash", "verge-mihomo": "Clash Verge",
+                "Clash Verge": "Clash Verge", "clash-verge": "Clash Verge", "TAG": "TAG",
+                "Shadowrocket": "Shadowrocket", "Surge": "Surge", "ClashX": "ClashX",
+                "sing-box": "sing-box", "mihomo": "Mihomo", "clash": "Clash 内核",
+                "clash-meta": "Clash 内核"}
+
+
+class NetworkError(Exception):
+    pass
+
+
+def safe_name(value):
+    if (not isinstance(value, str) or not value or len(value.encode("utf-8")) > 240
+            or value.startswith(("-", "*")) or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+        raise NetworkError("网络服务名称无法安全识别，请在系统设置中手动处理。")
+    return value
+
+
+def command_error(output):
+    return bool(re.search(r"(?mi)^(?:\*\* [Ee]rror|Error:|You cannot|.* is not a recognized network)", output))
+
+
+class Runner:
+    def __init__(self):
+        if platform.system() != "Darwin" or os.geteuid() == 0:
+            raise NetworkError("请在 Mac 上以普通用户运行，由系统对重置操作请求管理员授权。")
+
+    @staticmethod
+    def environment():
+        return {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C",
+                "HOME": str(Path.home())}
+
+    def query(self, args):
+        try:
+            result = subprocess.run(args, env=self.environment(), stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=12)
+        except (OSError, subprocess.SubprocessError):
+            raise NetworkError("系统网络信息读取失败，请检查权限后重新预检。")
+        if result.returncode or command_error(result.stdout):
+            raise NetworkError("系统未能完整读取网络配置，未生成可执行计划。")
+        return result.stdout.rstrip("\n")
+
+    def authorize(self, shell):
+        # Never save an elevated helper in a user-writable directory.
+        literal = shell.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        script = ('do shell script "' + literal
+                  + '" with prompt "Mac 网络重建将修改全机网络设置，并保留 Wi-Fi 密码"'
+                  + ' with administrator privileges\n')
+        try:
+            result = subprocess.run(["/usr/bin/osascript"], input=script, env=self.environment(),
+                                    capture_output=True, text=True)
+        except (OSError, subprocess.SubprocessError):
+            return {"ok": False, "output": "", "cancelled": False}
+        return {"ok": result.returncode == 0, "output": result.stdout,
+                "cancelled": result.returncode != 0 and "(-128)" in result.stderr}
+
+    def root_busy(self):
+        return ROOT_LOCK.exists()
+
+
+class NetworkRebuild:
+    def __init__(self, runner, home=None, uid=None):
+        self.runner = runner
+        self.home = Path.home() if home is None else Path(home)
+        self.uid = os.getuid() if uid is None else uid
+        self.base = self.home / ".claude-switcher"
+        self.pending = self.base / "network-rebuild-pending.json"
+        self.lock = self.base / "network-rebuild.lock"
+
+    def _safe_file(self, path):
+        for item in (self.home, self.base):
+            if item.is_symlink():
+                raise NetworkError("网络重建状态目录不能是符号链接。")
+        if self.base.exists() and (not self.base.is_dir() or self.base.stat().st_uid != self.uid):
+            raise NetworkError("网络重建状态目录的权限无效。")
+        if path.exists() or path.is_symlink():
+            value = path.lstat()
+            if (not stat.S_ISREG(value.st_mode) or value.st_uid != self.uid
+                    or stat.S_IMODE(value.st_mode) & 0o077):
+                raise NetworkError("网络重建状态文件的权限无效。")
+
+    def state(self):
+        self._safe_file(self.pending)
+        if not self.pending.exists():
+            return {"pending": False, "phase": "idle", "canRollback": False}
+        try:
+            value = json.loads(self.pending.read_text(encoding="utf-8"))
+            if (value["schema"] != 1 or value["level"] not in (1, 2, 3)
+                    or not re.fullmatch(r"[0-9a-f]{64}", value["token"])
+                    or value["phase"] not in ("authorizing", "awaiting_validation", "failed")):
+                raise ValueError()
+            for key in ("oldLocation", "newLocation"):
+                if value.get(key):
+                    safe_name(value[key])
+        except (OSError, ValueError, KeyError, TypeError):
+            raise NetworkError("网络重建记录无效，启动保护保持锁定；请手动检查记录。")
+        return dict(value, pending=True, canRollback=value["level"] == 3
+                    and bool(value.get("newLocation")))
+
+    def busy(self):
+        self._safe_file(self.lock)
+        operation_lock = self.base / "cli-operation.lock"
+        if self.runner.root_busy() or operation_lock.exists() or operation_lock.is_symlink():
+            return True
+        if not self.lock.exists():
+            return False
+        with self.lock.open("r") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(handle, fcntl.LOCK_UN)
+                return False
+            except BlockingIOError:
+                return True
+
+    @contextlib.contextmanager
+    def exclusive(self):
+        self._safe_file(self.lock)
+        self.base.mkdir(mode=0o700, exist_ok=True)
+        descriptor = os.open(self.lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise NetworkError("另一个网络重建操作正在进行。")
+            if self.runner.root_busy():
+                raise NetworkError("系统网络重建仍在进行；若上次异常中断，请重启 Mac 后再检查。")
+            # Share the existing desktop/CLI/browser launch lock. This closes the
+            # race where a launch passed its first guard just before preview/apply.
+            operation_lock = self.base / "cli-operation.lock"
+            try:
+                operation_lock.mkdir(mode=0o700)
+            except FileExistsError:
+                raise NetworkError("账号切换或启动正在进行，请等待完成后重新预检。")
+            try:
+                yield
+            finally:
+                operation_lock.rmdir()
+
+    def save(self, value):
+        self._safe_file(self.pending)
+        descriptor, name = tempfile.mkstemp(prefix=".network-rebuild-", dir=self.base)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(value, handle, ensure_ascii=False)
+                handle.write("\n")
+            os.replace(name, self.pending)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+
+    def inventory(self):
+        captured = []
+
+        def query(args):
+            output = self.runner.query(args)
+            captured.append((args, output))
+            return output
+
+        location = safe_name(query([NET, "-getcurrentlocation"]))
+        locations = query([NET, "-listlocations"]).splitlines()
+        if location not in locations:
+            raise NetworkError("无法确认当前网络位置，未生成可执行计划。")
+        all_services = query([NET, "-listallnetworkservices"]).splitlines()
+        if not all_services or "asterisk" not in all_services[0].lower():
+            raise NetworkError("系统网络服务列表格式不受支持。")
+        enabled = {}
+        for name in all_services[1:]:
+            if not name:
+                continue
+            disabled = name.startswith("*")
+            name = safe_name(name[1:] if disabled else name)
+            if name in enabled:
+                raise NetworkError("系统网络服务名称重复，需手动检查。")
+            enabled[name] = not disabled
+        order = query([NET, "-listnetworkserviceorder"])
+        services = []
+        name = None
+        for line in order.splitlines():
+            entry = re.fullmatch(r"\((?:\d+|\*)\)\s+(.+)", line)
+            if entry:
+                candidate = entry[1]
+                name = candidate if candidate in enabled else candidate.lstrip("*")
+            port = re.fullmatch(r"\(Hardware Port: (.*), Device:\s*([^)]*)\)", line)
+            if port and name in enabled:
+                services.append({"name": name, "hardware": safe_name(port[1] or "Unknown"), "device": port[2],
+                                 "enabled": enabled[name]})
+                name = None
+        if not services or len(services) != len(enabled) or {s["name"] for s in services} != set(enabled):
+            raise NetworkError("网络服务与接口无法完整对应，请在系统设置中检查。")
+        physical = [s for s in services if re.fullmatch(r"en\d+", s["device"])
+                    and "bluetooth" not in s["hardware"].lower()]
+        manual = [s["name"] + "：虚拟或特殊网络服务需在所属软件中处理。"
+                  for s in services if s not in physical]
+        if not physical:
+            raise NetworkError("未识别到可以安全重建的 Wi-Fi／以太网服务。")
+        wifi_queries = []
+        for device in sorted({s["device"] for s in physical
+                              if s["hardware"].lower() in ("wi-fi", "airport")}):
+            args = [NET, "-listpreferredwirelessnetworks", device]
+            output = query(args)
+            if "Preferred networks on" not in output:
+                raise NetworkError("无法验证 Wi-Fi 已保存网络，已禁止自动重建。")
+            wifi_queries.append((args, output))
+        for service in physical:
+            values = {option: query([NET, option, service["name"]]) for option in QUERIES}
+            service["staticAddress"] = bool(re.search(r"(?mi)^(?:Manual|BOOTP|DHCP with manual)", values["-getinfo"]))
+        process_output = self.runner.query(["/bin/ps", "-axww", "-o", "uid=,comm="])
+        claude_running = False
+        running_apps = set()
+        for line in process_output.splitlines():
+            fields = line.strip().split(None, 1)
+            if len(fields) != 2 or not fields[0].isdigit():
+                continue
+            executable = Path(fields[1]).name
+            if int(fields[0]) == self.uid and (executable in ("Claude", "claude")
+                                              or "/.local/share/claude/versions/" in fields[1]):
+                claude_running = True
+            if executable in NETWORK_APPS:
+                running_apps.add(NETWORK_APPS[executable])
+        # npm/bun installations use node/bun as comm; inspect args only in memory.
+        cli_output = self.runner.query(["/bin/ps", "-axww", "-o", "uid=,args="])
+        isolated_running = False
+        for line in cli_output.splitlines():
+            fields = line.strip().split(None, 1)
+            if (len(fields) == 2 and fields[0] == str(self.uid)
+                    and re.search(r"@anthropic-ai/claude-code/(?:cli\.js|bin/claude(?:\.exe)?)", fields[1])):
+                claude_running = True
+            if (len(fields) == 2 and fields[0] == str(self.uid)
+                    and "--user-data-dir=" in fields[1] and "claude-switcher-safe." in fields[1]):
+                isolated_running = True
+        vpn = self.runner.query(["/usr/sbin/scutil", "--nc", "list"])
+        connected_vpn = bool(re.search(r"\((?:Connected|Connecting|Disconnecting)\)", vpn))
+        if connected_vpn:
+            manual.append("系统 VPN 正在连接：请先在系统设置中断开，确认不会自动重连。")
+        interfaces = self.runner.query(["/sbin/ifconfig", "-l"]).split()
+        if any(re.fullmatch(r"(?:utun|tun|tap|bridge)\d+", device) for device in interfaces):
+            manual.append("检测到虚拟网络接口：由所属软件管理；本功能不强行删除系统隧道或网桥。")
+        return {"location": location, "services": physical, "captured": captured,
+                "wifi": wifi_queries, "manual": manual, "claudeRunning": claude_running,
+                "runningApps": sorted(running_apps), "connectedVPN": connected_vpn,
+                "isolatedRunning": isolated_running}
+
+    @staticmethod
+    def digest(captured):
+        value = "".join(str(i) + "\n" + output + "\n" for i, (_, output) in enumerate(captured))
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def token(self, inventory, level):
+        return hashlib.sha256((str(self.uid) + ":" + str(level) + ":v1:"
+                               + self.digest(inventory["captured"])).encode()).hexdigest()
+
+    def preview(self, level):
+        inventory = self.inventory()
+        current = self.state()
+        blocked = []
+        if inventory["claudeRunning"]:
+            blocked.append("请先正常退出 Claude 和 Claude Code；本功能不会强制终止会话。")
+        if inventory["isolatedRunning"]:
+            blocked.append("请先关闭切换器打开的隔离浏览器窗口，避免重建时失去代理保护。")
+        if self.busy() or current["pending"]:
+            blocked.append("已有网络重建尚未验收，请先恢复网络并检查，或切回旧位置。")
+        if level >= 2 and inventory["runningApps"]:
+            blocked.append("请先退出会重新写入网络设置的软件：" + "、".join(inventory["runningApps"]) + "。")
+        if level >= 2 and inventory["connectedVPN"]:
+            blocked.append("请先断开系统 VPN，避免重建时自动恢复旧配置。")
+        manual = list(inventory["manual"])
+        automatic = ["刷新全机 DNS 缓存", "按原配置重新连接所有已启用的 Wi-Fi／以太网服务"]
+        if level >= 2:
+            automatic = ["清除全部已识别服务的手动 DNS 和搜索域",
+                         "关闭 HTTP／HTTPS／SOCKS、PAC 和自动代理发现，清空代理绕过列表",
+                         "刷新 DNS 缓存并重新连接；保留服务名称、IP 接入方式和启停状态"]
+        if level == 3:
+            automatic = ["建立干净网络位置，重新创建全部已识别的 Wi-Fi／以太网服务",
+                         "IPv4 使用 DHCP、IPv6 使用自动配置；代理与手动 DNS 回到新服务默认值",
+                         "保留接口顺序、原启停状态和旧网络位置，供失败或验收前切回",
+                         "由系统重新建立动态路由，刷新 DNS 缓存"]
+            manual.append("特殊虚拟服务不复制到新位置；如需使用，请在所属软件中重新启用。")
+            manual.append("确认联网正常后，可在系统网络位置设置中手动移除不再需要的旧位置。")
+            if any(s["staticAddress"] for s in inventory["services"]):
+                manual.append("存在手动地址：此层将改为 DHCP，请先确认网络支持自动获取并记下所需参数。")
+        manual.append("若系统要求登录网络或重新授权连接，请手动完成；必要时重启 Mac。")
+        return {"schema": 1, "kind": "network_rebuild", "level": level,
+                "token": self.token(inventory, level), "location": inventory["location"],
+                "services": [{"name": s["name"], "device": s["device"], "enabled": s["enabled"]}
+                             for s in inventory["services"]],
+                "automatic": automatic, "manual": manual, "blocked": blocked,
+                "preserved": PRESERVED, "canApply": not blocked, "pending": current["pending"]}
+
+    @staticmethod
+    def shell_digest(captured):
+        lines = ["{"]
+        for i, (args, _) in enumerate(captured):
+            lines.append("v=$(" + shlex.join(args) + ") || exit 71")
+            lines.append("printf '%s\\n%s\\n' " + shlex.quote(str(i)) + ' "$v"')
+        lines.append("} | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'")
+        return "\n".join(lines)
+
+    def script(self, inventory, level, new_location="", rollback=""):
+        def net(action, *args):
+            if action not in MUTATIONS:
+                raise NetworkError("未授权的网络操作。")
+            return shlex.join([NET, action, *args])
+
+        lines = [
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH",
+            "LC_ALL=C; LANG=C; export LC_ALL LANG", "unset BASH_ENV ENV CDPATH", "set -eu",
+            "/bin/mkdir " + shlex.quote(str(ROOT_LOCK)) + " || exit 72",
+            "restore_service=''; created=''",
+            "cleanup() {", "rc=$?; trap - EXIT HUP INT TERM; set +e",
+            'if [ -n "$restore_service" ]; then ' + NET + ' -setnetworkserviceenabled "$restore_service" on >/dev/null 2>&1; fi',
+        ]
+        if new_location:
+            lines += [
+                'if [ "$rc" -ne 0 ] && [ -n "$created" ]; then',
+                "if " + net("-switchtolocation", inventory["location"]) + " >/dev/null 2>&1; then",
+                net("-deletelocation", new_location) + " >/dev/null 2>&1",
+                "printf 'NETWORK_ROLLBACK_OK\\n'",
+                "else printf 'NETWORK_ROLLBACK_FAILED\\n'; fi; fi",
+            ]
+        lines += ["/bin/rmdir " + shlex.quote(str(ROOT_LOCK)) + ' >/dev/null 2>&1; exit "$rc"; }',
+                  "trap cleanup EXIT; trap 'exit 130' HUP INT TERM",
+                  "current=$(" + self.shell_digest(inventory["captured"]) + ")",
+                  '[ "$current" = ' + shlex.quote(self.digest(inventory["captured"])) + " ] || exit 73",
+                  "if /usr/bin/pgrep -u " + str(self.uid) + " -x 'Claude|claude' >/dev/null; then exit 74; else rc=$?; [ \"$rc\" -eq 1 ] || exit 74; fi",
+                  "processes=$(/bin/ps -axww -o uid=,comm=,args=) || exit 74",
+                  'if printf "%s\\n" "$processes" | /usr/bin/awk -v uid=' + str(self.uid)
+                  + r""" '$1 == uid && ($0 ~ /\/\.local\/share\/claude\/versions\// || $0 ~ /@anthropic-ai\/claude-code\/(cli\.js|bin\/claude)/ || ($0 ~ /--user-data-dir=/ && $0 ~ /claude-switcher-safe\./)) { found=1 } END { exit(found ? 0 : 1) }'; then exit 74; fi""",
+                  "step() {",
+                  'index=$1; shift; if out=$("$@" 2>&1); then :; else printf "NETWORK_STEP:%s:fail\\n" "$index"; return 1; fi',
+                  'case "$out" in *"** Error"*|*"Error:"*|*"not a recognized network"*|*"You cannot"*) printf "NETWORK_STEP:%s:fail\\n" "$index"; return 1;; esac',
+                  'printf "NETWORK_STEP:%s:ok\\n" "$index"; }', "printf 'NETWORK_STARTED\\n'"]
+        # Check again after the administrator dialog; a preview is not a lasting lock.
+        if level >= 2:
+            check = ("if /usr/bin/pgrep -x " + shlex.quote("|".join(re.escape(name) for name in NETWORK_APPS))
+                     + ' >/dev/null; then exit 74; else rc=$?; [ "$rc" -eq 1 ] || exit 74; fi')
+            lines.insert(-1, check)
+            lines.insert(-1, 'vpn=$(/usr/sbin/scutil --nc list) || exit 74')
+            lines.insert(-1, 'if printf "%s" "$vpn" | /usr/bin/grep -Eq "\\((Connected|Connecting|Disconnecting)\\)"; then exit 74; fi')
+        count = 0
+
+        def step(command):
+            nonlocal count
+            count += 1
+            lines.append("step " + str(count) + " " + command)
+
+        if rollback:
+            step(net("-switchtolocation", rollback))
+        elif level == 3:
+            step(net("-createlocation", new_location))
+            lines.append("created=1")
+            step(net("-switchtolocation", new_location))
+            for service in inventory["services"]:
+                name = service["name"]
+                step(net("-createnetworkservice", name, service["hardware"]))
+                step(net("-setdhcp", name))
+                step(net("-setv6automatic", name))
+                if not service["enabled"]:
+                    step(net("-setnetworkserviceenabled", name, "off"))
+        else:
+            for service in inventory["services"]:
+                name = service["name"]
+                if level == 2:
+                    for action in ("-setdnsservers", "-setsearchdomains", "-setproxybypassdomains"):
+                        step(net(action, name, "Empty"))
+                    for action in ("-setwebproxystate", "-setsecurewebproxystate",
+                                   "-setsocksfirewallproxystate", "-setautoproxystate", "-setproxyautodiscovery"):
+                        step(net(action, name, "off"))
+                if service["enabled"]:
+                    lines.append("restore_service=" + shlex.quote(name))
+                    step(net("-setnetworkserviceenabled", name, "off"))
+                    step(net("-setnetworkserviceenabled", name, "on"))
+                    lines.append("restore_service=''")
+        step("/usr/bin/dscacheutil -flushcache")
+        step("/usr/bin/killall -HUP mDNSResponder")
+        if inventory["wifi"]:
+            lines += ["wifi=$(" + self.shell_digest(inventory["wifi"]) + ")",
+                      '[ "$wifi" = ' + shlex.quote(self.digest(inventory["wifi"])) + " ] || exit 75"]
+        lines.append("printf 'NETWORK_DONE\\n'")
+        return "\n".join(lines) + "\n"
+
+    def apply(self, level, token):
+        if not re.fullmatch(r"[0-9a-f]{64}", token):
+            raise NetworkError("请先预检，再确认对应层级的执行清单。")
+        with self.exclusive():
+            if self.state()["pending"]:
+                raise NetworkError("上一次网络重建尚未验收，不能覆盖恢复记录。")
+            inventory = self.inventory()
+            if token != self.token(inventory, level):
+                raise NetworkError("网络配置或所选层级已变化，请重新预检；未执行修改。")
+            if (inventory["claudeRunning"] or inventory["isolatedRunning"]
+                    or (level >= 2 and (inventory["runningApps"] or inventory["connectedVPN"]))):
+                raise NetworkError("请先退出 Claude／Claude Code，以及会写回设置的代理或 VPN 软件，再重新预检。")
+            new_location = "Claude-Network-" + os.urandom(8).hex() if level == 3 else ""
+            record = {"schema": 1, "level": level, "token": token, "phase": "authorizing",
+                      "oldLocation": inventory["location"], "newLocation": new_location}
+            self.save(record)
+            result = self.runner.authorize(self.script(inventory, level, new_location))
+            started = "NETWORK_STARTED" in result["output"]
+            successful = result["ok"] and "NETWORK_DONE" in result["output"]
+            if not started:
+                self.pending.unlink()
+                return {"schema": 1, "kind": "network_rebuild", "success": False, "pending": False,
+                        "message": ("已取消管理员授权，未修改网络。"
+                                    if result["cancelled"] else "授权或执行前复核未通过，未修改网络；请重新预检。")}
+            record["phase"] = "awaiting_validation" if successful else "failed"
+            self.save(record)
+            completed = len(re.findall(r"(?m)^NETWORK_STEP:\d+:ok$", result["output"]))
+            return {"schema": 1, "kind": "network_rebuild", "success": successful, "pending": True,
+                    "completedSteps": completed, "canRollback": level == 3,
+                    "message": ("所选网络操作已完成，Wi-Fi 已保存网络列表复核一致。请恢复代理，再检查保护环境；尚未允许启动 Claude。"
+                                if successful else "网络操作未全部完成，启动保护保持锁定。请检查网络；已启用服务会尽力恢复，第 3 层失败会尝试切回旧位置。")}
+
+    def rollback(self):
+        with self.exclusive():
+            state = self.state()
+            if not state["pending"] or not state["canRollback"]:
+                raise NetworkError("没有可以自动切回的旧网络位置。")
+            inventory = self.inventory()
+            if (inventory["location"] != state["newLocation"] or inventory["claudeRunning"]
+                    or inventory["isolatedRunning"] or inventory["runningApps"] or inventory["connectedVPN"]):
+                raise NetworkError("当前网络位置已变化，或相关软件仍在运行；请退出软件并在系统设置中确认。")
+            result = self.runner.authorize(self.script(inventory, 1, rollback=state["oldLocation"]))
+            successful = result["ok"] and "NETWORK_DONE" in result["output"]
+            state = {key: value for key, value in state.items() if key not in ("pending", "canRollback")}
+            state["phase"] = "awaiting_validation" if successful else "failed"
+            self.save(state)
+            return {"schema": 1, "kind": "network_rebuild", "success": successful, "pending": True,
+                    "message": ("已切回旧网络位置，请重新检查保护环境。" if successful
+                                else "未能完成切回，记录已保留；请在系统网络位置设置中手动切回。")}
+
+    def finish(self):
+        # The shell bridge calls this only after its ordinary full safety check succeeds.
+        with self.exclusive():
+            if not self.state()["pending"]:
+                raise NetworkError("当前没有待验收的网络重建。")
+            self.pending.unlink()
+        return {"schema": 1, "kind": "network_rebuild", "success": True, "pending": False,
+                "message": "已通过现有安全检查并解除重建锁定；跳过项仍表示未验证。"}
+
+
+def network_main(args):
+    if (not args or args[0] not in ("preview", "apply", "state", "busy", "has-pending", "finish", "rollback")
+            or (args[0] in ("preview", "apply") and (len(args) < 2 or args[1] not in ("1", "2", "3")))
+            or len(args) != {"preview": 2, "apply": 3, "state": 1, "busy": 1,
+                            "has-pending": 1, "finish": 1, "rollback": 1}.get(args[0], 0)):
+        raise NetworkError("用法：network-rebuild preview <1|2|3>；apply <层级> <预检令牌>；state；validate；rollback")
+    backend = NetworkRebuild(Runner())
+    if args[0] == "busy":
+        return 0 if backend.busy() else 1
+    if args[0] == "has-pending":
+        return 0 if backend.state()["pending"] else 1
+    if args[0] == "preview":
+        value = backend.preview(int(args[1]))
+    elif args[0] == "apply":
+        value = backend.apply(int(args[1]), args[2])
+    elif args[0] == "state":
+        value = dict(backend.state(), schema=1, kind="network_rebuild")
+    elif args[0] == "rollback":
+        value = backend.rollback()
+    else:
+        value = backend.finish()
+    print(json.dumps(value, ensure_ascii=False))
+    return 0 if value.get("success", True) else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(network_main(sys.argv[1:]))
+    except (NetworkError, OSError, ValueError, TypeError, KeyError):
+        error = sys.exc_info()[1]
+        message = str(error) if isinstance(error, NetworkError) else "网络重建状态或系统操作失败，请重新预检；未确认完成。"
+        print(json.dumps({"schema": 1, "kind": "network_rebuild", "success": False,
+                          "message": message}, ensure_ascii=False))
+        raise SystemExit(2)
+PY_NETWORK_REBUILD
+fi
 
 if [ "${1:-}" = "_support" ]; then
     shift
@@ -988,8 +1497,29 @@ LOG="$HOME/Library/Logs/claude-switch.log"
 CLASH_DIR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 ROUTE_MISSED=""
 KEEP_STAGED=0
+# Maintenance is a persistent launch interlock, not a substitute for the safety audit.
+# Check it before account initialization, and never stop the installed bodyguard.
+NETWORK_PENDING="$BASE/network-rebuild-pending.json"
 case "${1:-}" in
-    get-tool-config|set-keep-paths) ;;  # 工具配置入口不初始化账号目录。
+    switch|cli|open-safe)
+        if [ -e "$NETWORK_PENDING" ] || [ -L "$NETWORK_PENDING" ] || [ -e /var/run/local.claude-switcher.network-rebuild.lock ]; then
+            echo "FAIL:网络重建尚未验收，请恢复代理并在工具中检查保护环境；暂不允许启动 Claude"
+            exit 1
+        fi
+        ;;
+    fix|set-client|set-region|update|check|checkdetail)
+        if [ -e "$NETWORK_PENDING" ] || [ -L "$NETWORK_PENDING" ] || [ -e /var/run/local.claude-switcher.network-rebuild.lock ]; then
+            "$0" _network-rebuild busy >/dev/null 2>&1
+            busy_rc=$?
+            if [ "$busy_rc" -ne 1 ]; then
+                echo "FAIL:网络重建正在执行或状态无效，请等待完成后再操作"
+                exit 1
+            fi
+        fi
+        ;;
+esac
+case "${1:-}" in
+    get-tool-config|set-keep-paths|network-rebuild) ;;  # 工具配置与网络重建不初始化账号目录。
     *) mkdir -p "$BASE/accounts" ;;
 esac
 
@@ -2557,6 +3087,7 @@ open_safe() {
         '') echo "FAIL:用法: claude-switch.sh open-safe <http(s)://链接>"; return 1 ;;
         *) echo "FAIL:只允许 http/https 链接"; return 1 ;;
     esac
+    cli_lock_acquire || return 1
     if [ "${CLAUDE_SWITCHER_SKIP_NET_CHECK:-0}" != "1" ] && ! tun_up && ! proxy_alive; then
         echo "FAIL:代理未就绪(TUN 未接管且客户端未运行),拒绝打开以免直连"
         return 1
@@ -2712,6 +3243,7 @@ status() {
         stamp=$(date -r "$dir" '+%Y-%m-%d' 2>/dev/null)
         extras="$extras acc$a=${size:-?}@${stamp:-?}"
     done
+    if [ -e "$BASE/network-rebuild-pending.json" ] || [ -L "$BASE/network-rebuild-pending.json" ]; then extras="$extras network_rebuild=1"; fi
     echo "current=$cur hasA=$hasA hasB=$hasB hasC=$hasC hasD=$hasD accounts=${accounts:-none}$extras"
 }
 
@@ -2968,6 +3500,7 @@ restore_keep_paths() {
 switch_to() {
     target="${1:-}"
     valid_account "$target" || return 1
+    cli_lock_acquire || return 1
     cur="none"; [ -f "$BASE/current" ] && cur=$(cat "$BASE/current")
     just_archived=0
 
@@ -3063,6 +3596,25 @@ operation="${1:-}"
 started_at=$(date +%s)
 summary=""
 case "$operation" in
+    network-rebuild)
+        case "${2:-}" in
+            preview|apply|state|rollback) "$0" _network-rebuild "${@:2}" ;;
+            validate)
+                if [ "$#" -ne 2 ] || ! "$0" _network-rebuild has-pending >/dev/null 2>&1; then
+                    echo '{"schema":1,"kind":"network_rebuild","success":false,"message":"当前没有有效的待验收记录。"}'
+                    exit 1
+                fi
+                "$0" _network-rebuild busy >/dev/null 2>&1
+                busy_rc=$?
+                if [ "$busy_rc" -ne 1 ] || ! check >/dev/null 2>&1; then
+                    echo '{"schema":1,"kind":"network_rebuild","success":false,"pending":true,"message":"保护环境尚未恢复或操作仍在执行。请先启用代理、TUN 和原有安全设置，再检查；启动锁定保留。"}'
+                    exit 1
+                fi
+                "$0" _network-rebuild finish
+                ;;
+            *) echo '{"schema":1,"kind":"network_rebuild","success":false,"message":"请使用 preview <1|2|3>、apply <层级> <预检令牌>、state、validate 或 rollback。"}'; exit 2 ;;
+        esac
+        ;;
     check)  check ;;
     checkdetail)
         OUT_FILE="$BASE/last-check.txt"
@@ -3097,7 +3649,7 @@ case "$operation" in
     set-keep-paths) "$0" _support keep-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto|--gui]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto|--gui]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]|network-rebuild <preview|apply|state|validate|rollback> [args...]"; exit 2 ;;
 esac
 # checkdetail 分支内部已保存返回码;其他分支取 case 的最终状态。
 # 判断本身会改变 $?，所以必须先捕获 dispatch_rc，再按操作类型落 rc。
@@ -3106,7 +3658,7 @@ if [ "$operation" != "checkdetail" ]; then
     rc=$dispatch_rc
 fi
 case "$operation" in
-    get-check-config|set-check-config|get-tool-config|set-keep-paths|export-diagnostics|detect-client) ;;
+    get-check-config|set-check-config|get-tool-config|set-keep-paths|export-diagnostics|detect-client|network-rebuild) ;;
     *) log_result "$started_at" "$operation" "$rc" "$summary" ;;
 esac
 exit "$rc"
