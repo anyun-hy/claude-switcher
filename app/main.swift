@@ -85,6 +85,14 @@ final class VM: ObservableObject {
     @Published var settingsMessage = ""
     @Published private(set) var settingsBusy = false
     @Published var showSettingsSheet = false
+    @Published var showToolsSheet = false
+    @Published private(set) var toolRunning = false
+    @Published private(set) var toolOutput = ""
+    @Published private(set) var toolFailed = false
+    @Published var keepPaths = ""
+    @Published var webrtcPolicy = "proxy"
+    @Published private(set) var regionTarget = "尚未读取"
+    var terminalLauncher: ((String, @escaping (CoreResult) -> Void) -> Void)?
 
     static let optionalChecks: [(key: String, label: String)] = [
         ("IP一致", "IP 与上次一致"),
@@ -124,7 +132,7 @@ final class VM: ObservableObject {
         self.updateTimeout = updateTimeout
     }
 
-    var canQuit: Bool { !switchRequested && !updating && phase != .fixing && phase != .switching }
+    var canQuit: Bool { !toolRunning && !switchRequested && !updating && phase != .fixing && phase != .switching }
 
     func start() {
         guard !started else { return }
@@ -137,7 +145,14 @@ final class VM: ObservableObject {
         if phase == .done { phase = .ready }
     }
 
-    private func run(_ args: [String], timeout: TimeInterval = 45, done: @escaping (CoreResult) -> Void) {
+    private func run(_ args: [String], timeout: TimeInterval? = 45, input: Data? = nil,
+                     environment: [String: String] = [:], done: @escaping (CoreResult) -> Void) {
+        execute("/bin/bash", [core] + args, timeout: timeout, input: input, environment: environment, done: done)
+    }
+
+    private func execute(_ executable: String, _ args: [String], timeout: TimeInterval? = 45,
+                         input: Data? = nil, environment: [String: String] = [:],
+                         done: @escaping (CoreResult) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("switcher-out-\(UUID().uuidString).txt")
             guard FileManager.default.createFile(atPath: tmp.path, contents: nil, attributes: [.posixPermissions: 0o600]),
@@ -150,8 +165,26 @@ final class VM: ObservableObject {
                 try? FileManager.default.removeItem(at: tmp)
             }
             let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/bash")
-            p.arguments = [self.core] + args
+            p.executableURL = URL(fileURLWithPath: executable)
+            p.arguments = args
+            var env = ProcessInfo.processInfo.environment
+            env.removeValue(forKey: "BASH_ENV")
+            env.removeValue(forKey: "ENV")
+            env.merge(environment) { _, new in new }
+            p.environment = env
+            p.standardInput = FileHandle.nullDevice
+            // Snapshot passwords are bounded by the form and never enter argv or files.
+            let stdin = input.map { _ in Pipe() }
+            if let input = input, let stdin = stdin {
+                guard input.count <= 4096 else {
+                    DispatchQueue.main.async { done(CoreResult(output: "输入内容过长", succeeded: false)) }
+                    return
+                }
+                p.standardInput = stdin.fileHandleForReading
+                stdin.fileHandleForWriting.write(input)
+                try? stdin.fileHandleForWriting.close()
+            }
+            defer { try? stdin?.fileHandleForReading.close() }
             p.standardOutput = fh
             p.standardError = fh
             do { try p.run() } catch {
@@ -160,7 +193,9 @@ final class VM: ObservableObject {
             }
             let deadline = ProcessDeadline()
             let watchdog = DispatchWorkItem { deadline.expire(p) }
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+            if let timeout = timeout {
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+            }
             p.waitUntilExit()
             watchdog.cancel()
             let data = (try? Data(contentsOf: tmp)) ?? Data()
@@ -529,6 +564,193 @@ final class VM: ObservableObject {
         }
     }
 
+    private func rejectTool(_ message: String) {
+        toolOutput = message
+        toolFailed = true
+    }
+
+    private func finishTool(_ result: CoreResult) {
+        toolOutput = result.output.isEmpty ? "操作未返回结果" : result.output
+        toolFailed = !result.succeeded
+        toolRunning = false
+        isBusy = false
+    }
+
+    private func tool(_ args: [String], timeout: TimeInterval? = 180, input: Data? = nil,
+                      environment: [String: String] = [:], reaudit: Bool = false,
+                      reloadStatus: Bool = false, completed: ((CoreResult) -> Void)? = nil) {
+        guard !isBusy, !checkingUpdate, coreAvailable() else { return }
+        hideAfterSwitch?.cancel()
+        isBusy = true
+        toolRunning = true
+        toolFailed = false
+        toolOutput = "正在处理，请稍候…"
+        run(args, timeout: timeout, input: input, environment: environment) { result in
+            self.toolOutput = result.output.isEmpty ? "操作未返回结果" : result.output
+            self.toolFailed = !result.succeeded
+            completed?(result)
+            if reaudit {
+                self.checkEnvironment { _ in self.toolRunning = false; self.isBusy = false }
+            } else if reloadStatus && result.succeeded {
+                self.run(["status"]) { status in
+                    if !self.updateStatus(status) {
+                        self.toolFailed = true
+                        self.toolOutput += "\n账号状态刷新失败，请重新检查。"
+                    }
+                    self.toolRunning = false; self.isBusy = false
+                }
+            } else {
+                self.toolRunning = false; self.isBusy = false
+            }
+        }
+    }
+
+    func loadTools() {
+        tool(["get-tool-config"]) { result in
+            guard result.succeeded, let data = result.output.data(using: .utf8),
+                  let value = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+                  let keep = value["keepPaths"], let policy = value["policy"],
+                  ["proxy", "reject"].contains(policy), let country = value["country"],
+                  let timezone = value["timezone"], let locale = value["locale"] else {
+                self.rejectTool("工具配置读取失败；请确认核心已更新并重试。")
+                return
+            }
+            self.keepPaths = keep
+            self.webrtcPolicy = policy
+            self.regionTarget = "\(country) · \(timezone) · \(locale)"
+            if let client = value["client"], Self.clientChoices.contains(where: { $0.key == client }) {
+                self.currentClient = client
+            }
+            self.toolOutput = "工具已就绪。选择功能后查看执行结果。"
+        }
+    }
+
+    func inspectCLI() {
+        let home = NSHomeDirectory()
+        let path = [home + "/.local/bin", home + "/.bun/bin", "/opt/homebrew/bin", "/usr/local/bin",
+                    ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"].joined(separator: ":")
+        tool(["cli-info"], environment: ["PATH": path])
+    }
+
+    func inspectCLISlot() { tool(["cli-current"]) }
+
+    static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    func launchCLI(project: URL, resume: Bool) {
+        guard !isBusy, !checkingUpdate, coreAvailable() else { return }
+        guard Self.accountLetters.contains(current) else {
+            rejectTool("请先在主窗口初始化并确认当前账号。")
+            return
+        }
+        var directory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: project.path, isDirectory: &directory), directory.boolValue else {
+            rejectTool("请选择存在的项目文件夹。")
+            return
+        }
+        let command = "cd -- \(Self.shellQuote(project.path)) && /bin/bash \(Self.shellQuote(core)) cli" + (resume ? " --resume" : "")
+        hideAfterSwitch?.cancel()
+        isBusy = true; toolRunning = true; toolFailed = false
+        toolOutput = "正在打开终端…"
+        let done: (CoreResult) -> Void = { result in
+            self.finishTool(result.succeeded
+                ? CoreResult(output: "已打开终端。Claude Code 会先检查环境，再启动当前槽位；首次使用需在终端登录。", succeeded: true)
+                : result)
+        }
+        if let terminalLauncher = terminalLauncher {
+            terminalLauncher(command, done)
+        } else {
+            let script = "on run argv\ntell application \"Terminal\"\nactivate\ndo script (item 1 of argv)\nend tell\nend run"
+            execute("/usr/bin/osascript", ["-e", script, command], timeout: 30, done: done)
+        }
+    }
+
+    func resetRegion() { tool(["set-region"], reaudit: true) }
+
+    func openIsolated(_ address: String) {
+        guard !isBusy else { return }
+        let address = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URLComponents(string: address), let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), !(url.host ?? "").isEmpty,
+              url.user == nil, url.password == nil, !address.contains("\n"), !address.contains("\r") else {
+            rejectTool("请输入完整的 http 或 https 网址。")
+            return
+        }
+        tool(["open-safe", address])
+    }
+
+    func diagnoseProxy(address: String, config: URL?) {
+        guard !isBusy else { return }
+        let summarize: (CoreResult) -> Void = { result in
+            if let text = Self.proxySummary(result.output) { self.toolOutput = text }
+        }
+        if let config = config {
+            tool(["diagnose-proxy", "--config", config.path], completed: summarize)
+        } else {
+            let address = address.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !address.isEmpty else { rejectTool("请输入代理地址或选择私有 JSON 配置。") ; return }
+            tool(["diagnose-proxy"], environment: ["CLAUDE_SWITCHER_PROXY_URL": address], completed: summarize)
+        }
+    }
+
+    static func proxySummary(_ output: String) -> String? {
+        guard let start = output.firstIndex(of: "{"), let data = String(output[start...]).data(using: .utf8),
+              let report = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              report["mode"] as? String == "proxy_diagnostics" else { return nil }
+        if report["state"] as? String == "configuration_error" {
+            return "代理配置无效：请确认协议、地址、端口或私有 JSON 内容。"
+        }
+        guard let checks = report["checks"] as? [[String: Any]], checks.count == 2 else { return nil }
+        let lines = checks.map { check -> String in
+            let name = check["name"] as? String == "claude_web" ? "Claude 网页" : "Claude API"
+            guard check["transport_reached"] as? Bool == true else { return name + "：传输未确认，请检查代理和网络。" }
+            let status = check["http_status"] as? Int ?? 0
+            let access = status == 401 ? "，尚未认证" : (status == 403 || status == 407 ? "，访问受限" : "")
+            return "\(name)：已收到响应（HTTP \(status)\(access)）"
+        }
+        return (lines + ["仅验证传输，未验证账号登录或完整防泄漏保护。"]).joined(separator: "\n")
+    }
+
+    func transferSnapshot(importing: Bool, account: String, file: URL, password: String, confirmation: String = "") {
+        guard !isBusy else { return }
+        guard Self.accountLetters.contains(account), account != current else {
+            rejectTool("请选择当前未使用的 A–D 槽位。")
+            return
+        }
+        guard importing ? !archived.contains(account) : archived.contains(account) else {
+            rejectTool(importing ? "目标槽位已有存档，不能覆盖。" : "此槽位还没有归档快照。")
+            return
+        }
+        guard !password.isEmpty, password.utf8.count <= 1024,
+              !password.contains(where: { $0 == "\n" || $0 == "\r" || $0 == "\0" }),
+              importing || (password.count >= 8 && password == confirmation) else {
+            rejectTool(importing ? "请输入有效的镜像密码。" : "密码至少 8 位，两次输入须一致。")
+            return
+        }
+        let args = importing ? ["snapshot-import", file.path, account, "--password-stdin"]
+                             : ["snapshot-export", account, file.path, "--password-stdin"]
+        // Do not terminate a disk-image operation midway through copy/mount/cleanup.
+        tool(args, timeout: nil, input: Data((password + "\n").utf8), reloadStatus: importing)
+    }
+
+    func saveKeepPaths() {
+        guard let data = try? JSONSerialization.data(withJSONObject: keepPaths, options: [.fragmentsAllowed]),
+              let json = String(data: data, encoding: .utf8) else { return }
+        tool(["set-keep-paths", json])
+    }
+
+    var supportsWebRTCPolicy: Bool { ["clash-verge", "flclash"].contains(currentClient) }
+
+    func applyWebRTCPolicy() {
+        guard !isBusy else { return }
+        guard supportsWebRTCPolicy, ["proxy", "reject"].contains(webrtcPolicy) else {
+            rejectTool("当前客户端不支持由切换器修改 WebRTC 策略，请在代理客户端中管理。")
+            return
+        }
+        tool(["fix"], environment: ["WEBRTC_POLICY": webrtcPolicy], reaudit: true)
+    }
+
     var aiPrompt: String {
         let home = NSHomeDirectory()
         let agents = home + "/.claude-switcher/AGENTS.md"
@@ -725,6 +947,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showAIPrompt) { AIPromptSheet(text: vm.aiPrompt) }
         .sheet(isPresented: $vm.showSettingsSheet) { CheckSettingsView(vm: vm) }
+        .sheet(isPresented: $vm.showToolsSheet) { ToolsView(vm: vm) }
         .frame(width: 440, height: height)
         .preferredColorScheme(.light)
     }
@@ -1077,6 +1300,11 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("检查更新")
+            Button { vm.showToolsSheet = true } label: {
+                Text("工具").font(.caption2).foregroundColor(ClaudeTheme.muted)
+            }
+            .buttonStyle(.plain)
+            .disabled(vm.isBusy || vm.checkingUpdate)
             Button { showAIPrompt = true } label: {
                 Text("AI 配置").font(.caption2).foregroundColor(ClaudeTheme.muted)
             }
@@ -1089,6 +1317,257 @@ struct ContentView: View {
 }
 
 // MARK: - 检查设置与诊断
+
+struct ToolsView: View {
+    @ObservedObject var vm: VM
+    @Environment(\.dismiss) private var dismiss
+    @State private var section = "cli"
+    @State private var project: URL?
+    @State private var importing = false
+    @State private var account = "B"
+    @State private var password = ""
+    @State private var repeatedPassword = ""
+    @State private var address = ""
+    @State private var proxyAddress = ""
+    @State private var proxyConfig: URL?
+    @State private var pending: Confirmation?
+
+    private enum Confirmation: String, Identifiable {
+        case region, policy, keep
+        var id: String { rawValue }
+    }
+
+    init(vm: VM, initialSection: String = "cli") {
+        self.vm = vm
+        _section = State(initialValue: initialSection)
+    }
+
+    var body: some View {
+        ZStack {
+            ClaudeBackground()
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("工具").font(.system(size: 22, weight: .bold, design: .serif))
+                        Text("Claude Code、账号快照与环境维护").font(.caption).foregroundColor(ClaudeTheme.muted)
+                    }
+                    Spacer()
+                    Button("关闭") { dismiss() }.disabled(vm.toolRunning)
+                        .keyboardShortcut(.cancelAction)
+                }
+                Picker("工具分类", selection: $section) {
+                    Text("Claude Code").tag("cli")
+                    Text("账号快照").tag("snapshot")
+                    Text("网络与地区").tag("network")
+                    Text("共享设置").tag("keep")
+                }
+                .pickerStyle(.segmented)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        switch section {
+                        case "cli": cliSection
+                        case "snapshot": snapshotSection
+                        case "network": networkSection
+                        default: keepSection
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(2)
+                    .disabled(vm.isBusy || vm.checkingUpdate || vm.coreMissing)
+                }
+                Divider()
+                HStack {
+                    if vm.toolRunning { ProgressView().controlSize(.small) }
+                    Text(vm.toolRunning ? "正在执行" : (vm.toolFailed ? "操作未完成" : "执行结果"))
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(vm.toolFailed ? ClaudeTheme.error : ClaudeTheme.muted)
+                    Spacer()
+                    Button("刷新工具配置") { vm.loadTools() }.disabled(vm.isBusy || vm.checkingUpdate)
+                        .font(.caption)
+                }
+                ScrollView {
+                    Text(vm.toolOutput.isEmpty ? "选择工具后，这里会显示结果。" : vm.toolOutput)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(12)
+                .frame(height: 110)
+                .background(ClaudeTheme.card)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+            .padding(24)
+        }
+        .frame(width: 680, height: 660)
+        .foregroundColor(ClaudeTheme.ink)
+        .tint(ClaudeTheme.terracottaDeep)
+        .preferredColorScheme(.light)
+        .interactiveDismissDisabled(vm.toolRunning)
+        .onAppear { vm.loadTools() }
+        .onDisappear { password = ""; repeatedPassword = ""; proxyAddress = "" }
+        .alert(item: $pending) { action in
+            switch action {
+            case .region:
+                return Alert(title: Text("按当前出口重设地区？"),
+                             message: Text("将探测当前出口，修改目标国家、系统地区格式和时区，并同步时区看门狗。可能请求管理员授权；完成后会重新检查。"),
+                             primaryButton: .default(Text("重设地区")) { vm.resetRegion() }, secondaryButton: .cancel())
+            case .policy:
+                return Alert(title: Text("应用 WebRTC 策略并修复？"),
+                             message: Text("将调用一键修复，可能修改当前客户端的规则、重启代理并请求管理员授权。拒绝 UDP 策略可能影响语音、视频或 P2P。"),
+                             primaryButton: .default(Text("应用并修复")) { vm.applyWebRTCPolicy() }, secondaryButton: .cancel())
+            case .keep:
+                return Alert(title: Text("保存跨账号保留列表？"),
+                             message: Text("列出的文件将在以后切换账号时共享。请只保留通用配置，不要加入登录凭据、Cookie、设备标识或缓存。留空表示关闭。"),
+                             primaryButton: .default(Text("保存列表")) { vm.saveKeepPaths() }, secondaryButton: .cancel())
+            }
+        }
+    }
+
+    private func description(_ text: String) -> some View {
+        Text(text).font(.caption).foregroundColor(ClaudeTheme.muted).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var cliSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("Claude Code", systemImage: "terminal").font(.headline)
+            description("检查命令行版的安装与版本，按当前桌面槽位打开 Claude Code。B–D 的 CLI 需要分别登录，桌面快照不包含 CLI 数据。")
+            HStack {
+                Button("检查安装与版本") { vm.inspectCLI() }
+                Button("查看当前 CLI 槽位") { vm.inspectCLISlot() }
+            }
+            Divider()
+            Text("项目文件夹").font(.subheadline.weight(.semibold))
+            HStack {
+                Text(project?.path ?? "请选择 Claude Code 要使用的项目文件夹")
+                    .font(.caption).lineLimit(2).textSelection(.enabled)
+                Spacer()
+                Button("选择文件夹…") { project = selectFile(directory: true) ?? project }
+            }
+            HStack {
+                Button("启动 Claude Code") { if let project = project { vm.launchCLI(project: project, resume: false) } }
+                    .buttonStyle(.borderedProminent)
+                Button("选择历史会话") { if let project = project { vm.launchCLI(project: project, resume: true) } }
+            }
+            .disabled(project == nil)
+            description("交互式对话和登录会在终端中进行，启动前仍由核心检查环境。首次打开终端时，macOS 可能请求自动化授权。")
+        }
+    }
+
+    private var snapshotSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("加密账号快照", systemImage: "externaldrive.badge.person.crop").font(.headline)
+            Picker("操作", selection: $importing) {
+                Text("导出快照").tag(false)
+                Text("导入快照").tag(true)
+            }.pickerStyle(.segmented)
+            Picker("账号槽位", selection: $account) {
+                ForEach(VM.accountLetters, id: \.self) { slot in
+                    Text("账号 \(slot) · \(slot == vm.current ? "当前" : (vm.archived.contains(slot) ? "已归档" : "未归档"))").tag(slot)
+                }
+            }
+            description(importing
+                ? "只导入到未使用、没有存档的槽位；镜像中的账号标记须与目标一致。服务端登录过期时仍需重新登录。"
+                : "只能导出已归档、当前未使用的槽位。当前槽位需先在主窗口切换到其他账号后再导出。")
+            SecureField(importing ? "镜像密码" : "设置密码（至少 8 位）", text: $password)
+            if !importing { SecureField("再次输入密码", text: $repeatedPassword) }
+            Button(importing ? "选择镜像并导入…" : "选择位置并导出…") { transferSnapshot() }
+                .buttonStyle(.borderedProminent)
+                .disabled(account == vm.current || (importing ? vm.archived.contains(account) : !vm.archived.contains(account)) || password.isEmpty || (!importing && (password.count < 8 || password != repeatedPassword)))
+            description("采用 macOS 加密 DMG；不包含独立 Claude Code 配置。密码无法找回。导入或导出期间请等待完成。")
+        }
+        .textFieldStyle(.roundedBorder)
+        .onChange(of: importing) { _ in password = ""; repeatedPassword = "" }
+    }
+
+    private var networkSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            GroupBox("地区目标") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(vm.regionTarget).font(.caption).textSelection(.enabled)
+                    description("更换其他国家的节点后，按当前出口重新锁定目标。")
+                    Button("按当前出口重设地区…") { pending = .region }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox("隔离浏览器") {
+                VStack(alignment: .leading, spacing: 8) {
+                    TextField("https://…", text: $address)
+                    HStack {
+                        Button("隔离打开链接") { vm.openIsolated(address); address = "" }
+                        Button("打开 Web 指纹检测") { vm.openIsolated("https://yoursjeyo.github.io/claude-switcher/") }
+                    }
+                    description("使用一次性浏览器配置；窗口关闭后会话丢弃。Web 检测页可补充 Canvas 和 WebGL 检查。")
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox("指定代理诊断") {
+                VStack(alignment: .leading, spacing: 8) {
+                    SecureField("代理地址（含协议和端口）", text: $proxyAddress)
+                        .disabled(proxyConfig != nil)
+                    HStack {
+                        Button("选择私有 JSON…") { proxyConfig = selectFile(directory: false, types: [.json]) ?? proxyConfig }
+                        if let config = proxyConfig {
+                            Text(config.lastPathComponent).font(.caption).lineLimit(1)
+                            Button("清除文件") { proxyConfig = nil }
+                        }
+                        Spacer()
+                        Button("诊断代理") { vm.diagnoseProxy(address: proxyAddress, config: proxyConfig); proxyAddress = "" }
+                    }
+                    description("只测试所选代理到 Claude 网页和 API 的传输。401/403 是认证或访问限制，不表示账号可用；此诊断不提供启动许可。")
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox("WebRTC 修复策略") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker("UDP 策略", selection: $vm.webrtcPolicy) {
+                        Text("走代理（保留通话能力）").tag("proxy")
+                        Text("拒绝相关端口（可能影响通话）").tag("reject")
+                    }
+                    Button("应用策略并修复…") { pending = .policy }
+                    description(vm.supportsWebRTCPolicy ? "仅影响支持的客户端；应用后重新检查。" : "当前客户端需自行管理规则，切换器不会修改 TAG 等客户端的策略。")
+                }.frame(maxWidth: .infinity, alignment: .leading)
+                    .disabled(!vm.supportsWebRTCPolicy)
+            }
+        }.textFieldStyle(.roundedBorder)
+    }
+
+    private var keepSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("跨账号保留", systemImage: "doc.on.doc").font(.headline)
+            description("每行一个相对于 Claude 数据目录的路径，例如 settings.json 或 skills/。# 开头为注释，留空关闭。保存后从下次切换开始生效。")
+            TextEditor(text: $vm.keepPaths)
+                .font(.system(size: 12, design: .monospaced))
+                .frame(height: 140)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(ClaudeTheme.divider))
+                .accessibilityLabel("跨账号保留路径列表")
+            description("只共享通用配置。绝对路径、包含 .. 的路径和符号链接会被拒绝；不要放登录凭据、Cookie、设备标识或缓存。")
+            Button("保存保留列表…") { pending = .keep }.buttonStyle(.borderedProminent)
+        }
+    }
+
+    private func selectFile(directory: Bool, types: [UTType]? = nil) -> URL? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = directory
+        panel.canChooseFiles = !directory
+        panel.allowsMultipleSelection = false
+        if let types = types { panel.allowedContentTypes = types }
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    private func transferSnapshot() {
+        let destination: URL?
+        if importing {
+            destination = selectFile(directory: false, types: [.diskImage])
+        } else {
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = "account-\(account.lowercased()).dmg"
+            panel.allowedContentTypes = [.diskImage]
+            panel.canCreateDirectories = true
+            destination = panel.runModal() == .OK ? panel.url : nil
+        }
+        guard let destination = destination else { return }
+        vm.transferSnapshot(importing: importing, account: account, file: destination,
+                            password: password, confirmation: repeatedPassword)
+        password = ""; repeatedPassword = ""
+    }
+}
 
 struct CheckSettingsView: View {
     @Environment(\.dismiss) private var dismiss
@@ -1576,6 +2055,11 @@ struct MenuBarContent: View {
             showWindow()
             vm.showSettingsSheet = true
         }
+        Button("工具…") {
+            showWindow()
+            vm.showToolsSheet = true
+        }
+        .disabled(vm.isBusy || vm.checkingUpdate)
         Button("导出诊断日志") { vm.exportDiagnostics() }
             .disabled(vm.settingsBusy)
         Divider()

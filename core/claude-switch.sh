@@ -192,6 +192,54 @@ def main(args):
             os.replace(temporary, base / "checks.json")
         except OSError:
             fail()
+    elif action == "tools-get" and len(args) == 5:
+        base, _ = paths()
+        keep, policy = base / "keep-in-workspace.txt", base / "webrtc-policy"
+        if base.is_symlink() or keep.is_symlink() or policy.is_symlink():
+            fail()
+        try:
+            text = keep.read_text(encoding="utf-8") if keep.exists() else ""
+            mode = policy.read_text(encoding="utf-8").strip() if policy.exists() else "proxy"
+            if len(text.encode("utf-8")) > 16384 or mode not in ("proxy", "reject"):
+                fail()
+            print(json.dumps(dict(keepPaths=text, policy=mode, country=args[1],
+                                  timezone=args[2], locale=args[3], client=args[4]), ensure_ascii=False))
+        except (OSError, UnicodeError):
+            fail()
+    elif action == "keep-set" and len(args) == 2:
+        base, _ = paths()
+        destination = base / "keep-in-workspace.txt"
+        try:
+            text = json.loads(args[1])
+            if (not isinstance(text, str) or len(text.encode("utf-8")) > 16384
+                    or "\x00" in text or base.is_symlink() or destination.is_symlink()):
+                fail()
+            data = Path.home() / "Library/Application Support/Claude"
+            for line in text.splitlines():
+                if not line or line.lstrip().startswith("#"):
+                    continue
+                if line.startswith("/") or ".." in line or not Path(line).parts:
+                    fail()
+                current = data
+                if current.is_symlink():
+                    fail()
+                for part in Path(line).parts:
+                    current = current / part
+                    if current.is_symlink():
+                        fail()
+            base.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, temporary = tempfile.mkstemp(prefix=".keep-", dir=base)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(text.rstrip("\r\n") + "\n" if text else "")
+                os.chmod(temporary, 0o600)
+                os.replace(temporary, destination)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        except (OSError, ValueError, UnicodeError):
+            fail()
+        print("OK:跨账号保留列表已保存，下次切换时生效")
     elif action == "log":
         write_log(args[1:])
     elif action == "export-diagnostics":
@@ -940,7 +988,10 @@ LOG="$HOME/Library/Logs/claude-switch.log"
 CLASH_DIR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
 ROUTE_MISSED=""
 KEEP_STAGED=0
-mkdir -p "$BASE/accounts"
+case "${1:-}" in
+    get-tool-config|set-keep-paths) ;;  # 工具配置入口不初始化账号目录。
+    *) mkdir -p "$BASE/accounts" ;;
+esac
 
 load_runtime_config() {
     local cfg="${1:-$CONFIG_ENV}" line key val
@@ -3042,6 +3093,8 @@ case "$operation" in
     export-diagnostics) "$0" _support export-diagnostics "${2:-}" ;;
     get-check-config) "$0" _support config-get ;;
     set-check-config) "$0" _support config-set "${2:-}" ;;
+    get-tool-config) "$0" _support tools-get "$COUNTRY_TARGET" "$TZ_TARGET" "$LOCALE_TARGET" "$PROXY_MODE" ;;
+    set-keep-paths) "$0" _support keep-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
     *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto|--gui]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
@@ -3053,7 +3106,7 @@ if [ "$operation" != "checkdetail" ]; then
     rc=$dispatch_rc
 fi
 case "$operation" in
-    get-check-config|set-check-config|export-diagnostics|detect-client) ;;
+    get-check-config|set-check-config|get-tool-config|set-keep-paths|export-diagnostics|detect-client) ;;
     *) log_result "$started_at" "$operation" "$rc" "$summary" ;;
 esac
 exit "$rc"

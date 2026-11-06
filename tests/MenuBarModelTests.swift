@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import SwiftUI
 
 private let auditKeys = ["代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS", "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性"]
 
@@ -51,6 +52,14 @@ private final class Fixture {
           update) delay update; cat "$root/update-output"; result update ;;
           fix) delay fix; echo 'FIX:演示修复完成'; result fix ;;
           fingerprint) delay fingerprint; echo 'GPU=ok:演示设备' ;;
+          get-tool-config) cat "$root/tool-config"; result tool-config ;;
+          set-keep-paths) printf '%s' "$2" > "$root/saved-keep"; echo 'OK:已保存' ;;
+          cli-info|cli-current) echo 'current=A config=fixture'; result tools ;;
+          cli) pwd > "$root/cli-pwd"; printf '%s' "$2" > "$root/cli-args" ;;
+          snapshot-export|snapshot-import) cat > "$root/snapshot-input"; echo 'OK:快照操作完成' ;;
+          open-safe) echo 'OK:已打开' ;;
+          diagnose-proxy) printf '%s' "$CLAUDE_SWITCHER_PROXY_URL" > "$root/proxy-env"; cat "$root/diagnostics" ;;
+          set-region) delay tools; echo 'OK:地区已更新'; result tools ;;
           *) exit 2 ;;
         esac
         """)
@@ -112,6 +121,112 @@ struct MenuBarModelTests {
                         throw TestFailure(description: "缺少检查项：\(name)")
                     }
                     try expect(row.state == .ok && row.detail == detail, "检查项详情不正确：\(name)")
+                }
+            case "tools_config":
+                try f.write("tool-config", "{\"keepPaths\":\"settings.json\\n\",\"policy\":\"proxy\",\"country\":\"JP\",\"timezone\":\"Asia/Tokyo\",\"locale\":\"ja_JP\",\"client\":\"tag\"}")
+                let vm = f.vm()
+                vm.loadTools(); try f.idle(vm)
+                try expect(f.calls == ["get-tool-config"], "打开工具不能触发修复、网络检查或启动")
+                try expect(vm.keepPaths == "settings.json\n" && vm.regionTarget == "JP · Asia/Tokyo · ja_JP", "工具配置应来自核心")
+                try expect(!vm.supportsWebRTCPolicy, "TAG 不能使用托管策略")
+                vm.saveKeepPaths(); try f.idle(vm)
+                let saved = try String(contentsOf: f.root.appendingPathComponent("saved-keep"), encoding: .utf8)
+                let decoded = try JSONSerialization.jsonObject(with: Data(saved.utf8), options: [.fragmentsAllowed]) as? String
+                try expect(decoded == "settings.json\n", "列表必须作为一个 JSON 参数传递")
+            case "tools_snapshot_password":
+                try f.write("status", "current=A hasA=1 hasB=1 hasC=0 hasD=0 accounts=A,B\n")
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                vm.transferSnapshot(importing: false, account: "B", file: f.root.appendingPathComponent("snapshot.dmg"), password: "secret pass", confirmation: "secret pass")
+                try f.idle(vm)
+                let input = try String(contentsOf: f.root.appendingPathComponent("snapshot-input"), encoding: .utf8)
+                try expect(input == "secret pass\n", "密码必须经标准输入传递")
+                try expect(!f.calls.joined().contains("secret pass") && !vm.toolOutput.contains("secret pass"), "密码不能进入参数或结果")
+                try expect(f.calls.last?.hasSuffix("--password-stdin") == true, "必须选择非交互密码入口")
+                try f.write("status", "current=A hasA=1 hasB=1 hasC=1 hasD=0 accounts=A,B,C\n")
+                vm.transferSnapshot(importing: true, account: "C", file: f.root.appendingPathComponent("snapshot-c.dmg"), password: "secret pass")
+                try f.idle(vm)
+                try expect(vm.archived.contains("C") && f.calls.last == "status", "导入成功后必须刷新账号状态")
+            case "tools_invalid_inputs":
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                let before = f.calls
+                for address in ["file:///etc/passwd", "https://", "https://user:password@example.com", "https://example.com\n"] {
+                    // Trailing whitespace is intentionally normalized; embedded newlines are rejected.
+                    vm.openIsolated(address == "https://example.com\n" ? "https://example.com\npath" : address)
+                }
+                vm.transferSnapshot(importing: false, account: "A", file: f.root, password: "secret pass", confirmation: "secret pass")
+                vm.transferSnapshot(importing: true, account: "A", file: f.root, password: "secret pass")
+                vm.transferSnapshot(importing: true, account: "C", file: f.root, password: "one\ntwo")
+                try expect(f.calls == before, "无效或危险输入不能启动核心")
+                try f.write("tool-config", "{\"keepPaths\":\"\",\"policy\":\"proxy\",\"country\":\"JP\",\"timezone\":\"Asia/Tokyo\",\"locale\":\"ja_JP\",\"client\":\"tag\"}")
+                vm.loadTools(); try f.idle(vm)
+                let tagCalls = f.calls
+                vm.webrtcPolicy = "reject"; vm.applyWebRTCPolicy()
+                try expect(f.calls == tagCalls && vm.toolFailed, "TAG 必须在启动修复前拒绝策略修改")
+            case "tools_proxy_privacy":
+                try f.write("diagnostics", "{\"mode\":\"proxy_diagnostics\",\"checks\":[{\"name\":\"anthropic_api\",\"transport_reached\":true,\"http_status\":401},{\"name\":\"claude_web\",\"transport_reached\":true,\"http_status\":403}]}")
+                let vm = f.vm()
+                let proxy = "http://user:private-password@127.0.0.1:18080"
+                vm.diagnoseProxy(address: proxy, config: nil); try f.idle(vm)
+                let value = try String(contentsOf: f.root.appendingPathComponent("proxy-env"), encoding: .utf8)
+                try expect(value == proxy && f.calls == ["diagnose-proxy"], "代理凭据只能经环境传给脱敏诊断")
+                try expect(!vm.toolOutput.contains("private-password") && vm.toolOutput.contains("尚未认证") && vm.toolOutput.contains("访问受限"), "认证和访问限制不能显示为账号可用")
+            case "tools_mutation_reaudit":
+                try f.write("tools-delay", "0.1")
+                let vm = f.vm()
+                vm.resetRegion()
+                try expect(vm.toolRunning && !vm.canQuit, "配置变更期间不能退出")
+                vm.refresh(); vm.fixAll()
+                try f.idle(vm)
+                try expect(f.calls == ["set-region", "checkdetail", "get-client", "status"], "地区变更要串行完成再重新审计")
+                try f.write("tools-exit", "1")
+                vm.resetRegion(); try f.idle(vm)
+                try expect(vm.toolFailed && f.calls.last == "status", "失败可能部分写入，仍须重新审计且保留失败状态")
+            case "tools_terminal_quoting":
+                let vm = f.vm()
+                vm.start(); try f.idle(vm)
+                let project = f.root.appendingPathComponent("project ' $(touch INJECTED)")
+                try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+                var command = ""
+                vm.terminalLauncher = { value, done in command = value; done(CoreResult(output: "", succeeded: true)) }
+                vm.launchCLI(project: project, resume: true)
+                let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/bash"); p.arguments = ["-c", command]
+                try p.run(); p.waitUntilExit()
+                let cwd = try String(contentsOf: f.root.appendingPathComponent("cli-pwd"), encoding: .utf8).trimmingCharacters(in: .newlines)
+                let args = try String(contentsOf: f.root.appendingPathComponent("cli-args"), encoding: .utf8)
+                try expect(p.terminationStatus == 0 && cwd == project.path && args == "--resume", "项目路径必须原样引用且保留会话参数")
+                try expect(!FileManager.default.fileExists(atPath: f.root.appendingPathComponent("INJECTED").path), "项目路径不得执行命令替换")
+                vm.terminalLauncher = { _, done in done(CoreResult(output: "终端授权被拒绝", succeeded: false)) }
+                vm.launchCLI(project: project, resume: false)
+                try expect(vm.toolFailed && vm.toolOutput == "终端授权被拒绝" && vm.canQuit, "终端失败不能显示为启动成功")
+            case "tools_shell_isolation":
+                let startup = f.root.appendingPathComponent("startup.sh")
+                let marker = f.root.appendingPathComponent("startup-ran")
+                try "touch \(VM.shellQuote(marker.path))\n".write(to: startup, atomically: true, encoding: .utf8)
+                setenv("BASH_ENV", startup.path, 1)
+                defer { unsetenv("BASH_ENV") }
+                let vm = f.vm()
+                vm.inspectCLISlot(); try f.idle(vm)
+                try expect(f.calls == ["cli-current"] && !FileManager.default.fileExists(atPath: marker.path), "界面子进程不能继承覆盖命令的 Bash 启动配置")
+            case "tools_layout":
+                try f.write("tool-config", "{\"keepPaths\":\"# 通用配置\\nsettings.json\\nskills/\\n\",\"policy\":\"proxy\",\"country\":\"JP\",\"timezone\":\"Asia/Tokyo\",\"locale\":\"ja_JP\",\"client\":\"tag\"}")
+                _ = NSApplication.shared
+                let vm = f.vm()
+                for section in ["cli", "snapshot", "network", "keep"] {
+                    let view = NSHostingView(rootView: ToolsView(vm: vm, initialSection: section))
+                    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 660), styleMask: [.borderless], backing: .buffered, defer: false)
+                    window.contentView = view
+                    pump(0.1); try f.idle(vm)
+                    view.layoutSubtreeIfNeeded()
+                    try expect(view.fittingSize.width <= 681 && view.fittingSize.height <= 661, "工具布局不能撑出窗口")
+                    if let directory = ProcessInfo.processInfo.environment["CLAUDE_SWITCHER_TEST_RENDER_DIR"],
+                       let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                        view.cacheDisplay(in: view.bounds, to: bitmap)
+                        let data = bitmap.representation(using: .png, properties: [:])
+                        try data?.write(to: URL(fileURLWithPath: directory).appendingPathComponent("tools-\(section).png"))
+                    }
+                    window.contentView = nil
                 }
             case "tag_client_recognized":
                 try f.write("client", "client=tag\n")

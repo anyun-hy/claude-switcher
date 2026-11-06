@@ -60,6 +60,7 @@ cat > "$APP_OUT/Contents/Info.plist" <<EOF
 	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>ClaudeSwitcherSourceSHA256</key><string>$APP_SHA</string>
 	<key>NSHighResolutionCapable</key><true/>
+	<key>NSAppleEventsUsageDescription</key><string>用于在您选择的项目文件夹中打开终端并启动 Claude Code。</string>
 	<key>LSUIElement</key><true/>
 </dict>
 </plist>
