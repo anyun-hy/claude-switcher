@@ -52,7 +52,7 @@ printf 'state = not running\\nruns = %s\\nlast exit code = 0\\n' "$n"
         return ""
 
     def test_switches_mode(self):
-        for mode in ("shadowrocket", "sing-box", "flclash", "auto", "clash-verge"):
+        for mode in ("shadowrocket", "sing-box", "flclash", "bettbox", "tag", "auto", "clash-verge"):
             result = self.run_set(mode)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(self.current_mode(), mode)
@@ -167,6 +167,83 @@ printf 'state = not running\\nruns = %s\\nlast exit code = 0\\n' "$n"
         kill_args = (self.root / "kill-args").read_text(encoding="utf-8").strip()
         self.assertEqual(kill_args, "-TERM 201 203", "非 root 下应以自身 UID 过滤,而非 __HOME__ 属主")
 
+    def test_clashx_variants_are_detected_by_app_path(self):
+        core = self.copy.read_text(encoding="utf-8")
+        match = re.search(r"(?ms)^clashx_alive\(\) \{\n.*?^\}", core)
+        self.assertIsNotNone(match, "核心需要独立的 ClashX/Pro/Meta 进程识别助手")
+        script = match.group(0) + r'''
+            pgrep() { case "$*" in *"/Contents/MacOS/ClashX"*) return 0 ;; *) return 1 ;; esac; }
+            clashx_alive
+        '''
+        env = dict(os.environ, HOME=str(self.root), PATH=f"{self.fakebin}:/usr/bin:/bin")
+        run = subprocess.run(["/bin/bash", "-c", script],
+                             env=env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(run.returncode, 0, "ClashX Pro/Meta 的 /Contents/MacOS/ClashX 主进程应被识别")
+
+    def test_clashx_variant_keeps_guard_online(self):
+        script = self.install_guard("clashx")
+        self.stub("ifconfig", "#!/bin/sh\necho 'inet 198.18.0.1'\n")
+        self.stub("pgrep", "#!/bin/sh\ncase \"$*\" in *Claude.app*|*/Contents/MacOS/ClashX*) exit 0 ;; *) exit 1 ;; esac\n")
+        self.stub("pkill", "#!/bin/sh\ntouch \"$CLAUDE_SWITCHER_TEST_ROOT/pkill-called\"\n")
+        self.stub("id", "#!/bin/sh\necho 502\n")
+        self.stub("ps", "#!/bin/sh\ncat <<'EOF'\n"
+                        "  301   502 node            /Users/u/project/server.js\n"
+                        "EOF\n")
+        run = self.run_guard(script)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertFalse((self.root / "pkill-called").exists(),
+                         "ClashX Pro/Meta 在线时保镖不得误判离线并关闭 Claude")
+
+    def test_bettbox_core_keeps_guard_online(self):
+        script = self.install_guard("bettbox")
+        self.stub("ifconfig", "#!/bin/sh\necho 'inet 198.18.0.1'\n")
+        self.stub("pgrep", "#!/bin/sh\ncase \"$*\" in *BettboxCore*|*Claude.app*) exit 0 ;; *) exit 1 ;; esac\n")
+        self.stub("pkill", "#!/bin/sh\ntouch \"$CLAUDE_SWITCHER_TEST_ROOT/pkill-called\"\n")
+        self.stub("id", "#!/bin/sh\necho 502\n")
+        self.stub("ps", "#!/bin/sh\ncat <<'EOF'\n"
+                        "  301   502 node            /Users/u/project/server.js\n"
+                        "EOF\n")
+        run = self.run_guard(script)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertFalse((self.root / "pkill-called").exists(),
+                         "Bettbox 在线时保镖不得误判离线并关闭 Claude")
+
+    def test_installer_offers_bettbox(self):
+        install = (ROOT / "installer" / "安装.command").read_text(encoding="utf-8")
+        self.assertIn("bettbox", install)
+        self.assertIn("/Applications/Bettbox.app", install)
+
+    def test_other_client_detection_includes_bettbox_and_clashx_variants(self):
+        self.stub("pgrep", '''#!/bin/sh
+case "$*" in *BettboxCore*|*/Contents/MacOS/ClashX*) exit 0 ;; *) exit 1 ;; esac
+''')
+        core = self.copy.read_text(encoding="utf-8")
+        names = ("clashx_alive", "detect_other_clients")
+        harness = '\n'.join(re.search(r"(?ms)^" + name + r"\(\) \{\n.*?^\}", core).group(0)
+                            for name in names)
+        harness += '\ntag_alive() { return 1; }\nPROXY_MODE=tag\ndetect_other_clients\n'
+        env = dict(self.env, HOME=str(ROOT / "_trash/client-detection-fixture"))
+        result = subprocess.run(["/bin/bash", "-c", harness], env=env, text=True,
+                                capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), "Bettbox/ClashX")
+
+    def test_bettbox_conflict_still_triggers_existing_guard_protection(self):
+        script = self.install_guard("flclash")
+        source = script.read_text().replace('HOME_DIR="' + str(self.root) + '"',
+                                           'HOME_DIR="' + str(ROOT / "_trash/guard-conflict-fixture") + '"')
+        script.write_text(source)
+        self.stub("ifconfig", "#!/bin/sh\necho 'inet 198.18.0.1'\n")
+        self.stub("pgrep", '''#!/bin/sh
+case "$*" in *FlClashCore*|*BettboxCore*|*Claude.app*) exit 0 ;; *) exit 1 ;; esac
+''')
+        self.stub("id", "#!/bin/sh\necho 501\n")
+        self.stub("ps", "#!/bin/sh\nexit 0\n")
+        self.stub("pkill", '#!/bin/sh\ntouch "$CLAUDE_SWITCHER_TEST_ROOT/pkill-called"\n')
+        result = self.run_guard(script)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.root / "pkill-called").exists())
+
     def test_bodyguard_offline_still_kills_desktop_claude(self):
         script = self.install_guard("clash-verge")
         self.stub("ifconfig", "#!/bin/sh\necho 'inet 192.168.1.2'\n")
@@ -213,6 +290,16 @@ printf 'state = not running\\nruns = %s\\nlast exit code = 0\\n' "$n"
         fix_fn = re.search(r"(?ms)^fix\(\) \{\n.*?^\}", core).group(0)
         self.assertIn("fail:客户端不一致*", fix_fn)
         self.assertIn('/Library/Application Support/claude-switcher/claude-bodyguard.sh', fix_fn)
+
+    def test_gui_set_client_syncs_bettbox_guard_and_keeps_health_gate(self):
+        self.stub("osascript",
+                  f"#!/bin/sh\n/usr/bin/sed -i '' 's/^MODE=\"[^\"]*\"/MODE=\"bettbox\"/' '{self.guard}'\n")
+        env = dict(self.env, CLAUDE_SWITCHER_CORE=str(self.copy))
+        result = subprocess.run(["/bin/bash", str(self.copy), "set-client", "bettbox", "--gui"],
+                                env=env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OK:系统保镖守护已同步为 bettbox", result.stdout)
+        self.assertNotIn("WARN:保镖", result.stdout)
 
     def test_guard_status_fails_closed_on_mode_mismatch(self):
         core = self.copy.read_text(encoding="utf-8")

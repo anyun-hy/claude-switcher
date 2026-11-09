@@ -66,7 +66,7 @@ esac''')
             *) exit 1 ;;
         esac''')
         text = self.core.read_text(encoding="utf-8")
-        harness = (function(text, "tag_alive") + "\n" + function(text, "proxy_alive")
+        harness = (function(text, "tag_alive") + "\n" + function(text, "clashx_alive") + "\n" + function(text, "proxy_alive")
                    + '\nshadowrocket_up() { return 1; }\nproxy_alive\n')
         for client in ("tag", "auto"):
             for mode, expected in (("present", 0), ("missing", 1), ("spoof", 1), ("error", 1)):
@@ -156,7 +156,8 @@ esac''')
         text = INSTALLER.read_text(encoding="utf-8")
         start = text.index('CLASH_DIR="$H/Library/Application Support/')
         end = text.index('echo "✓ 代理客户端: $MODE"', start)
-        code = text[start:end] + '\nprintf "selected=%s\\n" "$MODE"\n'
+        code = text[start:end].replace("/Applications/Bettbox.app", str(self.root / "Bettbox.app"))
+        code += '\nprintf "selected=%s\\n" "$MODE"\n'
         env = dict(self.env, H=str(self.home), TAG_EXE=TAG_EXE)
         clash = self.home / "Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
         clash.mkdir(parents=True)
@@ -171,6 +172,15 @@ esac''')
                              input="8\n", text=True, capture_output=True, timeout=5)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("selected=tag", run.stdout)
+        run = subprocess.run(["/bin/bash", "-c", code], env=dict(env, FAKE_TAG="missing"),
+                             input="9\n", text=True, capture_output=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("selected=bettbox", run.stdout)
+        (self.root / "Bettbox.app").mkdir()
+        run = subprocess.run(["/bin/bash", "-c", code], env=dict(env, FAKE_TAG="missing"),
+                             text=True, capture_output=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("selected=bettbox", run.stdout)
 
 
 if __name__ == "__main__":

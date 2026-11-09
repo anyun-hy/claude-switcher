@@ -335,11 +335,65 @@ function Test-TunUp {
     return [bool]$t.up
 }
 
+# 代理进程与 TUN 的存活信号；不能据此证明所有请求必然经过预期路由。
+function Test-ProxyPathAlive {
+    return ((Test-ProxyAlive) -and (Test-TunUp))
+}
+
+# 有界重试仅处理临时传输失败；每次发包前重查路径，失效则立即停止。
+# 仍保留进程巡检与实际发包之间的时间窗口，不将重试当作防火墙保证。
+function Invoke-ProbeText {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [int]$Attempts = 3,
+        [int]$TimeoutSec = 8,
+        [scriptblock]$Valid = { param($body) return [bool]$body }
+    )
+    $body = ''
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        if (-not (Test-ProxyPathAlive)) { return '' }
+        $body = (& curl.exe -s --max-time $TimeoutSec $Url 2>$null) -join "`n"
+        if ((& $Valid $body)) { return $body }
+        if ($attempt -lt $Attempts) { Start-Sleep -Milliseconds (400 * $attempt) }
+    }
+    return $body
+}
+
+# 取 HTTP 状态码。curl 连不上时 '-w %{http_code}' 输出 000,视为传输失败并重试。
+function Invoke-ProbeCode {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [int]$Attempts = 3,
+        [int]$TimeoutSec = 8
+    )
+    $code = '000'
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        if (-not (Test-ProxyPathAlive)) { return '000' }
+        $code = ((& curl.exe -s --max-time $TimeoutSec -o NUL -w '%{http_code}' $Url 2>$null) -join '').Trim()
+        if ($code -and $code -ne '000') { return $code }
+        if ($attempt -lt $Attempts) { Start-Sleep -Milliseconds (400 * $attempt) }
+    }
+    return $code
+}
+
 function Get-Egress {
-    $trace = & curl.exe -s --max-time 8 "https://www.cloudflare.com/cdn-cgi/trace" 2>$null
-    $ip  = (($trace -split "`n" | Where-Object { $_ -like 'ip=*' })  -replace 'ip=','').Trim()
-    $loc = (($trace -split "`n" | Where-Object { $_ -like 'loc=*' }) -replace 'loc=','').Trim()
-    return @{ ip = $ip; loc = $loc }
+    # 代理路径失效时立刻放弃,一个探测包都不发:
+    # 这正是保镖会立刻杀 Claude 的条件,此时再发请求等于用真实 IP 再敲一次门。
+    if (-not (Test-ProxyPathAlive)) {
+        return @{ ip = ''; loc = ''; skipped = $true }
+    }
+    # 响应为空时不能对空数组调用 Trim —— 链路失败必须降级成"未取到",
+    # 而不是抛异常中断整轮检查(ip/loc 都取到才算有效答案)。
+    $trace = Invoke-ProbeText -Url 'https://www.cloudflare.com/cdn-cgi/trace' -Valid {
+            param($body)
+            return ($body -match '(?m)^ip=') -and ($body -match '(?m)^loc=')
+        }
+    if (-not (Test-ProxyPathAlive)) {
+        return @{ ip = ''; loc = ''; skipped = $true }
+    }
+    $ip  = (((($trace -split "`n") | Where-Object { $_ -like 'ip=*' })  -replace 'ip=','') -join '').Trim()
+    $loc = (((($trace -split "`n") | Where-Object { $_ -like 'loc=*' }) -replace 'loc=','') -join '').Trim()
+    return @{ ip = $ip; loc = $loc; skipped = $false }
 }
 
 # ============ 地区映射(安装器与 set-region 共用同一套目标) ============
@@ -1187,7 +1241,9 @@ function Invoke-CheckDetail {
     } else { "TUN网卡=fail:不在线" }
 
     $e = Get-Egress
-    if ($e.loc -eq $COUNTRY_TARGET) { "出口IP=ok:$($e.ip)" } else { "出口IP=fail:$($e.ip)/$($e.loc)(期望$COUNTRY_TARGET)" }
+    if ($e.skipped) { "出口IP=fail:代理路径失效,已跳过探测(避免真实 IP 出网)" }
+    elseif ($e.loc -eq $COUNTRY_TARGET) { "出口IP=ok:$($e.ip)" }
+    else { "出口IP=fail:$($e.ip)/$($e.loc)(期望$COUNTRY_TARGET)" }
 
     if (Test-CheckDisabled 'IP一致') {
         Format-OptionalResult 'IP一致' 'ok'
@@ -1262,9 +1318,11 @@ function Invoke-CheckDetail {
     } else {
         $org = ''
         $asnType = ''
-        if ($e.ip) {
+        if ($e.ip -and (Test-ProxyPathAlive)) {
+            # ASN 查询要把出口 IP 交给第三方,路径一旦失效就会用真实 IP 的源地址发出去,
+            # 所以这里要再确认一次路径存活,而不是只看上一轮的 $e.ip。
             try {
-                $ipInfoResponse = (& curl.exe -s --max-time 6 "https://ipinfo.io/$([Uri]::EscapeDataString([string]$e.ip))/json" 2>$null) -join "`n"
+                $ipInfoResponse = Invoke-ProbeText -Url "https://ipinfo.io/$([Uri]::EscapeDataString([string]$e.ip))/json" -TimeoutSec 6
                 $ipInfo = $ipInfoResponse | ConvertFrom-Json -ErrorAction Stop
                 if ([string]$ipInfo.ip -eq [string]$e.ip) { $org = [string]$ipInfo.org }
             } catch {}
@@ -1272,7 +1330,7 @@ function Invoke-CheckDetail {
         if ($org -match '^AS(\d+)\s') {
             $asn = $Matches[1]
             try {
-                $networkResponse = (& curl.exe -s --max-time 6 "https://www.peeringdb.com/api/net?asn=$asn&fields=asn,info_type" 2>$null) -join "`n"
+                $networkResponse = Invoke-ProbeText -Url "https://www.peeringdb.com/api/net?asn=$asn&fields=asn,info_type" -TimeoutSec 6
                 $network = ($networkResponse | ConvertFrom-Json -ErrorAction Stop).data |
                     Where-Object { [string]$_.asn -eq $asn } | Select-Object -First 1
                 $asnType = [string]$network.info_type
@@ -1286,9 +1344,12 @@ function Invoke-CheckDetail {
 
     if (Test-CheckDisabled '生态可达性') {
         Format-OptionalResult '生态可达性' 'ok'
+    } elseif (-not (Test-ProxyPathAlive)) {
+        # 路径可能已失效时不再发探测请求:探测会脱离隧道、用真实 IP 敲门。
+        Format-OptionalResult '生态可达性' 'fail' '代理路径失效,已跳过探测(避免真实 IP 出网)'
     } else {
-        $r1 = & curl.exe -s --max-time 8 -o NUL -w '%{http_code}' "https://claude.ai/" 2>$null
-        $r2 = & curl.exe -s --max-time 8 -o NUL -w '%{http_code}' "https://api.anthropic.com/v1/models" 2>$null
+        $r1 = Invoke-ProbeCode -Url 'https://claude.ai/'
+        $r2 = Invoke-ProbeCode -Url 'https://api.anthropic.com/v1/models'
         if ($r1 -ne '000' -and $r2 -ne '000') { Format-OptionalResult '生态可达性' 'ok' "claude.ai:$r1 api:$r2" } else { Format-OptionalResult '生态可达性' 'fail' "claude.ai:$r1 api:$r2" }
     }
 }
@@ -1436,7 +1497,9 @@ function Invoke-Fix {
     # C. 出口IP最终验证
     Start-Sleep 2
     $e = Get-Egress
-    if ($e.loc -eq $COUNTRY_TARGET) { "FIX:出口IP ✓ ($($e.ip))" } else { "FIX:出口IP ✗ ($($e.ip)/$($e.loc),期望$COUNTRY_TARGET) — 请换节点/线路" }
+    if ($e.skipped) { "FIX:出口IP ✗ 代理路径失效,已跳过探测 — 请先恢复代理/TUN 再复验" }
+    elseif ($e.loc -eq $COUNTRY_TARGET) { "FIX:出口IP ✓ ($($e.ip))" }
+    else { "FIX:出口IP ✗ ($($e.ip)/$($e.loc),期望$COUNTRY_TARGET) — 请换节点/线路" }
     "FIX:修复流程结束"
 }
 

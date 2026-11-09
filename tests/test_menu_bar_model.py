@@ -9,6 +9,8 @@ import unittest
 
 PROJECT = Path(__file__).resolve().parents[1]
 SCENARIOS = (
+    "official_release_acknowledgement", "official_release_modal_guard", "official_release_window_lifecycle",
+    "bettbox_client_integration", "official_release_layout",
     "bodyguard_history", "bodyguard_offline", "bodyguard_legacy", "bodyguard_not_optional",
     "network_preview_readonly", "network_level_invalidates_plan", "network_apply_and_validate",
     "network_restart_keeps_interlock", "network_failed_validation_and_rollback",

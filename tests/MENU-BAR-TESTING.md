@@ -10,9 +10,13 @@ python3 -m unittest discover -s tests -v
 
 网络重建后端测试为 `test_network_rebuild.py`：所有系统操作注入假实现；管理员脚本测试也会先替换全部网络命令及锁路径，再以普通用户在隔离目录执行。不得为了验证该功能运行本机真实 `network-rebuild apply`。
 
+免费提醒覆盖首次展示、显式确认、持久化、手动复看和弹窗互斥。模型测试使用独立 UserDefaults suite，结束后清理，不读写生产偏好。
+
 ## UI 演示程序
 
 `MenuBarFixture.swift` 与生产应用共用 `SwitcherMenu`、`AppDelegate` 和 `ContentView`，仅把核心脚本注入为明确指定的假脚本。未提供脚本路径时拒绝启动；不会回退到 `~/.local/bin/claude-switch.sh`。
+
+提醒偏好存入独立的 `claude-switcher-demo.<假脚本路径的 SHA256>` suite；相同脚本路径重启保留确认状态。传入 `--reset-notice` 仅清空该演示 suite，方便复测首次启动，不修改已安装 App 的偏好。
 
 演示程序额外提供「菜单内容预览」和「演示外观」菜单，便于无法定位 macOS `AXExtrasMenuBar` 的 UI 工具验证同一份生产菜单内容，以及只改变演示应用自身的深浅色外观。启动时会输出原生状态栏按钮数量、模板图像属性和辅助功能名称，供检查图标驻留与可访问性。辅助功能属性检查不等于完整的 VoiceOver 语音验收。
 
@@ -43,13 +47,15 @@ esac
 SH
 
 _trash/menu-bar-demo/MenuBarFixture "$PWD/_trash/menu-bar-demo/fake-core.sh"
+# 重测首次提醒（仅清理演示偏好，后续重启验证时不要带此参数）：
+# _trash/menu-bar-demo/MenuBarFixture "$PWD/_trash/menu-bar-demo/fake-core.sh" --reset-notice
 # 深色外观（只改变演示应用自身）：
 # _trash/menu-bar-demo/MenuBarFixture "$PWD/_trash/menu-bar-demo/fake-core.sh" --dark
 ```
 
 手动验收：
 
-1. 首次启动显示窗口，顶部有盾牌图标，Dock 没有该应用图标。
+1. 首次启动显示窗口和「官方版本免费与举报」提醒，环境检查仍正常完成；顶部有盾牌图标，Dock 没有该应用图标。
 2. 关闭窗口后图标仍在；「打开主窗口」复用同一窗口，最小化后也能恢复。
 3. 菜单和主窗口账号、警告状态一致；「重新检查」打开窗口并重新检测。
 4. 模拟切换成功后约 2.2 秒隐藏窗口，菜单仍可恢复窗口；失败时保持错误信息。
@@ -57,6 +63,15 @@ _trash/menu-bar-demo/MenuBarFixture "$PWD/_trash/menu-bar-demo/fake-core.sh"
 6. 菜单项支持方向键、Return、⌘O、⌘Q；图标有辅助功能标签，检查结果用文字表示而不是只用颜色。
 7. 在浅色、深色下检查菜单图标和文字；可在 VoiceOver 中确认图标、菜单项和禁用状态可读取。
 8. 选择「退出 Claude 切换器」后图标消失；确认本机已安装的应用和系统服务没有被修改。
+
+提醒专项验收（全程使用上面的假脚本路径）：
+
+- 用 `--reset-notice` 启动，点击关闭图标或按 Esc，不点「知道了」；退出演示程序后不带重置参数重启，应再次显示提醒。
+- 点击「知道了」，退出后重启，应不再自动弹出；关闭并重开主窗口、从菜单打开主窗口也不重复提醒。
+- 隐藏主窗口，从菜单栏「官方版本免费与举报」打开，窗口和提醒应一起显示；主窗口底部「关于」菜单中也应能复看，不重新执行环境检查。
+- 在「关于」菜单打开「安全防护体系公告」，确认原公告完整保留。工具箱、设置、更新、指纹或提示词面板打开时，菜单栏免费提醒入口禁用；关闭面板后恢复。
+- 点击「前往 Issues 举报」，浏览器应打开项目 Issues；只打开链接不会记录已读，外部页面打开失败也不妨碍关闭提醒。
+- 在较小可见屏幕区域检查公告正文可滚动、底部两个按钮始终可用，并用 VoiceOver 检查信息菜单、关闭按钮和确认按钮。
 
 截图只使用这个演示程序。不要运行真实账号切换或把住宅/代理 IP、凭据放进截图。
 

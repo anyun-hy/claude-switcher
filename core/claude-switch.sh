@@ -1479,7 +1479,7 @@ PY_CLASH_RULES
 fi
 
 # ============ 安装时可配置项(默认兜底值;实际运行优先读取 ~/.claude-switcher/config.env) ============
-PROXY_MODE="clash-verge"       # 代理客户端: tag|clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto
+PROXY_MODE="clash-verge"       # 代理客户端: tag|clash-verge|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto
 PROXY_GROUP="IpEqual"          # Clash 代理组名(安装时自动探测)
 COUNTRY_TARGET="US"            # 目标出口国家(安装时按出口自动识别)
 TZ_TARGET="America/New_York"   # 锁定时区,应与出口IP所在城市一致
@@ -1611,6 +1611,7 @@ proxy_name() {
         tag)          echo "TAG" ;;
         clash-verge)  echo "Clash Verge" ;;
         flclash)      echo "FlClash" ;;
+        bettbox)      echo "Bettbox" ;;
         shadowrocket) echo "Shadowrocket" ;;
         sing-box)     echo "sing-box" ;;
         clashx)       echo "ClashX" ;;
@@ -1626,6 +1627,7 @@ proxy_app_name() {
         tag)          echo "TAG" ;;
         clash-verge)  echo "Clash Verge" ;;
         flclash)      echo "FlClash" ;;
+        bettbox)      echo "Bettbox" ;;
         shadowrocket) echo "Shadowrocket" ;;
         clashx)       echo "ClashX" ;;
         surge)        echo "Surge" ;;
@@ -1654,21 +1656,32 @@ tag_alive() {
     return 1
 }
 
+# ClashX / ClashX Pro / ClashX Meta 的主可执行文件都在 .../Contents/MacOS/ClashX。
+# 只按 -x ClashX 会漏掉 Pro/Meta，按小写 "clash" 又匹配不到大写主进程。
+clashx_alive() {
+    pgrep -f '/Contents/MacOS/ClashX' >/dev/null 2>&1 \
+        || pgrep -x ClashX >/dev/null 2>&1 \
+        || pgrep -x 'ClashX Pro' >/dev/null 2>&1 \
+        || pgrep -x 'ClashX Meta' >/dev/null 2>&1
+}
+
 # 代理内核在线判定:按安装时识别的客户端分派;auto 时任一命中即活
 proxy_alive() {
     case "$PROXY_MODE" in
         tag)          tag_alive ;;
         clash-verge)  pgrep -f verge-mihomo >/dev/null 2>&1 ;;
         flclash)      pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1 ;;
+        bettbox)      pgrep -f BettboxCore >/dev/null 2>&1 || pgrep -x Bettbox >/dev/null 2>&1 ;;
         shadowrocket) shadowrocket_up ;;
         sing-box)     pgrep -f sing-box >/dev/null 2>&1 ;;
-        clashx)       pgrep -x ClashX >/dev/null 2>&1 || pgrep -f clash >/dev/null 2>&1 ;;
+        clashx)       clashx_alive ;;
         surge)        pgrep -f Surge >/dev/null 2>&1 ;;
         auto)         tag_alive || pgrep -f verge-mihomo >/dev/null 2>&1 \
                       || pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1 \
                       || shadowrocket_up \
                       || pgrep -f sing-box >/dev/null 2>&1 \
-                      || pgrep -x ClashX >/dev/null 2>&1 || pgrep -f clash >/dev/null 2>&1 \
+                      || pgrep -f BettboxCore >/dev/null 2>&1 || pgrep -x Bettbox >/dev/null 2>&1 \
+                      || clashx_alive \
                       || pgrep -f Surge >/dev/null 2>&1 ;;
         *)            pgrep -f verge-mihomo >/dev/null 2>&1 ;;
     esac
@@ -1690,10 +1703,13 @@ detect_other_clients() {
     if [ "$PROXY_MODE" != "flclash" ] && { pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; }; then
         list="${list:+$list/}FlClash"
     fi
+    if [ "$PROXY_MODE" != "bettbox" ] && { pgrep -f BettboxCore >/dev/null 2>&1 || pgrep -x Bettbox >/dev/null 2>&1; }; then
+        list="${list:+$list/}Bettbox"
+    fi
     if [ "$PROXY_MODE" != "sing-box" ] && pgrep -f sing-box >/dev/null 2>&1; then
         list="${list:+$list/}sing-box"
     fi
-    if [ "$PROXY_MODE" != "clashx" ] && pgrep -x ClashX >/dev/null 2>&1; then
+    if [ "$PROXY_MODE" != "clashx" ] && clashx_alive; then
         list="${list:+$list/}ClashX"
     fi
     if [ "$PROXY_MODE" != "surge" ] && pgrep -f Surge >/dev/null 2>&1; then
@@ -2179,7 +2195,7 @@ sync_bodyguard_mode() {
     local mode="${1:-$PROXY_MODE}"
     local guard="/Library/Application Support/claude-switcher/claude-bodyguard.sh"
     case "$mode" in
-        tag|clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto) ;;
+        tag|clash-verge|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto) ;;
         *) return 1 ;;
     esac
     [ -r "$guard" ] || return 1
@@ -2467,7 +2483,7 @@ fix() {
     case "$guard_state" in
         fail:客户端不一致*)
             case "$PROXY_MODE" in
-                tag|clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto)
+                tag|clash-verge|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto)
                     adminCmds="${adminCmds}/usr/bin/sed -i '' 's/^MODE=\"[^\"]*\"/MODE=\"$PROXY_MODE\"/' '/Library/Application Support/claude-switcher/claude-bodyguard.sh' || exit 1; chown root:wheel '/Library/Application Support/claude-switcher/claude-bodyguard.sh' || exit 1; chmod 755 '/Library/Application Support/claude-switcher/claude-bodyguard.sh' || exit 1; "
                     ;;
             esac
@@ -2560,8 +2576,8 @@ set_client() {
     local gui_mode=0
     [ "${2:-}" = "--gui" ] && gui_mode=1
     case "$mode" in
-        tag|clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto) ;;
-        *) echo "FAIL:用法: claude-switch.sh set-client <tag|clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto>"; return 1 ;;
+        tag|clash-verge|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto) ;;
+        *) echo "FAIL:用法: claude-switch.sh set-client <tag|clash-verge|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto>"; return 1 ;;
     esac
     PROXY_MODE="$mode"
     save_runtime_config || { echo "FAIL:写入配置失败"; return 1; }
@@ -2592,7 +2608,7 @@ set_client() {
 # 只读输出当前代理客户端(供 UI 下拉高亮),同时列出全部支持项
 get_client() {
     echo "client=$PROXY_MODE"
-    echo "clients=tag,clash-verge,flclash,shadowrocket,sing-box,clashx,surge"
+    echo "clients=tag,clash-verge,flclash,bettbox,shadowrocket,sing-box,clashx,surge"
 }
 
 # 地区自适应:按当前出口国家一键重设 国家/时区/地区格式(换了国家节点后运行)

@@ -50,6 +50,14 @@ tag_alive() {
     return 1
 }
 
+# ClashX / Pro / Meta 共用 .../Contents/MacOS/ClashX 主进程路径。
+clashx_alive() {
+    pgrep -f '/Contents/MacOS/ClashX' >/dev/null 2>&1 \
+        || pgrep -x ClashX >/dev/null 2>&1 \
+        || pgrep -x 'ClashX Pro' >/dev/null 2>&1 \
+        || pgrep -x 'ClashX Meta' >/dev/null 2>&1
+}
+
 # TUN 在线判定:必须存在且仅存在 1 个 fake-ip 网段地址(0 个或多个 TUN 均视为异常并关闭 Claude)
 interfaces=$(ifconfig 2>/dev/null) || { HEALTH_ERROR=1; ok=0; }
 [ "$(printf '%s\n' "$interfaces" | grep -c 'inet 198\.18\.')" -eq 1 ] || ok=0
@@ -62,6 +70,8 @@ case "$MODE" in
         pgrep -f verge-mihomo >/dev/null 2>&1 || ok=0 ;;
     flclash)
         { pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; } || ok=0 ;;
+    bettbox)
+        { pgrep -f BettboxCore >/dev/null 2>&1 || pgrep -x Bettbox >/dev/null 2>&1; } || ok=0 ;;
     shadowrocket)
         # launchd 环境下 scutil 可能查不到 VPN 行,查不到时以 TUN 判定为准(避免误杀)
         nc=$(scutil --nc list 2>/dev/null)
@@ -71,7 +81,7 @@ case "$MODE" in
     sing-box)
         pgrep -f sing-box >/dev/null 2>&1 || ok=0 ;;
     clashx)
-        { pgrep -x ClashX >/dev/null 2>&1 || pgrep -f clash >/dev/null 2>&1; } || ok=0 ;;
+        clashx_alive || ok=0 ;;
     surge)
         pgrep -f Surge >/dev/null 2>&1 || ok=0 ;;
     auto)
@@ -88,8 +98,9 @@ case "$HOME_DIR" in
             [ "$MODE" != "tag" ] && tag_alive && ok=0
             [ "$MODE" != "clash-verge" ] && pgrep -f verge-mihomo >/dev/null 2>&1 && ok=0
             [ "$MODE" != "flclash" ] && { pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; } && ok=0
+            [ "$MODE" != "bettbox" ] && { pgrep -f BettboxCore >/dev/null 2>&1 || pgrep -x Bettbox >/dev/null 2>&1; } && ok=0
             [ "$MODE" != "sing-box" ] && pgrep -f sing-box >/dev/null 2>&1 && ok=0
-            [ "$MODE" != "clashx" ] && pgrep -x ClashX >/dev/null 2>&1 && ok=0
+            [ "$MODE" != "clashx" ] && clashx_alive && ok=0
             [ "$MODE" != "surge" ] && pgrep -f Surge >/dev/null 2>&1 && ok=0
         fi
         ;;

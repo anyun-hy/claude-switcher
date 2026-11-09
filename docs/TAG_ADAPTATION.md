@@ -1,17 +1,28 @@
 # TAG 适配与上游同步
 
-本仓库是 [anyun-hy/claude-switcher](https://github.com/anyun-hy/claude-switcher)，基于原作者 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) 维护。自己的 `main` 承接上游代码和少量本地适配；本次同步的上游基线是 [`4a5d35312e23f7c603343c68bc4d1e43c43a9831`](https://github.com/YOURSJEYO/claude-switcher/commit/4a5d35312e23f7c603343c68bc4d1e43c43a9831)。保留原作者署名、Git 历史和上游随代码提供的 [AGPL-3.0-only 许可证](../LICENSE)。
+本仓库是 [anyun-hy/claude-switcher](https://github.com/anyun-hy/claude-switcher)，基于原作者 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) 维护。本次集成的上游代码基线是 [`cf474a23bd4c7467163721399082568f0cb95cf7`](https://github.com/YOURSJEYO/claude-switcher/commit/cf474a23bd4c7467163721399082568f0cb95cf7)。保留原作者署名、Git 历史和上游随代码提供的 [AGPL-3.0-only 许可证](../LICENSE)。
 
 ## TAG 适配范围
 
 - 核心脚本支持 `tag` 客户端模式，按完整可执行文件路径识别 TAG 内核：`/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin`。其他客户端或任意包含 `mihomo` 的进程不能据此当成 TAG。
-- 安装器、保镖模板和桌面界面支持同一客户端模式。安装器按实际客户端和出口写入配置，App 安装位置保留为「应用程序」文件夹。用户切换客户端后，root 保镖需要通过安装器同步其配置。
+- 安装器、保镖模板和桌面界面支持同一客户端模式。安装器按实际客户端和出口写入配置，App 安装位置保留为「应用程序」文件夹。界面切换客户端或执行一键修复时，可请求管理员权限同步已安装 root 保镖的模式；完整守护代码升级仍通过安装器或界面更新完成。
 - 这些改动提供 TAG 的基础兼容。Fake-IP 响应及相关网卡、DNS 行为只能作为检查信号，不能证明请求实际走了预期代理节点，也不能证明规则已置顶；仍须在 TAG 中核对 TUN、代理规则和实际出口。
 - 切换器不会自动重写 TAG 的规则文件。启动客户端、检查状态及等待隧道就绪后仍不满足要求时，应由用户在 TAG 中调整配置。
 
 ## 更新通道与安装范围
 
 macOS 核心的更新源固定为 **`anyun-hy/claude-switcher` 的 `main`**，与当前是否选择 `tag` 模式无关。原作者的新提交先由维护者合入自己的仓库，通过验证后再进入这条更新通道。
+
+2026-11-09 的功能集成包括：
+
+| 上游功能 | 本 fork 的接入方式 |
+|---|---|
+| ClashX Pro / Meta 识别 | 核心与保镖共用对应的识别逻辑，并用于本 fork 的多客户端冲突检测；保留 TAG 完整可执行文件路径验证。 |
+| Bettbox 支持 | 接入安装识别、客户端菜单、核心与保镖，以及本 fork 的保镖模式同步白名单和多客户端冲突检测；不套用其他客户端的规则改写。安装器继续保留原有 7=auto、8=tag，新增 9=bettbox。 |
+| 官方免费版本公告 | 保留上游的显式确认、持久化和手动复看，通过现有「关于」菜单和菜单栏访问；与工具箱等面板互斥，不替换现有主界面布局。 |
+| Windows 网络探测 | 接入空响应处理和有界重试；每次重试前重新检查代理路径，检查失效即停止。进程与 TUN 信号不能证明实际路由，仍存在检查与发包之间的时间窗口。 |
+
+本地的保镖健康记录与历史事件分离、紧凑侧栏、Mac 网络重建和账号启动锁定均保留。集成验证使用假进程、假网络命令和隔离账号目录；Windows PowerShell 运行脚本与真实代理客户端行为仍需在对应环境验收。
 
 | 入口 | 行为 |
 |---|---|
