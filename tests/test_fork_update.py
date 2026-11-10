@@ -6,6 +6,7 @@ validation, config-only comparisons and both read-only command aliases.
 """
 import hashlib
 import os
+import plistlib
 from pathlib import Path
 import re
 import subprocess
@@ -67,6 +68,7 @@ class ForkUpdateTests(unittest.TestCase):
                         EXPECTED_UPDATE_URL=UPDATE_URL, FORBIDDEN_LOG=str(self.forbidden_log),
                         SELF_CHECK_MARKER=str(self.root / "self-check-called"))
         self.env.pop("BASH_ENV", None)
+        self.env.pop("ENV", None)
         self.stub("curl", '''out=""; url=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -102,7 +104,7 @@ cp "$FIXTURE_ARCHIVE" "$out"
         return text
 
     def prepare_remote(self, content, manifest="valid", package="claude-switcher-main",
-                       app_source=None, stun_source=None):
+                       app_source=None, stun_source=None, guard_plist_source=None):
         if isinstance(content, str):
             content = content.encode("utf-8")
         if stun_source is None:
@@ -115,6 +117,8 @@ cp "$FIXTURE_ARCHIVE" "$out"
             "daemons/claude-bodyguard.sh": b'HOME_DIR="__HOME__"\nMODE="__PROXY_MODE__"\n',
             "daemons/tz-watchdog.sh": b'HOME_DIR="__HOME__"\nTZV="__TZ_TARGET__"\n',
         }
+        if guard_plist_source is not None:
+            files["daemons/local.claude-bodyguard.plist"] = guard_plist_source
         if app_source is not None:
             files["app/main.swift"] = app_source.encode("utf-8") if isinstance(app_source, str) else app_source
             files["scripts/build-app.sh"] = (ROOT / "scripts/build-app.sh").read_bytes()
@@ -129,10 +133,14 @@ cp "$FIXTURE_ARCHIVE" "$out"
             entries = [(d, n) for d, n in entries if n != "app/main.swift"]
         elif manifest == "missing-build":
             entries = [(d, n) for d, n in entries if n != "scripts/build-app.sh"]
+        elif manifest == "missing-guard-plist":
+            entries = [(d, n) for d, n in entries if n != "daemons/local.claude-bodyguard.plist"]
         elif manifest == "missing-file":
             entries.append(("0" * 64, "core/not-in-archive.sh"))
         elif manifest == "wrong-extra":
             files["daemons/claude-bodyguard.sh"] += b"# corrupted after hashing\n"
+        elif manifest == "wrong-guard-plist":
+            files["daemons/local.claude-bodyguard.plist"] += b"corrupted after hashing\n"
         sums = "".join(digest + "  " + name + "\n" for digest, name in entries)
         if manifest == "empty":
             sums = ""
@@ -153,8 +161,112 @@ cp "$FIXTURE_ARCHIVE" "$out"
 
     def installed_state(self):
         return {str(path.relative_to(self.root)): path.read_bytes()
-                for directory in (self.home, self.appdir)
+                for directory in (self.home, self.appdir, self.daemons_dir)
                 for path in directory.rglob("*") if path.is_file()}
+
+    def prepare_schedule_update(self):
+        # These match the remote script templates byte-for-byte: only the plist changes.
+        (self.appdir / "claude-bodyguard.sh").write_text(
+            f'HOME_DIR="{self.home}"\nMODE="{LOCAL_CONFIG["PROXY_MODE"]}"\n')
+        (self.appdir / "tz-watchdog.sh").write_text(
+            f'HOME_DIR="{self.home}"\nTZV="{LOCAL_CONFIG["TZ_TARGET"]}"\n')
+        self.daemons_dir.mkdir()
+        plist = self.daemons_dir / "local.claude-bodyguard.plist"
+        new = (ROOT / "daemons/local.claude-bodyguard.plist").read_bytes()
+        old = plistlib.loads(new)
+        old["StartInterval"] = 10
+        old.pop("ThrottleInterval", None)
+        plist.write_bytes(plistlib.dumps(old))
+        self.env["LAUNCH_TRACE"] = str(self.root / "launch-trace")
+        self.stub("chown", "exit 0")
+        self.stub("launchctl", '''printf '%s\\n' "$*" >> "$LAUNCH_TRACE"
+if [ "${FAIL_NEW_SCHEDULE:-0}" = 1 ] && [ "$1" = bootstrap ] &&
+   /usr/bin/grep -q '<integer>1</integer>' "$3"; then exit 1; fi
+exit 0''')
+        return plist, new
+
+    def test_schedule_only_change_is_detected_by_readonly_update_checks(self):
+        plist, new = self.prepare_schedule_update()
+        self.prepare_remote(self.core.read_bytes(), guard_plist_source=new)
+        for args in CHECK_COMMANDS:
+            with self.subTest(args=args):
+                before = self.installed_state()
+                run, _ = self.run_core(*args)
+                self.assert_run(run, True, "发现新版本")
+                self.assertEqual(self.installed_state(), before)
+                self.assertFalse(Path(self.env["LAUNCH_TRACE"]).exists())
+
+    def test_schedule_plist_requires_valid_archive_checksum(self):
+        new = (ROOT / "daemons/local.claude-bodyguard.plist").read_bytes()
+        for manifest in ("missing-guard-plist", "wrong-guard-plist"):
+            with self.subTest(manifest=manifest):
+                self.prepare_remote(self.core.read_bytes(), manifest=manifest, guard_plist_source=new)
+                before = self.installed_state()
+                run, _ = self.run_core("update", "--gui")
+                self.assert_run(run, False, "校验")
+                self.assertEqual(self.installed_state(), before)
+
+    @unittest.skipUnless(sys.platform == "darwin", "actual updater uses macOS BSD commands")
+    def test_gui_schedule_update_reloads_service_without_replacing_unchanged_scripts(self):
+        plist, new = self.prepare_schedule_update()
+        guard = self.appdir / "claude-bodyguard.sh"
+        modified = guard.stat().st_mtime_ns
+        self.stub("osascript", 'script="$2"; /bin/bash "$script"')
+        self.prepare_remote(self.install_candidate("保镖=ok:fixture"), guard_plist_source=new)
+        run, _ = self.run_core("update", "--gui")
+        self.assert_run(run, True, "守护进程")
+        self.assertEqual(plist.read_bytes(), new)
+        self.assertEqual(plist.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(guard.stat().st_mtime_ns, modified)
+        trace = Path(self.env["LAUNCH_TRACE"]).read_text()
+        self.assertIn("bootout system/local.claude-bodyguard", trace)
+        self.assertIn("bootstrap system " + str(plist), trace)
+        self.assertIn("print system/local.claude-bodyguard", trace)
+        self.assertNotIn("tz-watchdog", trace)
+        self.assertEqual(list(self.daemons_dir.glob(".claude-bodyguard.*")), [])
+
+    @unittest.skipUnless(sys.platform == "darwin", "actual updater uses macOS BSD commands")
+    def test_cancelled_schedule_update_leaves_existing_system_config_untouched(self):
+        plist, new = self.prepare_schedule_update()
+        old = plist.read_bytes()
+        before_core = self.core.read_bytes()
+        self.stub("osascript", "exit 1")
+        self.prepare_remote(self.install_candidate("保镖=ok:fixture"), guard_plist_source=new)
+        run, _ = self.run_core("update", "--gui")
+        self.assert_run(run, False, "已自动回滚")
+        self.assertEqual(plist.read_bytes(), old)
+        self.assertEqual(self.core.read_bytes(), before_core)
+        self.assertFalse(Path(self.env["LAUNCH_TRACE"]).exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "actual updater uses macOS BSD commands")
+    def test_tampered_schedule_is_rejected_before_system_mutation(self):
+        plist, new = self.prepare_schedule_update()
+        old = plist.read_bytes()
+        before_core = self.core.read_bytes()
+        self.stub("osascript", 'printf tampered > "${2%/*}/bg.plist"; /bin/bash "$2"')
+        self.prepare_remote(self.install_candidate("保镖=ok:fixture"), guard_plist_source=new)
+        run, _ = self.run_core("update", "--gui")
+        self.assert_run(run, False, "已自动回滚")
+        self.assertEqual(plist.read_bytes(), old)
+        self.assertEqual(self.core.read_bytes(), before_core)
+        self.assertFalse(Path(self.env["LAUNCH_TRACE"]).exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "actual updater uses macOS BSD commands")
+    def test_failed_new_schedule_restores_and_reloads_previous_schedule(self):
+        plist, new = self.prepare_schedule_update()
+        old = plist.read_bytes()
+        before_core = self.core.read_bytes()
+        self.env["FAIL_NEW_SCHEDULE"] = "1"
+        self.stub("osascript", '/bin/bash "$2"')
+        self.prepare_remote(self.install_candidate("保镖=ok:fixture"), guard_plist_source=new)
+        run, _ = self.run_core("update", "--gui")
+        self.assert_run(run, False, "已自动回滚")
+        self.assertEqual(plist.read_bytes(), old)
+        self.assertEqual(self.core.read_bytes(), before_core)
+        trace = Path(self.env["LAUNCH_TRACE"]).read_text()
+        self.assertEqual(trace.count("bootstrap system " + str(plist)), 2)
+        self.assertIn("print system/local.claude-bodyguard", trace)
+        self.assertEqual(list(self.daemons_dir.glob(".claude-bodyguard.*")), [])
 
     def assert_run(self, run, success, message):
         self.assertEqual(run.returncode == 0, success, run.stdout + run.stderr)

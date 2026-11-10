@@ -4,6 +4,7 @@
 <plist version="1.0"><dict>
 	<key>Label</key><string>local.claude-bodyguard</string>
 	<key>ProgramArguments</key><array><string>/bin/bash</string><string>/Library/Application Support/claude-switcher/claude-bodyguard.sh</string></array>
-	<key>StartInterval</key><integer>10</integer>
+	<key>StartInterval</key><integer>1</integer>
+	<key>ThrottleInterval</key><integer>1</integer>
 	<key>RunAtLoad</key><true/>
 </dict></plist>

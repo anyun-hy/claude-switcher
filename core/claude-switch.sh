@@ -2478,7 +2478,7 @@ fix() {
     [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
     echo "$v6" | grep -qi 'off' || adminCmds="${adminCmds}networksetup -setv6off Wi-Fi; "
     if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
-        adminCmds="${adminCmds}cp -X $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ || exit 1; /usr/bin/xattr -d com.apple.quarantine /Library/LaunchDaemons/local.claude-bodyguard.plist 2>/dev/null || true; chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1; "
+        adminCmds="${adminCmds}if [ ! -f /Library/LaunchDaemons/local.claude-bodyguard.plist ]; then cp -X $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ || exit 1; fi; /usr/bin/xattr -d com.apple.quarantine /Library/LaunchDaemons/local.claude-bodyguard.plist 2>/dev/null || true; chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1; "
     fi
     case "$guard_state" in
         fail:客户端不一致*)
@@ -2739,6 +2739,42 @@ install_staged() {  # $1=源文件 $2=目标文件
     return 0
 }
 
+# Serialized into the authorized root update script. Keep the previous schedule
+# in a protected same-directory staging area until the new service is verified.
+replace_bodyguard_schedule() {
+    local source="$1" expected="$2" target="$3" stage had_old=0
+    [ ! -L "$target" ] && { [ ! -e "$target" ] || [ -f "$target" ]; } || return 1
+    stage=$(mktemp -d "${target%/*}/.claude-bodyguard.XXXXXXXX") || return 1
+    if [ -f "$target" ]; then
+        cp -X "$target" "$stage/previous.plist" || { rm -rf "$stage"; return 1; }
+        had_old=1
+    fi
+    if ! cp -X "$source" "$stage/new.plist" ||
+       ! verify_sha256 "$stage/new.plist" "$expected" ||
+       ! chown root:wheel "$stage/new.plist" || ! chmod 644 "$stage/new.plist" ||
+       ! mv -f "$stage/new.plist" "$target"; then
+        rm -rf "$stage"; return 1
+    fi
+    launchctl bootout system/local.claude-bodyguard 2>/dev/null || true
+    if launchctl bootstrap system "$target" && launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
+        rm -rf "$stage"; return 0
+    fi
+    launchctl bootout system/local.claude-bodyguard 2>/dev/null || true
+    if [ "$had_old" -eq 1 ]; then
+        if ! mv -f "$stage/previous.plist" "$target"; then
+            echo "保镖调度恢复失败，原配置保留在 $stage/previous.plist" >&2
+            return 1
+        fi
+        if ! launchctl bootstrap system "$target" || ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
+            echo '原保镖调度配置已恢复，但服务未能重新注册，请运行安装器恢复' >&2
+        fi
+    else
+        rm -f "$target"
+    fi
+    rm -rf "$stage"
+    return 1
+}
+
 self_update() {
     auto=0; check=0; gui=0
     case "${1:-}" in
@@ -2831,13 +2867,16 @@ self_update() {
     if [ ! -s "$NEW/SHA256SUMS" ]; then
         echo "FAIL:无法获取校验清单(SHA256SUMS),已中止"; cleanup_update; return 1
     fi
-    bad=0; saw_core=0; saw_stun=0; saw_app=0; saw_build=0
+    bad=0; saw_core=0; saw_stun=0; saw_app=0; saw_build=0; saw_guard_plist=0; bg_plist_sha=""
     while read -r sum rel; do
         [ -z "$sum" ] && continue
         [ "$rel" = "core/claude-switch.sh" ] && saw_core=1
         [ "$rel" = "core/stun-probe.py" ] && saw_stun=1
         [ "$rel" = "app/main.swift" ] && saw_app=1
         [ "$rel" = "scripts/build-app.sh" ] && saw_build=1
+        if [ "$rel" = "daemons/local.claude-bodyguard.plist" ]; then
+            saw_guard_plist=1; bg_plist_sha="$sum"
+        fi
         if [ ! -f "$NEW/$rel" ] || [ "$(shasum -a 256 "$NEW/$rel" | awk '{print $1}')" != "$sum" ]; then
             bad=1; break
         fi
@@ -2845,7 +2884,8 @@ self_update() {
     if [ "$bad" -eq 1 ] || [ "$saw_core" -ne 1 ] \
         || { [ -f "$NEW/core/stun-probe.py" ] && [ "$saw_stun" -ne 1 ]; } \
         || { [ -f "$NEW/app/main.swift" ] && [ "$saw_app" -ne 1 ]; } \
-        || { [ -f "$NEW/scripts/build-app.sh" ] && [ "$saw_build" -ne 1 ]; }; then
+        || { [ -f "$NEW/scripts/build-app.sh" ] && [ "$saw_build" -ne 1 ]; } \
+        || { [ -f "$NEW/daemons/local.claude-bodyguard.plist" ] && [ "$saw_guard_plist" -ne 1 ]; }; then
         echo "FAIL:工件校验失败,已中止(不排除网络篡改,可稍后重试或手动 update)"; cleanup_update; return 1
     fi
 
@@ -2885,7 +2925,10 @@ self_update() {
     fi
 
     APPDIR="/Library/Application Support/claude-switcher"
+    DAEMON_DIR="${CLAUDE_SWITCHER_DAEMONS:-/Library/LaunchDaemons}"
     daemon_changed=0
+    daemon_scripts_changed=0
+    guard_plist_changed=0
     if [ -f "$APPDIR/claude-bodyguard.sh" ] || [ -f "$APPDIR/tz-watchdog.sh" ]; then
         [ -z "$PM" ] && PM="clash-verge"
         [ -z "$TZV" ] && TZV="America/New_York"
@@ -2893,6 +2936,15 @@ self_update() {
         sed -e "s|__HOME__|$UHOME|g" -e "s|__TZ_TARGET__|$TZV|g" "$NEW/daemons/tz-watchdog.sh" > "$tmpd/tz.new"
         if ! diff -q "$tmpd/bg.new" "$APPDIR/claude-bodyguard.sh" >/dev/null 2>&1 || \
            ! diff -q "$tmpd/tz.new" "$APPDIR/tz-watchdog.sh" >/dev/null 2>&1; then
+            daemon_changed=1
+            daemon_scripts_changed=1
+        fi
+        if [ -f "$NEW/daemons/local.claude-bodyguard.plist" ] &&
+           ! cmp -s "$NEW/daemons/local.claude-bodyguard.plist" "$DAEMON_DIR/local.claude-bodyguard.plist"; then
+            cp -X "$NEW/daemons/local.claude-bodyguard.plist" "$tmpd/bg.plist" || {
+                echo "FAIL:无法暂存保镖调度配置"; cleanup_update; return 1;
+            }
+            guard_plist_changed=1
             daemon_changed=1
         fi
     fi
@@ -3028,7 +3080,6 @@ self_update() {
     fi
 
     # 4. 自检通过后,统一执行 App 替换与 root 守护进程同步(root 执行前二次校验临时文件 SHA256)
-    DAEMON_DIR="${CLAUDE_SWITCHER_DAEMONS:-/Library/LaunchDaemons}"
     daemon_updated=0
     app_updated=0
     if [ "$gui" -eq 1 ] && { [ "$daemon_changed" -eq 1 ] || [ "$need_admin_app" -eq 1 ]; }; then
@@ -3038,6 +3089,7 @@ self_update() {
             echo 'set -e'
             echo 'verify_sha256() { [ -f "$1" ] && [ "$(/usr/bin/shasum -a 256 "$1" | /usr/bin/awk '\''{print $1}'\'')" = "$2" ]; }'
             declare -f replace_app_bundle
+            [ "$guard_plist_changed" -eq 1 ] && declare -f replace_bodyguard_schedule
             if [ "$need_admin_app" -eq 1 ]; then
                 bin_sha=$(shasum -a 256 "$app_built/Contents/MacOS/ClaudeSwitcher" | awk '{print $1}')
                 printf 'verify_sha256 %q %q\n' "$app_built/Contents/MacOS/ClaudeSwitcher" "$bin_sha"
@@ -3048,14 +3100,26 @@ self_update() {
                 tz_sha=$(shasum -a 256 "$tmpd/tz.new" | awk '{print $1}')
                 printf 'verify_sha256 %q %q\n' "$tmpd/bg.new" "$bg_sha"
                 printf 'verify_sha256 %q %q\n' "$tmpd/tz.new" "$tz_sha"
+                if [ "$guard_plist_changed" -eq 1 ]; then
+                    printf 'verify_sha256 %q %q\n' "$tmpd/bg.plist" "$bg_plist_sha"
+                fi
                 printf 'mkdir -p %q\n' "$APPDIR"
-                printf 'cp %q %q\n' "$tmpd/bg.new" "$APPDIR/claude-bodyguard.sh"
-                printf 'cp %q %q\n' "$tmpd/tz.new" "$APPDIR/tz-watchdog.sh"
-                printf 'chown root:wheel %q %q\n' "$APPDIR/claude-bodyguard.sh" "$APPDIR/tz-watchdog.sh"
-                printf 'chmod 755 %q %q\n' "$APPDIR/claude-bodyguard.sh" "$APPDIR/tz-watchdog.sh"
-                printf '/usr/bin/xattr -d com.apple.quarantine %q %q 2>/dev/null || true\n' "$APPDIR/claude-bodyguard.sh" "$APPDIR/tz-watchdog.sh"
-                printf 'if [ -f %q ]; then launchctl bootout system/local.claude-bodyguard 2>/dev/null || true; launchctl bootstrap system %q; launchctl print system/local.claude-bodyguard >/dev/null 2>&1; fi\n' "$DAEMON_DIR/local.claude-bodyguard.plist" "$DAEMON_DIR/local.claude-bodyguard.plist"
-                printf 'if [ -f %q ]; then launchctl bootout system/local.tz-watchdog 2>/dev/null || true; launchctl bootstrap system %q; launchctl print system/local.tz-watchdog >/dev/null 2>&1; fi\n' "$DAEMON_DIR/local.tz-watchdog.plist" "$DAEMON_DIR/local.tz-watchdog.plist"
+                if [ "$daemon_scripts_changed" -eq 1 ]; then
+                    printf 'cp %q %q\n' "$tmpd/bg.new" "$APPDIR/claude-bodyguard.sh"
+                    printf 'cp %q %q\n' "$tmpd/tz.new" "$APPDIR/tz-watchdog.sh"
+                    printf 'chown root:wheel %q %q\n' "$APPDIR/claude-bodyguard.sh" "$APPDIR/tz-watchdog.sh"
+                    printf 'chmod 755 %q %q\n' "$APPDIR/claude-bodyguard.sh" "$APPDIR/tz-watchdog.sh"
+                    printf '/usr/bin/xattr -d com.apple.quarantine %q %q 2>/dev/null || true\n' "$APPDIR/claude-bodyguard.sh" "$APPDIR/tz-watchdog.sh"
+                fi
+                if [ "$guard_plist_changed" -eq 1 ]; then
+                    printf 'mkdir -p %q\n' "$DAEMON_DIR"
+                    printf 'replace_bodyguard_schedule %q %q %q\n' "$tmpd/bg.plist" "$bg_plist_sha" "$DAEMON_DIR/local.claude-bodyguard.plist"
+                else
+                    printf 'if [ -f %q ]; then launchctl bootout system/local.claude-bodyguard 2>/dev/null || true; launchctl bootstrap system %q; launchctl print system/local.claude-bodyguard >/dev/null 2>&1; fi\n' "$DAEMON_DIR/local.claude-bodyguard.plist" "$DAEMON_DIR/local.claude-bodyguard.plist"
+                fi
+                if [ "$daemon_scripts_changed" -eq 1 ]; then
+                    printf 'if [ -f %q ]; then launchctl bootout system/local.tz-watchdog 2>/dev/null || true; launchctl bootstrap system %q; launchctl print system/local.tz-watchdog >/dev/null 2>&1; fi\n' "$DAEMON_DIR/local.tz-watchdog.plist" "$DAEMON_DIR/local.tz-watchdog.plist"
+                fi
             fi
         } > "$admin_script"
         chmod 700 "$admin_script"
@@ -3065,14 +3129,14 @@ on run argv
 end run
 ASEOF
         then
-            echo "FAIL:管理员授权取消或系统组件更新失败,已自动回滚"
+            echo "FAIL:管理员授权取消或系统组件更新失败,已自动回滚用户态文件;请重新检查系统守护,必要时运行安装器恢复"
             cleanup_update
             return 1
         fi
         [ "$need_admin_app" -eq 1 ] && app_updated=1
         [ "$daemon_changed" -eq 1 ] && daemon_updated=1
     elif [ "$daemon_changed" -eq 1 ]; then
-        echo "INFO:守护进程脚本有更新,请运行 installer/安装.command 刷新(需要密码)"
+        echo "INFO:守护脚本或调度配置有更新,请运行 installer/安装.command 刷新(需要密码)"
     fi
 
     if [ -n "$app_built" ] && [ "$need_admin_app" -eq 0 ]; then

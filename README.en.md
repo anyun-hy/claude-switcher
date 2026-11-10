@@ -28,7 +28,7 @@ closing the window in which traffic could leave outside the proxy.
 
 - **14-point preflight audit** — proxy core, TUN interface, exit country, IP stability, time zone, locale, IPv6, DNS leakage, WebRTC candidates, bodyguard status, pinned routing, browser language, ASN type, and Claude reachability.
 - **Snapshot switching** — archives and restores whole account directories; APFS copy-on-write cloning avoids duplicating unchanged data.
-- **Fail-closed bodyguard** — checks the proxy kernel and virtual interface every ten seconds and terminates protected processes when the tunnel is lost.
+- **Process-level bodyguard** — macOS schedules local proxy-process and virtual-interface checks every second, with an explicit one-second launch throttle. Scheduling and execution time affect actual reaction latency; this is not a firewall guarantee. The installer or in-app update must refresh the system LaunchDaemon plist for existing installations. Windows and Linux retain their ten-second interval.
 - **Drift watchdog** — records a baseline for time zone and proxy settings and rolls back silent changes made by other software.
 - **Multiple proxy clients** — detects Clash Verge, FlClash, Shadowrocket, sing-box, ClashX, and Surge, with an automatic mode. Clash Verge and FlClash repairs install and verify routing rules with rollback; other non-Clash clients keep their own configuration.
 - **Region adaptation** — captures the exit country, time zone, and locale at install time and re-locks all three after moving to a different node.

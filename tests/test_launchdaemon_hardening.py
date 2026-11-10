@@ -1,5 +1,6 @@
 """LaunchDaemon 安装/修复的隔离标记与注册结果回归。"""
 import re
+import plistlib
 from pathlib import Path
 import unittest
 
@@ -17,6 +18,19 @@ def function_body(text, name):
 
 
 class LaunchDaemonHardeningTests(unittest.TestCase):
+    def test_bodyguard_uses_one_second_schedule_and_explicit_throttle(self):
+        with (ROOT / "daemons/local.claude-bodyguard.plist").open("rb") as handle:
+            config = plistlib.load(handle)
+        self.assertEqual(config["StartInterval"], 1)
+        self.assertEqual(config["ThrottleInterval"], 1)
+        self.assertTrue(config["RunAtLoad"])
+        self.assertEqual(config["ProgramArguments"],
+                         ["/bin/bash", "/Library/Application Support/claude-switcher/claude-bodyguard.sh"])
+
+    def test_fix_preserves_installed_schedule_before_using_old_user_cache(self):
+        fix = function_body(CORE.read_text(encoding="utf-8"), "fix")
+        self.assertIn("if [ ! -f /Library/LaunchDaemons/local.claude-bodyguard.plist ]; then cp -X", fix)
+
     def test_installer_removes_quarantine_before_launchd_bootstrap(self):
         text = INSTALLER.read_text(encoding="utf-8")
         copy_line = next(
