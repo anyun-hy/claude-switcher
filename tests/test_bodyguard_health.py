@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 
+from macos_process_fixture import with_process_paths
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = (ROOT / "core/claude-switch.sh").read_text(encoding="utf-8")
@@ -151,7 +152,8 @@ cat "$file"''')
                     self.assertTrue(run.stdout.startswith("#保镖事件=2026-11-07 01:19:15 "))
 
     def test_daemon_publishes_completion_and_failure_only_beside_fixture(self):
-        self.guard.write_text(DAEMON.replace("__HOME__", str(self.root))
+        source = with_process_paths(DAEMON, r"printf '654\t/bin/sleep\n'")
+        self.guard.write_text(source.replace("__HOME__", str(self.root))
                               .replace("__PROXY_MODE__", "flclash"))
         self.stub("id", "echo 501")
         self.stub("pgrep", "exit 1")
@@ -174,19 +176,23 @@ cat "$file"''')
                 self.assertEqual(list(self.root.glob(".claude-bodyguard-health.*")), [])
 
     def test_failed_enforcement_publishes_error_instead_of_healthy_heartbeat(self):
-        self.guard.write_text(DAEMON.replace("__HOME__", str(self.root))
+        source = with_process_paths(
+            DAEMON, r"printf '654\t/Applications/Claude.app/Contents/MacOS/Claude\n'")
+        self.guard.write_text(source.replace("__HOME__", str(self.root))
                               .replace("__PROXY_MODE__", "flclash"))
+        (self.root / "Library/Logs").mkdir(parents=True)
         self.stub("id", "echo 501")
         self.stub("ifconfig", "echo 'inet 192.0.2.1'")
-        self.stub("pgrep", '''case "$*" in *Claude.app*) exit 0 ;; *) exit 1 ;; esac''')
-        self.stub("ps", "exit 0")
-        self.stub("pkill", "exit 1")
-        self.stub("kill", "exit 99")
+        self.stub("ps", '''case "$1" in -p) echo 501 ;; *) echo '654 501 Claude' ;; esac''')
+        self.stub("pkill", "exit 99")
+        self.stub("kill", "exit 1")
         run = subprocess.run(["/bin/bash", "-c", 'enable -n kill; . "$1"',
                               "fixture", str(self.guard)], env=self.env,
                              text=True, capture_output=True, timeout=3)
         self.assertEqual(run.returncode, 1, run.stderr)
         self.assertIn("result=error\n", self.heartbeat.read_text())
+        self.assertIn("目标=Claude,pid=654,结果=发送失败",
+                      (self.root / "Library/Logs/claude-bodyguard.log").read_text())
 
 
 if __name__ == "__main__":

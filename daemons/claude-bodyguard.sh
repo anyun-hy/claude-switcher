@@ -28,7 +28,7 @@ record_health() {
 }
 trap record_health EXIT
 
-# 安装用户 UID: root 守护从 __HOME__ 属主推导,只处理该用户的 CLI 进程。
+# 安装用户 UID: root 守护从 __HOME__ 属主推导,只处理该用户的受保护进程。
 # 推导失败宁可不杀,也不按进程名全系统扫描(避免误伤其他用户与 claude-switcher 自身)。
 if [ "$(id -u)" -eq 0 ]; then
     INSTALL_UID=$(stat -f %u "$HOME_DIR" 2>/dev/null || id -u "${HOME_DIR##*/}" 2>/dev/null)
@@ -37,102 +37,159 @@ else
 fi
 case "$INSTALL_UID" in ''|*[!0-9]*) HEALTH_ERROR=1 ;; esac
 
-ok=1
+# Keep the process probe and classifier in sync with core/claude-switch.sh.
+# macOS ps comm can report argv[0]. Use the kernel's executable path instead.
+macos_process_paths() {
+    /usr/bin/python3 -I -S -B - <<'PY'
+import ctypes
+import sys
 
-# TAG 内核可能由特权服务启动；核验 PID 的实际可执行文件，防止命令行冒名。
-tag_alive() {
-    local pid executable
-    while IFS= read -r pid; do
-        case "$pid" in ''|*[!0-9]*) continue ;; esac
-        executable=$(ps -p "$pid" -o comm= 2>/dev/null | sed 's/^[[:space:]]*//')
-        [ "$executable" = "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin" ] && return 0
-    done < <(pgrep -f '/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin' 2>/dev/null)
-    return 1
+lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+lib.proc_listallpids.argtypes = (ctypes.c_void_p, ctypes.c_int)
+lib.proc_listallpids.restype = ctypes.c_int
+lib.proc_pidpath.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+lib.proc_pidpath.restype = ctypes.c_int
+count = lib.proc_listallpids(None, 0)
+if count <= 0:
+    sys.exit(1)
+pids = (ctypes.c_int * (count + 256))()
+count = lib.proc_listallpids(pids, ctypes.sizeof(pids))
+if not 0 < count < len(pids):
+    sys.exit(1)
+buf = ctypes.create_string_buffer(4096)
+readable = False
+for pid in pids[:count]:
+    if pid <= 0 or lib.proc_pidpath(pid, buf, len(buf)) <= 0:
+        continue
+    path = buf.value
+    if path.startswith(b"/") and not any(c in path for c in (b"\t", b"\r", b"\n")):
+        sys.stdout.buffer.write(str(pid).encode() + b"\t" + path + b"\n")
+        readable = True
+sys.exit(0 if readable else 1)
+PY
 }
 
-# ClashX / Pro / Meta 共用 .../Contents/MacOS/ClashX 主进程路径。
-clashx_alive() {
-    pgrep -f '/Contents/MacOS/ClashX' >/dev/null 2>&1 \
-        || pgrep -x ClashX >/dev/null 2>&1 \
-        || pgrep -x 'ClashX Pro' >/dev/null 2>&1 \
-        || pgrep -x 'ClashX Meta' >/dev/null 2>&1
+proxy_processes() {
+    local paths
+    paths=$(macos_process_paths 2>/dev/null) || return 1
+    printf '%s\n' "$paths" | awk -F '\t' '
+        NF == 2 && $1 ~ /^[1-9][0-9]*$/ && $2 ~ /^\// {
+            name = $2; sub(/^.*\//, "", name)
+            if ($2 == "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin") mode = "tag"
+            else if (name ~ /^verge-mihomo(-[[:alnum:]_.-]+)?$/) mode = "clash-verge"
+            else if (name == "FlClashCore" || name == "FlClash") mode = "flclash"
+            else if (name == "BettboxCore" || name == "Bettbox") mode = "bettbox"
+            else if (name == "sing-box") mode = "sing-box"
+            else if (name ~ /^ClashX( Pro| Meta)?$/) mode = "clashx"
+            else if (name == "Surge" || $2 ~ /\/Surge[.]app\/Contents\//) mode = "surge"
+            else next
+            printf "%s\t%s\n", mode, $1
+        }'
 }
 
-# TUN 在线判定:必须存在且仅存在 1 个 fake-ip 网段地址(0 个或多个 TUN 均视为异常并关闭 Claude)
-interfaces=$(ifconfig 2>/dev/null) || { HEALTH_ERROR=1; ok=0; }
-[ "$(printf '%s\n' "$interfaces" | grep -c 'inet 198\.18\.')" -eq 1 ] || ok=0
+proxy_seen() {
+    [[ $'\n'$1 == *$'\n'"$2"$'\t'* ]]
+}
 
-# 内核在线判定:按安装时识别的客户端分派
-case "$MODE" in
-    tag)
-        tag_alive || ok=0 ;;
-    clash-verge)
-        pgrep -f verge-mihomo >/dev/null 2>&1 || ok=0 ;;
-    flclash)
-        { pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; } || ok=0 ;;
-    bettbox)
-        { pgrep -f BettboxCore >/dev/null 2>&1 || pgrep -x Bettbox >/dev/null 2>&1; } || ok=0 ;;
-    shadowrocket)
-        # launchd 环境下 scutil 可能查不到 VPN 行,查不到时以 TUN 判定为准(避免误杀)
+reasons=""
+guard_reason() { reasons="${reasons:+$reasons;}$1"; }
+
+# Retain the existing one-TUN rule. Probe failure is distinct from missing TUN.
+if interfaces=$(ifconfig 2>/dev/null); then
+    tcnt=$(printf '%s\n' "$interfaces" | grep -c 'inet 198\.18\.')
+    case "$tcnt" in
+        1) ;;
+        0) guard_reason 'TUN未在线' ;;
+        *) guard_reason "多TUN=$tcnt" ;;
+    esac
+else
+    HEALTH_ERROR=1
+    guard_reason 'TUN核验失败'
+fi
+
+# auto remains TUN-only. Other modes use the same executable inventory as core.
+if [ "$MODE" != "auto" ]; then
+    case "$MODE" in
+        tag|clash-verge|flclash|bettbox|sing-box|clashx|surge) expected_mode="$MODE" ;;
+        shadowrocket) expected_mode="" ;;
+        *) expected_mode="clash-verge" ;;
+    esac
+    if processes=$(proxy_processes); then
+        if [ -n "$expected_mode" ] && ! proxy_seen "$processes" "$expected_mode"; then
+            guard_reason "代理内核未运行=$expected_mode"
+        fi
+        conflicts=""
+        while IFS=$'\t' read -r client pid; do
+            if [ -n "$client" ] && [ "$client" != "$MODE" ]; then
+                conflicts="${conflicts:+$conflicts/}$client:$pid"
+            fi
+        done <<< "$processes"
+        [ -z "$conflicts" ] || guard_reason "多代理=$conflicts"
+    else
+        HEALTH_ERROR=1
+        guard_reason '代理进程核验失败'
+    fi
+    if [ "$MODE" = "shadowrocket" ]; then
+        # If launchd cannot see the VPN row, retain the existing TUN fallback.
         nc=$(scutil --nc list 2>/dev/null)
-        if echo "$nc" | grep -q 'com.liguangming.Shadowrocket'; then
-            echo "$nc" | grep 'com.liguangming.Shadowrocket' | grep -q '(Connected)' || ok=0
-        fi ;;
-    sing-box)
-        pgrep -f sing-box >/dev/null 2>&1 || ok=0 ;;
-    clashx)
-        clashx_alive || ok=0 ;;
-    surge)
-        pgrep -f Surge >/dev/null 2>&1 || ok=0 ;;
-    auto)
-        : ;;  # auto 模式只查 TUN
-    *)
-        pgrep -f verge-mihomo >/dev/null 2>&1 || ok=0 ;;
-esac
-
-# 多客户端冲突判定:若除当前 MODE 外同时运行了其他代理客户端,同样触发保护关闭 Claude
-case "$HOME_DIR" in
-    /var/folders/*|/private/var/folders/*|/tmp/*|/private/tmp/*) ;;
-    *)
-        if [ "$MODE" != "auto" ]; then
-            [ "$MODE" != "tag" ] && tag_alive && ok=0
-            [ "$MODE" != "clash-verge" ] && pgrep -f verge-mihomo >/dev/null 2>&1 && ok=0
-            [ "$MODE" != "flclash" ] && { pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; } && ok=0
-            [ "$MODE" != "bettbox" ] && { pgrep -f BettboxCore >/dev/null 2>&1 || pgrep -x Bettbox >/dev/null 2>&1; } && ok=0
-            [ "$MODE" != "sing-box" ] && pgrep -f sing-box >/dev/null 2>&1 && ok=0
-            [ "$MODE" != "clashx" ] && clashx_alive && ok=0
-            [ "$MODE" != "surge" ] && pgrep -f Surge >/dev/null 2>&1 && ok=0
+        if printf '%s\n' "$nc" | grep -q 'com.liguangming.Shadowrocket'; then
+            printf '%s\n' "$nc" | grep 'com.liguangming.Shadowrocket' | grep -q '(Connected)' ||
+                guard_reason 'Shadowrocket未连接'
         fi
-        ;;
-esac
+    fi
+fi
 
-# Claude Code CLI 进程: native claude/claude.exe 与 npm/bun 的 @anthropic-ai/claude-code。
-# 过滤思路与 core/claude-switch.sh 的 cli_pids 一致: 先按安装用户 UID 圈定,再看进程名/CLI 入口参数。
-cli_pids() {
-    local processes
-    [ -n "$INSTALL_UID" ] || return 0
-    processes=$(ps -axo pid=,uid=,comm=,args=) || return 1
-    printf '%s\n' "$processes" | awk -v uid="$INSTALL_UID" '
-        $2 == uid && ($3 ~ /(^|\/)(claude|claude\.exe)$/ ||
-        ($3 ~ /(^|\/)(node|bun)$/ && $5 ~ /(^|\/)@anthropic-ai\/claude-code\/(bin\/claude(\.exe)?|cli\.js)$/)) { print $1 }'
+# A fresh kernel path snapshot identifies actual targets. Only Node/Bun needs
+# the command line, to match the existing Claude Code package entry point.
+guard_targets() {
+    local rows paths
+    rows=$(ps -axww -o pid=,uid=,args= 2>/dev/null) || return 1
+    paths=$(macos_process_paths 2>/dev/null) || return 1
+    { printf '%s\n' "$paths"; printf '%s\n' '--'; printf '%s\n' "$rows"; } |
+        awk -v uid="$INSTALL_UID" '
+            $0 == "--" { args = 1; next }
+            !args {
+                tab = index($0, "\t")
+                if (tab) paths[substr($0, 1, tab - 1)] = substr($0, tab + 1)
+                next
+            }
+            $1 ~ /^[1-9][0-9]*$/ && $2 == uid && ($1 in paths) {
+                path = paths[$1]
+                name = path; sub(/^.*\//, "", name)
+                if (path == "/Applications/Claude.app/Contents/MacOS/Claude")
+                    printf "Claude\t%s\n", $1
+                else if (name == "claude" || name == "claude.exe" ||
+                         ((name == "node" || name == "bun") &&
+                          $4 ~ /(^|\/)@anthropic-ai\/claude-code\/(bin\/claude(\.exe)?|cli\.js)$/))
+                    printf "Claude Code CLI\t%s\n", $1
+            }'
 }
 
-if [ "$ok" -eq 0 ]; then
-    if pgrep -f '/Applications/Claude.app/Contents/MacOS/Claude' >/dev/null 2>&1; then
-        if pkill -f '/Applications/Claude.app/Contents/MacOS/Claude'; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 代理离线(内核或TUN丢失),已自动关闭 Claude" >>"$LOG"
-        else
-            HEALTH_ERROR=1
-        fi
-    fi
-    pids=$(cli_pids) || HEALTH_ERROR=1
-    if [ -n "$pids" ]; then
-        if kill -TERM $pids 2>/dev/null; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 代理离线(内核或TUN丢失),已自动关闭 Claude Code CLI" >>"$LOG"
-        else
-            HEALTH_ERROR=1
-        fi
-    fi
+if [ -n "$reasons" ]; then
+    case "$INSTALL_UID" in
+        ''|*[!0-9]*) ;;
+        *)
+            if targets=$(guard_targets); then
+                while IFS=$'\t' read -r target pid; do
+                    [ -n "$pid" ] || continue
+                    # Do not signal a vanished process or a different user's PID.
+                    owner=$(ps -p "$pid" -o uid= 2>/dev/null) || continue
+                    [ "${owner//[[:space:]]/}" = "$INSTALL_UID" ] || continue
+                    if kill -TERM "$pid" 2>/dev/null; then
+                        result='已发送终止信号'
+                    else
+                        HEALTH_ERROR=1
+                        result='发送失败'
+                    fi
+                    printf '%s 保镖处置(%s),目标=%s,pid=%s,结果=%s\n' \
+                        "$(date '+%Y-%m-%d %H:%M:%S')" "$reasons" "$target" "$pid" "$result" >>"$LOG" ||
+                        HEALTH_ERROR=1
+                done <<< "$targets"
+            else
+                HEALTH_ERROR=1
+            fi
+            ;;
+    esac
 fi
 [ "$HEALTH_ERROR" -eq 0 ] || exit 1
 exit 0

@@ -1519,7 +1519,7 @@ case "${1:-}" in
         ;;
 esac
 case "${1:-}" in
-    get-tool-config|set-keep-paths|network-rebuild) ;;  # 工具配置与网络重建不初始化账号目录。
+    detect-client|get-tool-config|set-keep-paths|network-rebuild) ;;  # 状态探测不初始化账号目录。
     *) mkdir -p "$BASE/accounts" ;;
 esac
 
@@ -1607,7 +1607,7 @@ tun_up() { [ "$(tun_count)" -eq 1 ]; }
 
 # 代理客户端显示名(供检查细节输出)
 proxy_name() {
-    case "$PROXY_MODE" in
+    case "${1:-$PROXY_MODE}" in
         tag)          echo "TAG" ;;
         clash-verge)  echo "Clash Verge" ;;
         flclash)      echo "FlClash" ;;
@@ -1617,7 +1617,7 @@ proxy_name() {
         clashx)       echo "ClashX" ;;
         surge)        echo "Surge" ;;
         auto)         echo "代理客户端" ;;
-        *)            echo "$PROXY_MODE" ;;
+        *)            echo "${1:-$PROXY_MODE}" ;;
     esac
 }
 
@@ -1645,104 +1645,99 @@ shadowrocket_up() {
     fi
 }
 
-# TAG 内核可能由特权服务启动；核验进程真实可执行文件，避免命令行冒名。
-tag_alive() {
-    local pid executable
-    while IFS= read -r pid; do
-        case "$pid" in ''|*[!0-9]*) continue ;; esac
-        executable=$(ps -p "$pid" -o comm= 2>/dev/null | sed 's/^[[:space:]]*//')
-        [ "$executable" = "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin" ] && return 0
-    done < <(pgrep -f '/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin' 2>/dev/null)
-    return 1
+# Keep the process probe and classifier in sync with daemons/claude-bodyguard.sh.
+# macOS ps comm can report argv[0]. Use the kernel's executable path instead.
+macos_process_paths() {
+    /usr/bin/python3 -I -S -B - <<'PY'
+import ctypes
+import sys
+
+lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+lib.proc_listallpids.argtypes = (ctypes.c_void_p, ctypes.c_int)
+lib.proc_listallpids.restype = ctypes.c_int
+lib.proc_pidpath.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+lib.proc_pidpath.restype = ctypes.c_int
+count = lib.proc_listallpids(None, 0)
+if count <= 0:
+    sys.exit(1)
+pids = (ctypes.c_int * (count + 256))()
+count = lib.proc_listallpids(pids, ctypes.sizeof(pids))
+if not 0 < count < len(pids):
+    sys.exit(1)
+buf = ctypes.create_string_buffer(4096)
+readable = False
+for pid in pids[:count]:
+    if pid <= 0 or lib.proc_pidpath(pid, buf, len(buf)) <= 0:
+        continue
+    path = buf.value
+    if path.startswith(b"/") and not any(c in path for c in (b"\t", b"\r", b"\n")):
+        sys.stdout.buffer.write(str(pid).encode() + b"\t" + path + b"\n")
+        readable = True
+sys.exit(0 if readable else 1)
+PY
 }
 
-# ClashX / ClashX Pro / ClashX Meta 的主可执行文件都在 .../Contents/MacOS/ClashX。
-# 只按 -x ClashX 会漏掉 Pro/Meta，按小写 "clash" 又匹配不到大写主进程。
-clashx_alive() {
-    pgrep -f '/Contents/MacOS/ClashX' >/dev/null 2>&1 \
-        || pgrep -x ClashX >/dev/null 2>&1 \
-        || pgrep -x 'ClashX Pro' >/dev/null 2>&1 \
-        || pgrep -x 'ClashX Meta' >/dev/null 2>&1
+proxy_processes() {
+    local paths
+    paths=$(macos_process_paths 2>/dev/null) || return 1
+    printf '%s\n' "$paths" | awk -F '\t' '
+        NF == 2 && $1 ~ /^[1-9][0-9]*$/ && $2 ~ /^\// {
+            name = $2; sub(/^.*\//, "", name)
+            if ($2 == "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin") mode = "tag"
+            else if (name ~ /^verge-mihomo(-[[:alnum:]_.-]+)?$/) mode = "clash-verge"
+            else if (name == "FlClashCore" || name == "FlClash") mode = "flclash"
+            else if (name == "BettboxCore" || name == "Bettbox") mode = "bettbox"
+            else if (name == "sing-box") mode = "sing-box"
+            else if (name ~ /^ClashX( Pro| Meta)?$/) mode = "clashx"
+            else if (name == "Surge" || $2 ~ /\/Surge[.]app\/Contents\//) mode = "surge"
+            else next
+            printf "%s\t%s\n", mode, $1
+        }'
+}
+
+proxy_seen() {
+    [[ $'\n'$1 == *$'\n'"$2"$'\t'* ]]
 }
 
 # 代理内核在线判定:按安装时识别的客户端分派;auto 时任一命中即活
 proxy_alive() {
+    [ "$PROXY_MODE" != "shadowrocket" ] || { shadowrocket_up; return; }
+    local processes="${1-}"
+    [ "$#" -gt 0 ] || processes=$(proxy_processes) || return 1
     case "$PROXY_MODE" in
-        tag)          tag_alive ;;
-        clash-verge)  pgrep -f verge-mihomo >/dev/null 2>&1 ;;
-        flclash)      pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1 ;;
-        bettbox)      pgrep -f BettboxCore >/dev/null 2>&1 || pgrep -x Bettbox >/dev/null 2>&1 ;;
-        shadowrocket) shadowrocket_up ;;
-        sing-box)     pgrep -f sing-box >/dev/null 2>&1 ;;
-        clashx)       clashx_alive ;;
-        surge)        pgrep -f Surge >/dev/null 2>&1 ;;
-        auto)         tag_alive || pgrep -f verge-mihomo >/dev/null 2>&1 \
-                      || pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1 \
-                      || shadowrocket_up \
-                      || pgrep -f sing-box >/dev/null 2>&1 \
-                      || pgrep -f BettboxCore >/dev/null 2>&1 || pgrep -x Bettbox >/dev/null 2>&1 \
-                      || clashx_alive \
-                      || pgrep -f Surge >/dev/null 2>&1 ;;
-        *)            pgrep -f verge-mihomo >/dev/null 2>&1 ;;
+        tag|clash-verge|flclash|bettbox|sing-box|clashx|surge) proxy_seen "$processes" "$PROXY_MODE" ;;
+        auto) [ -n "$processes" ] || shadowrocket_up ;;
+        *) proxy_seen "$processes" clash-verge ;;
     esac
 }
 
 # 只读探测除当前配置客户端外,系统中是否还有其他代理客户端在运行(绝不自动修改 PROXY_MODE)
 detect_other_clients() {
-    case "$HOME" in
-        /var/folders/*|/private/var/folders/*|/tmp/*|/private/tmp/*) return 0 ;;
-    esac
     [ "$PROXY_MODE" = "auto" ] && return 0
-    local list=""
-    if [ "$PROXY_MODE" != "tag" ] && tag_alive; then
-        list="${list:+$list/}TAG"
-    fi
-    if [ "$PROXY_MODE" != "clash-verge" ] && pgrep -f verge-mihomo >/dev/null 2>&1; then
-        list="${list:+$list/}Clash Verge"
-    fi
-    if [ "$PROXY_MODE" != "flclash" ] && { pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; }; then
-        list="${list:+$list/}FlClash"
-    fi
-    if [ "$PROXY_MODE" != "bettbox" ] && { pgrep -f BettboxCore >/dev/null 2>&1 || pgrep -x Bettbox >/dev/null 2>&1; }; then
-        list="${list:+$list/}Bettbox"
-    fi
-    if [ "$PROXY_MODE" != "sing-box" ] && pgrep -f sing-box >/dev/null 2>&1; then
-        list="${list:+$list/}sing-box"
-    fi
-    if [ "$PROXY_MODE" != "clashx" ] && clashx_alive; then
-        list="${list:+$list/}ClashX"
-    fi
-    if [ "$PROXY_MODE" != "surge" ] && pgrep -f Surge >/dev/null 2>&1; then
-        list="${list:+$list/}Surge"
-    fi
-    echo "$list"
+    local processes="${1-}" list="" mode
+    [ "$#" -gt 0 ] || processes=$(proxy_processes) || return 1
+    for mode in tag clash-verge flclash bettbox sing-box clashx surge; do
+        if [ "$mode" != "$PROXY_MODE" ] && proxy_seen "$processes" "$mode"; then
+            list="${list:+$list/}$(proxy_name "$mode")"
+        fi
+    done
+    printf '%s\n' "$list"
 }
 
 detect_client_state() {
-    local alive=0 tcnt others pids log="$HOME/Library/Logs/claude-bodyguard.log"
-    proxy_alive && alive=1
+    local alive=0 tcnt others="" processes probe_error=0
+    if processes=$(proxy_processes); then
+        proxy_alive "$processes" && alive=1
+        others=$(detect_other_clients "$processes")
+    else
+        probe_error=1
+    fi
     tcnt=$(tun_count)
-    others=$(detect_other_clients)
-    case "$HOME" in
-        /var/folders/*|/private/var/folders/*|/tmp/*|/private/tmp/*) ;;
-        *)
-            if [ "$alive" -eq 0 ] || [ "$tcnt" -ne 1 ] || [ -n "$others" ]; then
-                if pgrep -f '/Applications/Claude.app/Contents/MacOS/Claude' >/dev/null 2>&1; then
-                    pkill -f '/Applications/Claude.app/Contents/MacOS/Claude' 2>/dev/null || true
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到代理/TUN状态变化(alive=$alive,tun=$tcnt,others=${others:-none}),已自动关闭 Claude" >>"$log"
-                fi
-                pids=$(cli_pids)
-                if [ -n "$pids" ]; then
-                    kill -TERM $pids 2>/dev/null || true
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到代理/TUN状态变化(alive=$alive,tun=$tcnt,others=${others:-none}),已自动关闭 Claude Code CLI" >>"$log"
-                fi
-            fi
-            ;;
-    esac
     echo "configured=$PROXY_MODE"
     echo "alive=$alive"
     echo "tun_count=$tcnt"
     echo "others=${others:-none}"
+    [ "$probe_error" -eq 0 ] || echo "process_probe=error"
 }
 
 # 单文件内嵌 Python 的隔离入口;策略从 WEBRTC_POLICY 或持久化文件读取。
@@ -1920,12 +1915,16 @@ check() {
     load_check_config || { echo "FAIL:检查配置无效，请恢复默认设置"; return 1; }
     fails=""
 
-    local others tcnt
-    others=$(detect_other_clients)
-    if ! proxy_alive; then
-        fails="$fails;代理内核未运行${others:+(检测到 $others 运行中)}"
-    elif [ -n "$others" ]; then
-        fails="$fails;检测到多个代理客户端同时运行($(proxy_name) 与 $others)"
+    local others tcnt processes
+    if ! processes=$(proxy_processes); then
+        fails="$fails;无法核验代理进程"
+    else
+        others=$(detect_other_clients "$processes")
+        if ! proxy_alive "$processes"; then
+            fails="$fails;代理内核未运行${others:+(检测到 $others 运行中)}"
+        elif [ -n "$others" ]; then
+            fails="$fails;检测到多个代理客户端同时运行($(proxy_name) 与 $others)"
+        fi
     fi
     tcnt=$(tun_count)
     if [ "$tcnt" -gt 1 ]; then
@@ -2185,6 +2184,10 @@ bodyguard_last_event() {
     timestamp=$(printf '%s\n' "$line" | sed -n 's/^\([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\) .*/\1/p')
     [ -n "$timestamp" ] || return 0
     case "$line" in
+        *" 保镖处置("*",结果=已发送终止信号")
+            printf '#保镖事件=%s 检测到保护异常，已发送终止信号\n' "$timestamp" ;;
+        *" 保镖处置("*",结果=发送失败")
+            printf '#保镖事件=%s 检测到保护异常，终止信号发送失败\n' "$timestamp" ;;
         *"代理离线(内核或TUN丢失),已自动关闭 Claude"*|*"检测到代理/TUN状态变化("*"已自动关闭 Claude"*)
             printf '#保镖事件=%s 检测到代理或TUN异常，执行关闭保护\n' "$timestamp" ;;
     esac
@@ -2210,19 +2213,21 @@ ASEOF
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
 checkdetail() {
     load_check_config || { echo "检查配置无效，请恢复默认设置"; return 1; }
-    local others tcnt
-    others=$(detect_other_clients)
-    if proxy_alive; then
-        if [ -n "$others" ]; then
-            echo "代理内核=fail:检测到多个代理软件同时运行($(proxy_name) 与 $others,请彻底退出多余软件)"
-        else
-            case "$PROXY_MODE" in
-                shadowrocket) echo '代理内核=ok:Shadowrocket 已连接' ;;
-                *) echo "代理内核=ok:$(proxy_name) 运行中" ;;
-            esac
-        fi
+    local others tcnt processes
+    if ! processes=$(proxy_processes); then
+        echo '代理内核=fail:无法核验代理进程'
     else
-        if [ -n "$others" ]; then
+        others=$(detect_other_clients "$processes")
+        if proxy_alive "$processes"; then
+            if [ -n "$others" ]; then
+                echo "代理内核=fail:检测到多个代理软件同时运行($(proxy_name) 与 $others,请彻底退出多余软件)"
+            else
+                case "$PROXY_MODE" in
+                    shadowrocket) echo '代理内核=ok:Shadowrocket 已连接' ;;
+                    *) echo "代理内核=ok:$(proxy_name) 运行中" ;;
+                esac
+            fi
+        elif [ -n "$others" ]; then
             echo "代理内核=fail:$(proxy_name) 未运行(检测到 $others 运行中,请手动切换客户端或启动 $(proxy_name))"
         else
             echo "代理内核=fail:$(proxy_name) 未运行"
@@ -2358,14 +2363,14 @@ fix_flclash() {
     local dir="$HOME/Library/Application Support/com.follow.clash"
     local result backup trace ip wr i
     [ -d "$dir" ] || { echo "FIX:FlClash 配置目录不存在，无法自动修复"; return 1; }
-    if pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; then
+    if proxy_alive; then
         osascript -e 'tell application "FlClash" to quit' >/dev/null 2>&1
         for i in $(seq 1 15); do
-            pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1 || break
+            proxy_alive || break
             sleep 1
         done
     fi
-    if pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; then
+    if proxy_alive; then
         echo "FIX:FlClash 未能退出，请手动退出后重试"
         return 1
     fi
@@ -2393,7 +2398,7 @@ fix_flclash() {
     fi
     osascript -e 'tell application "FlClash" to quit' >/dev/null 2>&1
     for i in $(seq 1 15); do
-        pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1 || break
+        proxy_alive || break
         sleep 1
     done
     local rollback_result
@@ -2424,15 +2429,15 @@ fix() {
 
     # A. 代理内核 + TUN
     if [ "$PROXY_MODE" = "clash-verge" ]; then
-        if ! pgrep -f verge-mihomo >/dev/null 2>&1; then
+        if ! proxy_alive; then
             echo "FIX:正在启动 Clash Verge..."
             open -a "Clash Verge"
         fi
         for i in $(seq 1 40); do
-            pgrep -f verge-mihomo >/dev/null 2>&1 && tun_up && break
+            proxy_alive && tun_up && break
             sleep 1
         done
-        if pgrep -f verge-mihomo >/dev/null 2>&1 && tun_up; then
+        if proxy_alive && tun_up; then
             echo "FIX:代理内核+TUN ✓"
         else
             V="$CLASH_DIR/verge.yaml"
@@ -2447,7 +2452,7 @@ fix() {
                     sleep 1
                 done
             fi
-            if pgrep -f verge-mihomo >/dev/null 2>&1 && tun_up; then
+            if proxy_alive && tun_up; then
                 echo "FIX:代理内核+TUN ✓(已恢复TUN开关)"
             else
                 echo "FIX:代理内核/TUN ✗(请打开 Clash Verge 检查节点/线路)"

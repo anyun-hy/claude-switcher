@@ -11,6 +11,7 @@ import time
 import unittest
 import zipfile
 
+from macos_process_fixture import with_process_paths
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "core/claude-switch.sh"
@@ -27,17 +28,20 @@ class OptionalLoggingTests(unittest.TestCase):
         self.base = self.home / ".claude-switcher"
         self.base.mkdir()
         self.settings = self.base / "checks.json"
+        self.process_paths = self.home.parent / "process-paths"
+        self.process_paths.touch()
         self.core = Path(self.tmp.name) / "claude-switch.sh"
         text = SOURCE.read_text(encoding="utf-8")
         text = text.replace('PROXY_MODE="clash-verge"', 'PROXY_MODE="sing-box"', 1)
-        self.core.write_text(text, encoding="utf-8")
+        self.core.write_text(with_process_paths(text), encoding="utf-8")
         self.core.chmod(0o755)
         self.bin = Path(self.tmp.name) / "bin"
         self.bin.mkdir()
         self.calls = Path(self.tmp.name) / "calls"
         self.env = dict(os.environ, HOME=str(self.home),
                         PATH=str(self.bin) + ":/usr/bin:/bin:/usr/sbin:/sbin",
-                        CLAUDE_SWITCHER_PYTHON=sys.executable, PYTHONUTF8="1")
+                        CLAUDE_SWITCHER_PYTHON=sys.executable, PYTHONUTF8="1",
+                        TEST_PROCESS_PATHS=str(self.process_paths))
         # Non-interactive shell startup files can override PATH and bypass stubs.
         self.env.pop("BASH_ENV", None)
         self.env.pop("ENV", None)
@@ -57,7 +61,7 @@ class OptionalLoggingTests(unittest.TestCase):
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
     def prepare_checkdetail(self):
-        self.stub("pgrep", "exit 0")
+        self.process_paths.write_text("321\t/usr/local/bin/sing-box\n")
         self.stub("ifconfig", "echo 'inet 198.18.0.1'")
         self.stub("curl", '''case "$*" in
   *cdn-cgi/trace*) printf 'ip=203.0.113.10\\nloc=US\\n' ;;
@@ -70,7 +74,7 @@ esac''')
         self.stub("networksetup", "echo 'IPv6: Off'")
         self.stub("python3", "echo RESULT:203.0.113.10")
         self.stub("launchctl", "exit 1")
-        names = ("pgrep", "ifconfig", "curl", "dig", "readlink", "defaults",
+        names = ("ifconfig", "curl", "dig", "readlink", "defaults",
                  "networksetup", "python3", "launchctl")
         probe = subprocess.run(
             ["/bin/bash", "-c", 'for name in "$@"; do command -v "$name"; done', "probe", *names],
@@ -227,7 +231,7 @@ esac''')
     def test_hard_security_failures_remain_blocking_when_optional_failures_allowed(self):
         self.prepare_checkdetail()
         self.write_settings({"allowOptionalFailures": True, "logging": True})
-        self.stub("pgrep", "exit 1")
+        self.process_paths.write_text("")
         self.stub("ifconfig", "printf ''")
         self.stub("curl", "printf 'ip=203.0.113.10\\nloc=CN\\n'")
         run = subprocess.run(["/bin/bash", str(self.core), "checkdetail"],

@@ -7,19 +7,13 @@ import sys
 import tempfile
 import unittest
 
+from macos_process_fixture import shell_function as function, with_process_paths
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "core/claude-switch.sh"
 GUARD = ROOT / "daemons/claude-bodyguard.sh"
 INSTALLER = ROOT / "installer/安装.command"
 TAG_EXE = "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin"
-
-
-def function(text, name):
-    result = re.search(r"(?ms)^" + re.escape(name) + r"\(\) \{\n.*?^\}", text)
-    if not result:
-        raise AssertionError("missing function " + name)
-    return result.group(0)
 
 
 class TagAdapterTests(unittest.TestCase):
@@ -56,25 +50,30 @@ class TagAdapterTests(unittest.TestCase):
                               text=True, capture_output=True, timeout=30)
 
     def test_tag_identity_and_auto_mode_require_the_real_executable(self):
-        self.stub("pgrep", '''case "$*" in
-    "-f $TAG_EXE") [ "$FAKE_TAG" = missing ] && exit 1; echo 321 ;;
-    *) exit 1 ;;
-esac''')
-        self.stub("ps", '''case "$FAKE_TAG" in
-            present) echo "$TAG_EXE" ;;
-            spoof) echo /usr/bin/other-process ;;
-            *) exit 1 ;;
-        esac''')
-        text = self.core.read_text(encoding="utf-8")
-        harness = (function(text, "tag_alive") + "\n" + function(text, "clashx_alive") + "\n" + function(text, "proxy_alive")
-                   + '\nshadowrocket_up() { return 1; }\nproxy_alive\n')
+        text = with_process_paths(self.core.read_text(encoding="utf-8"), r'''
+case "$FAKE_TAG" in
+    present) printf '321\t%s\n' "$TAG_EXE" ;;
+    spoof) printf '321\t/tmp/mihomo-universal-tag-darwin\n' ;;
+    missing) printf '321\t/usr/bin/other-process\n' ;;
+    *) return 1 ;;
+esac
+''')
+        harness = "\n".join(function(text, name) for name in (
+            "macos_process_paths", "proxy_processes", "proxy_seen", "proxy_alive"))
+        harness += "\nshadowrocket_up() { return 1; }\nproxy_alive\n"
         for client in ("tag", "auto"):
             for mode, expected in (("present", 0), ("missing", 1), ("spoof", 1), ("error", 1)):
                 with self.subTest(client=client, mode=mode):
                     env = dict(self.env, FAKE_TAG=mode, TAG_EXE=TAG_EXE, PROXY_MODE=client)
-                    run = subprocess.run(["/bin/bash", "-c", harness], env=env,
+                    run = subprocess.run(["/bin/bash"], input=harness, env=env,
                                          text=True, capture_output=True, timeout=5)
                     self.assertEqual(run.returncode, expected, run.stdout + run.stderr)
+
+    def test_core_and_guard_use_the_same_process_identity_rules(self):
+        core = SOURCE.read_text(encoding="utf-8")
+        guard = GUARD.read_text(encoding="utf-8")
+        for name in ("macos_process_paths", "proxy_processes", "proxy_seen"):
+            self.assertEqual(function(core, name), function(guard, name))
 
     def test_client_discovery_reports_tag(self):
         run = self.run_core("get-client")
@@ -119,31 +118,36 @@ printf 'state = not running\\nruns = %s\\nlast exit code = 0\\n' "$n"''')
         self.env.update(FAKE_TAG="present", FAKE_TUN="up", TAG_EXE=TAG_EXE,
                         KILL_MARKER=str(marker))
         self.stub("ifconfig", 'if [ "$FAKE_TUN" = up ]; then echo "inet 198.18.0.1"; fi')
-        self.stub("pgrep", '''case "$*" in
-    *mihomo-universal-tag-darwin*) [ "$FAKE_TAG" = missing ] && exit 1; echo 321 ;;
-    *Claude.app*) echo 654 ;;
-    *) exit 1 ;;
+        self.stub("id", "echo 501")
+        self.stub("ps", '''case "$1" in
+    -p) echo 501 ;;
+    *) echo '654 501 Claude' ;;
 esac''')
-        self.stub("ps", '''[ "$1" = -axo ] && exit 0
-case "$FAKE_TAG" in
-    present) echo "$TAG_EXE" ;;
-    spoof) echo /usr/bin/other-process ;;
-    *) exit 1 ;;
-esac''')
-        self.stub("pkill", 'printf called > "$KILL_MARKER"')
+        self.stub("kill", 'printf "%s\n" "$*" > "$KILL_MARKER"')
+        self.stub("pkill", 'printf unexpected > "$KILL_MARKER"; exit 99')
         guard = self.root / "guard.sh"
-        guard.write_text(GUARD.read_text(encoding="utf-8").replace("__HOME__", str(self.home))
-                         .replace("__PROXY_MODE__", "tag"), encoding="utf-8")
+        source = with_process_paths(GUARD.read_text(encoding="utf-8"), r'''
+case "$FAKE_TAG" in
+    present) printf '321\t%s\n' "$TAG_EXE" ;;
+    spoof) printf '321\t/tmp/mihomo-universal-tag-darwin\n' ;;
+esac
+printf '654\t/Applications/Claude.app/Contents/MacOS/Claude\n'
+''')
+        guard.write_text(source.replace("__HOME__", str(self.home)).replace("__PROXY_MODE__", "tag"),
+                         encoding="utf-8")
         for mode, tun, should_close in (("present", "up", False), ("missing", "up", True),
                                         ("spoof", "up", True), ("present", "down", True)):
             with self.subTest(mode=mode, tun=tun):
                 if marker.exists():
                     marker.unlink()
                 env = dict(self.env, FAKE_TAG=mode, FAKE_TUN=tun)
-                run = subprocess.run(["/bin/bash", str(guard)], env=env, text=True,
+                run = subprocess.run(["/bin/bash", "-c", 'enable -n kill || exit 1; . "$1"',
+                                      "guard", str(guard)], env=env, text=True,
                                      capture_output=True, timeout=5)
                 self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
                 self.assertEqual(marker.exists(), should_close)
+                if should_close:
+                    self.assertEqual(marker.read_text(), "-TERM 654\n")
 
     def test_installer_recognizes_only_a_real_tag_process_and_accepts_manual_tag(self):
         self.stub("pgrep", '[ "$FAKE_TAG" = missing ] && exit 1; echo 321')
@@ -163,12 +167,15 @@ esac''')
         clash.mkdir(parents=True)
         for mode, expected in (("present", "tag"), ("spoof", "clash-verge")):
             with self.subTest(mode=mode):
-                run = subprocess.run(["/bin/bash", "-c", code], env=dict(env, FAKE_TAG=mode),
+                run = subprocess.run(["/bin/bash"], input=code, env=dict(env, FAKE_TAG=mode),
                                      text=True, capture_output=True, timeout=5)
                 self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
                 self.assertIn("selected=" + expected, run.stdout)
         clash.rmdir()
-        run = subprocess.run(["/bin/bash", "-c", code], env=dict(env, FAKE_TAG="missing"),
+        # Read the harness from a file so its prompt can use stdin.
+        fixture = self.root / "installer-detection.sh"
+        fixture.write_text(code, encoding="utf-8")
+        run = subprocess.run(["/bin/bash", str(fixture)], env=dict(env, FAKE_TAG="missing"),
                              input="8\n", text=True, capture_output=True, timeout=5)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("selected=tag", run.stdout)

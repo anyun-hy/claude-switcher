@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 
+from macos_process_fixture import with_process_paths
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "core" / "claude-switch.sh"
@@ -135,9 +136,13 @@ class FlClashRepairTests(unittest.TestCase):
         home_dir = self.home.parents[2]
         core = home_dir / ".local/bin/claude-switch.sh"
         core.parent.mkdir(parents=True)
-        core.write_text(SCRIPT.read_text(encoding="utf-8").replace(
-            'PROXY_MODE="clash-verge"', 'PROXY_MODE="flclash"', 1
-        ), encoding="utf-8")
+        source = SCRIPT.read_text(encoding="utf-8").replace(
+            'PROXY_MODE="clash-verge"', 'PROXY_MODE="flclash"', 1)
+        core.write_text(with_process_paths(source, r'''
+if [ -f "$FLCLASH_TEST_STATE" ]; then
+    printf '321\t/usr/local/bin/FlClashCore\n'
+fi
+'''), encoding="utf-8")
         core.chmod(0o700)
         (home_dir / ".claude-switcher").mkdir()
         fake_bin = home_dir / "bin"
@@ -146,7 +151,6 @@ class FlClashRepairTests(unittest.TestCase):
         scripts = {
             "open": "#!/bin/sh\ntouch \"$FLCLASH_TEST_STATE\"\nexit 0\n",
             "osascript": "#!/bin/sh\nrm -f \"$FLCLASH_TEST_STATE\"\nexit 0\n",
-            "pgrep": "#!/bin/sh\nif [ -f \"$FLCLASH_TEST_STATE\" ]; then exit 0; else exit 1; fi\n",
             "ifconfig": "#!/bin/sh\necho 'inet 198.18.0.1'\n",
             "dig": "#!/bin/sh\necho '198.18.0.2'\n",
             "networksetup": "#!/bin/sh\necho 'IPv6: Off'\n",
