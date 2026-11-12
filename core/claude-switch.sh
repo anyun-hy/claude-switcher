@@ -554,7 +554,7 @@ def parse_address(value):
         return None
 
 
-def observe_ip(now):
+def observe_ip(now, include_previous):
     # stdin carries the embedded Python; the private sample arrives on fd 3.
     with os.fdopen(3, encoding="utf-8") as sample:
         current = parse_address(sample.read(80).strip())
@@ -595,7 +595,7 @@ def observe_ip(now):
         last_change = None
         for (old, _), (addr, timestamp) in zip(samples, samples[1:]):
             if addr != old:
-                last_change = timestamp
+                last_change = (old, timestamp)
         first_recent = next(i for i, (_, timestamp) in enumerate(samples) if timestamp > cutoff)
         # The predecessor is needed to recognize a change just inside the window.
         keep = samples[max(0, first_recent - 1):]
@@ -610,9 +610,11 @@ def observe_ip(now):
         previous.seek(0)
         previous.write(f"{current}\n")
         previous.truncate()
-    if last_change is not None and last_change > cutoff:
-        changed_at = datetime.datetime.fromtimestamp(last_change).strftime("%m-%d %H:%M:%S")
-        print(f"warn:48小时内出口IP有变化（最近：{changed_at}）")
+    if last_change is not None and last_change[1] > cutoff:
+        previous_ip, timestamp = last_change
+        changed_at = datetime.datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M:%S")
+        previous_detail = f"变化前 IP：{previous_ip}；" if include_previous else ""
+        print(f"warn:48小时内出口IP有变化（{previous_detail}最近：{changed_at}）")
     else:
         print("ok:首次记录" if first else "ok:与上次一致")
 
@@ -748,9 +750,10 @@ def main(args):
     if not args:
         fail()
     action = args[0]
-    if action == "observe-ip" and len(args) == 2 and re.fullmatch(r"[0-9]{1,12}", args[1]):
+    if (action == "observe-ip" and len(args) == 3 and re.fullmatch(r"[0-9]{1,12}", args[1])
+            and args[2] in ("summary", "detail")):
         try:
-            observe_ip(int(args[1]))
+            observe_ip(int(args[1]), args[2] == "detail")
         except (OSError, ValueError, OverflowError):
             fail()
     elif action == "config" and len(args) == 1:
@@ -1982,7 +1985,7 @@ ip_consistency() {
         echo 'fail:未获取到出口IP'
         return
     fi
-    "$0" _support observe-ip "$(date +%s)" 3<<<"$1" || echo 'fail:无法核验出口IP历史'
+    "$0" _support observe-ip "$(date +%s)" "${2:-summary}" 3<<<"$1" || echo 'fail:无法核验出口IP历史'
 }
 
 # ---------- 安全检查 ----------
@@ -2317,7 +2320,7 @@ checkdetail() {
     if check_disabled "IP一致"; then
         optional_result "IP一致" ok
     else
-        ip_state=$(ip_consistency "$ip")
+        ip_state=$(ip_consistency "$ip" detail)
         optional_result "IP一致" "${ip_state%%:*}" "${ip_state#*:}"
     fi
     tz=$(readlink /etc/localtime 2>/dev/null)

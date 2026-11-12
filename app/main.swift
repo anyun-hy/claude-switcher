@@ -1279,6 +1279,7 @@ struct ContentView: View {
             }.padding(.horizontal, 16).padding(.vertical, 10)
             Divider().overlay(ClaudeTheme.divider)
             ForEach(Array(vm.rows.enumerated()), id: \.element.id) { index, row in
+                let wrapsDetail = row.name == "IP 与上次一致" && row.state == .warn
                 HStack(spacing: 12) {
                     Image(systemName: row.icon)
                         .font(.system(size: 13)).foregroundColor(ClaudeTheme.muted)
@@ -1288,7 +1289,8 @@ struct ContentView: View {
                     Text(row.detail.isEmpty ? "—" : row.detail)
                         .font(.system(size: 12))
                         .foregroundColor(row.state == .warn ? ClaudeTheme.warning : ClaudeTheme.muted)
-                        .lineLimit(1).truncationMode(.middle)
+                        .lineLimit(wrapsDetail ? nil : 1).truncationMode(.middle)
+                        .fixedSize(horizontal: false, vertical: wrapsDetail)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .help(row.name == "保镖在线" && !vm.guardLastEvent.isEmpty
                               ? row.detail + "\n上次保护事件：" + vm.guardLastEvent : row.detail)
@@ -1297,7 +1299,9 @@ struct ContentView: View {
                         .foregroundColor(row.state.color)
                         .frame(width: 62, alignment: .leading)
                 }
-                .padding(.horizontal, 16).frame(minHeight: 31)
+                .padding(.horizontal, 16)
+                .padding(.vertical, wrapsDetail ? 4 : 0)
+                .frame(minHeight: 31)
                 .accessibilityElement(children: .combine)
                 if index < vm.rows.count - 1 {
                     Divider().overlay(ClaudeTheme.divider).padding(.leading, 48)

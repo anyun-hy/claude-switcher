@@ -160,8 +160,7 @@ esac''')
         lines = run.stdout.splitlines()
         self.assertIn("TUN网卡=fail:不在线", lines)
         ip_row = next(line for line in lines if line.startswith("IP一致="))
-        self.assertTrue(ip_row.startswith("IP一致=warn:48小时内出口IP有变化（最近："), ip_row)
-        self.assertNotIn("192.0.2.1", ip_row)
+        self.assertTrue(ip_row.startswith("IP一致=warn:48小时内出口IP有变化（变化前 IP：192.0.2.1；最近："), ip_row)
         self.assertIn("时区=fail:/var/db/timezone/zoneinfo/Asia/Tokyo", lines)
         self.assertIn("地区=fail:ja_JP", lines)
 
@@ -174,7 +173,8 @@ esac''')
             encoding="utf-8")
         run = self.run_ip_audit("checkdetail", "203.0.113.10", start + 180)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertIn("IP一致=warn:48小时内出口IP有变化（最近：01-01 00:01:00）", run.stdout.splitlines())
+        self.assertIn("IP一致=warn:48小时内出口IP有变化（变化前 IP：192.0.2.1；最近：01-01 00:01:00）",
+                      run.stdout.splitlines())
 
     def test_ip_warning_survives_rechecks_and_return_until_exact_expiry(self):
         self.prepare_ip_timeline()
@@ -200,11 +200,13 @@ esac''')
         window = 48 * 60 * 60
         first_warning = "48小时内出口IP有变化（最近：01-01 00:01:00）"
         return_warning = "48小时内出口IP有变化（最近：01-01 00:03:00）"
+        first_detail = f"IP一致=warn:48小时内出口IP有变化（变化前 IP：{a}；最近：01-01 00:01:00）"
+        return_detail = f"IP一致=warn:48小时内出口IP有变化（变化前 IP：{b}；最近：01-01 00:03:00）"
         self.assertIn("IP一致=ok:首次记录", audit("checkdetail", a, start))
-        self.assertIn("IP一致=warn:" + first_warning, audit("checkdetail", b, first_change))
+        self.assertIn(first_detail, audit("checkdetail", b, first_change))
         self.assertIn("OK:" + b + "|注意:" + first_warning, audit("check", b, start + 120))
-        self.assertIn("IP一致=warn:" + return_warning, audit("checkdetail", a, back))
-        self.assertIn("IP一致=warn:" + return_warning, audit("checkdetail", a, back + window - 2))
+        self.assertIn(return_detail, audit("checkdetail", a, back))
+        self.assertIn(return_detail, audit("checkdetail", a, back + window - 2))
         self.assertIn("OK:" + a + "|注意:" + return_warning, audit("check", a, back + window - 1))
         self.assertIn("IP一致=ok:与上次一致", audit("checkdetail", a, back + window))
 
@@ -300,20 +302,23 @@ esac''')
 
     def test_checkdetail_log_discards_ip_and_other_details(self):
         self.prepare_checkdetail()
+        (self.base / "lastip").write_text("192.0.2.1", encoding="utf-8")
         run = subprocess.run(["/bin/bash", str(self.core), "checkdetail"],
                              text=True, capture_output=True, env=self.env, timeout=10)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         log = (self.home / "Library/Logs/claude-switcher/client.log").read_text(encoding="utf-8")
         self.assertIn("command=checkdetail", log)
         self.assertIn("出口IP=ok", log)
+        self.assertIn("IP一致=warn", log)
         self.assertIn("DNS=ok", log)
-        for detail in ("203.0.113.10", "198.18.0.2", "Example Residential", "走隧道"):
+        for detail in ("192.0.2.1", "203.0.113.10", "198.18.0.2", "Example Residential", "走隧道"):
             self.assertNotIn(detail, log)
 
     def test_diagnostic_export_contains_only_sanitized_allowlisted_files(self):
         self.assertEqual(self.support("log", "checkdetail", "0", "8", "DNS=ok").returncode, 0)
         self.write_settings({"disabled": ["DNS"], "logging": True})
-        (self.base / "last-check.txt").write_text("出口IP=ok:203.0.113.10 token=secret", encoding="utf-8")
+        (self.base / "last-check.txt").write_text(
+            "出口IP=ok:203.0.113.10 token=secret\nIP一致=warn:变化前 IP：192.0.2.1\n", encoding="utf-8")
         (self.base / "lastip").write_text("203.0.113.10", encoding="utf-8")
         (self.base / "accounts").mkdir()
         (self.base / "accounts" / "A").mkdir()
@@ -329,8 +334,9 @@ esac''')
             self.assertNotIn("last-check.txt", names)
             self.assertNotIn("lastip", names)
             self.assertFalse(any("account" in name.lower() or "clash" in name.lower() for name in names))
+            self.assertEqual(json.loads(archive.read("recent-status.json"))["checks"]["IP一致"], "warn")
             payload = b"".join(archive.read(name) for name in names)
-        for secret in (b"203.0.113.10", b"Bearer", b"token", b"session", b"cookie", b"secret"):
+        for secret in (b"192.0.2.1", b"203.0.113.10", b"Bearer", b"token", b"session", b"cookie", b"secret"):
             self.assertNotIn(secret, payload)
 
 

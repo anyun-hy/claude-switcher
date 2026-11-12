@@ -430,10 +430,13 @@ struct MenuBarModelTests {
                 }
                 try render(ContentView(vm: vm).frame(width: 860, height: 620), name: "dashboard-compact", size: NSSize(width: 860, height: 620))
                 var warning = details
-                warning["IP一致"] = "warn:48h 内多个出口记录，建议固定节点"
+                let ipWarning = "48小时内出口IP有变化（变化前 IP：2001:db8:1234:5678:90ab:cdef:1234:5678；最近：11-12 09:30:00）"
+                warning["IP一致"] = "warn:\(ipWarning)"
                 warning["WebRTC"] = "skip:用户已禁用"
                 try f.audit(warning); vm.refresh(); try f.idle(vm)
+                try expect(vm.rows.first(where: { $0.name == "IP 与上次一致" })?.detail == ipWarning, "警告应保留完整变化前 IP 和时间")
                 try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-warning", size: NSSize(width: 1060, height: 760))
+                try render(ContentView(vm: vm).frame(width: 860, height: 620), name: "dashboard-warning-compact", size: NSSize(width: 860, height: 620))
                 warning["DNS"] = "fail:未走隧道，请检查客户端 DNS 配置"
                 try f.audit(warning); vm.refresh(); try f.idle(vm)
                 let clientHeight = NSHostingView(rootView: ContentView(vm: vm).clientCard.frame(width: 292)).fittingSize.height
