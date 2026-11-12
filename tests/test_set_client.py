@@ -333,7 +333,7 @@ proxy_alive() { return 0; }
 tun_count() { echo 1; }
 check_disabled() { return 1; }
 curl() { case "$*" in *cdn-cgi/trace*) printf 'ip=198.51.100.2\nloc=US\n' ;; *) printf '403' ;; esac; }
-iphist_count() { echo 0; }
+ip_consistency() { echo 'ok:与上次一致'; }
 readlink() { echo /var/db/timezone/zoneinfo/America/New_York; }
 defaults() { case "$*" in *AppleLocale*) echo en_US ;; *) echo en-US ;; esac; }
 networksetup() { echo 'IPv6: off'; }
@@ -372,7 +372,7 @@ tun_up() { return 1; }
 tun_count() { echo 2; }
 tun_if() { echo "utun4"; }
 curl() { case "$*" in *cdn-cgi/trace*) printf 'ip=198.51.100.2\nloc=US\n' ;; *) printf '403' ;; esac; }
-iphist_count() { echo 0; }
+ip_consistency() { echo 'ok:与上次一致'; }
 readlink() { echo /var/db/timezone/zoneinfo/America/New_York; }
 defaults() { case "$*" in *AppleLocale*) echo en_US ;; *) echo en-US ;; esac; }
 networksetup() { echo 'IPv6: off'; }

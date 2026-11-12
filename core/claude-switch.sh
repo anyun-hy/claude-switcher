@@ -517,11 +517,14 @@ if [ "${1:-}" = "_support" ]; then
     shift
     exec "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$@" <<'PY_SUPPORT'
 import datetime
+import fcntl
+import ipaddress
 import json
 import os
 from pathlib import Path
 import platform
 import re
+import stat
 import sys
 import tempfile
 import zipfile
@@ -542,6 +545,76 @@ def fail():
 def paths():
     home = Path.home()
     return home / ".claude-switcher", home / "Library/Logs/claude-switcher/client.log"
+
+
+def parse_address(value):
+    try:
+        return ipaddress.ip_address(value)
+    except ValueError:
+        return None
+
+
+def observe_ip(now):
+    # stdin carries the embedded Python; the private sample arrives on fd 3.
+    with os.fdopen(3, encoding="utf-8") as sample:
+        current = parse_address(sample.read(80).strip())
+    if current is None:
+        print("fail:未获取到有效出口IP")
+        return
+    base, _ = paths()
+    history, baseline = base / "iphistory.log", base / "lastip"
+    if base.is_symlink() or history.is_symlink():
+        fail()
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cutoff = now - 48 * 60 * 60
+    # Keep lastip as a compatible baseline and use its existing inode to
+    # serialize observations from the interface and the launch audit.
+    fd = os.open(baseline, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+", encoding="utf-8", errors="replace") as previous:
+        if not stat.S_ISREG(os.fstat(previous.fileno()).st_mode):
+            fail()
+        fcntl.flock(previous, fcntl.LOCK_EX)
+        samples = []
+        try:
+            with history.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    fields = line.split()
+                    if len(fields) == 2 and re.fullmatch(r"[0-9]{1,12}", fields[1]):
+                        addr = parse_address(fields[0])
+                        if addr is not None:
+                            samples.append((addr, int(fields[1])))
+        except FileNotFoundError:
+            pass
+        if not samples:
+            legacy = parse_address(previous.read(80).strip())
+            if legacy is not None:
+                # Older installations may have a baseline but no history.
+                samples.append((legacy, min(now, int(os.fstat(previous.fileno()).st_mtime))))
+        first = not samples
+        samples.append((current, now))
+        last_change = None
+        for (old, _), (addr, timestamp) in zip(samples, samples[1:]):
+            if addr != old:
+                last_change = timestamp
+        first_recent = next(i for i, (_, timestamp) in enumerate(samples) if timestamp > cutoff)
+        # The predecessor is needed to recognize a change just inside the window.
+        keep = samples[max(0, first_recent - 1):]
+        fd, temporary = tempfile.mkstemp(prefix=".iphistory-", dir=base)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.writelines(f"{addr} {timestamp}\n" for addr, timestamp in keep)
+            os.replace(temporary, history)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        previous.seek(0)
+        previous.write(f"{current}\n")
+        previous.truncate()
+    if last_change is not None and last_change > cutoff:
+        changed_at = datetime.datetime.fromtimestamp(last_change).strftime("%m-%d %H:%M:%S")
+        print(f"warn:48小时内出口IP有变化（最近：{changed_at}）")
+    else:
+        print("ok:首次记录" if first else "ok:与上次一致")
 
 
 def validate(value):
@@ -675,7 +748,12 @@ def main(args):
     if not args:
         fail()
     action = args[0]
-    if action == "config" and len(args) == 1:
+    if action == "observe-ip" and len(args) == 2 and re.fullmatch(r"[0-9]{1,12}", args[1]):
+        try:
+            observe_ip(int(args[1]))
+        except (OSError, ValueError, OverflowError):
+            fail()
+    elif action == "config" and len(args) == 1:
         config = load_config()
         print("disabled=" + ",".join(config["disabled"]))
         print("allowOptionalFailures=" + str(int(config["allowOptionalFailures"])))
@@ -1898,16 +1976,13 @@ locale_for() {
     esac
 }
 
-# IP 审查:记录出口IP并统计最近48h内不同IP个数(账号画像风险指标)
-iphist_count() {
-    [ -z "$1" ] && { echo 0; return; }
-    local HIST="$BASE/iphistory.log"
-    local now=$(date +%s)
-    echo "$1 $now" >>"$HIST"
-    # 裁掉48小时(172800秒)以前的记录
-    awk -v cutoff=$((now-172800)) '$2>=cutoff' "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
-    # 统计48h内不同IP个数
-    awk '{print $1}' "$HIST" | sort -u | wc -l | tr -d ' '
+# Interface and launch audits share the same 48-hour transition history.
+ip_consistency() {
+    if [ -z "$1" ]; then
+        echo 'fail:未获取到出口IP'
+        return
+    fi
+    "$0" _support observe-ip "$(date +%s)" 3<<<"$1" || echo 'fail:无法核验出口IP历史'
 }
 
 # ---------- 安全检查 ----------
@@ -1915,7 +1990,7 @@ check() {
     load_check_config || { echo "FAIL:检查配置无效，请恢复默认设置"; return 1; }
     fails=""
 
-    local others tcnt processes
+    local others tcnt processes ip_state
     if ! processes=$(proxy_processes); then
         fails="$fails;无法核验代理进程"
     else
@@ -1939,17 +2014,11 @@ check() {
     [ "$loc" = "$COUNTRY_TARGET" ] || fails="$fails;出口IP异常(${ip:-无}/${loc:-未知},期望$COUNTRY_TARGET)"
     ipwarn=""
     if ! check_disabled "IP一致"; then
-        lastip=""; [ -f "$BASE/lastip" ] && lastip=$(cat "$BASE/lastip")
-        if [ -n "$ip" ] && [ -n "$lastip" ] && [ "$ip" != "$lastip" ]; then
-            ipwarn="注意:出口IP与上次不同($lastip -> $ip)"
-        fi
-        [ -n "$ip" ] && echo "$ip" > "$BASE/lastip"
-
-        # IP 审查:48h 内出口 IP 变化 ≥3 次追加警告(只 warn 不 fail)
-        ipn=$(iphist_count "$ip")
-        if [ "$ipn" -ge 3 ] 2>/dev/null; then
-            ipwarn="${ipwarn:+$ipwarn; }注意:48h内出口IP变化${ipn}次,账号画像有风险,建议固定节点"
-        fi
+        ip_state=$(ip_consistency "$ip")
+        case "$ip_state" in
+            warn:*) ipwarn="注意:${ip_state#warn:}" ;;
+            fail:*) optional_failure "IP一致:${ip_state#fail:}" ;;
+        esac
     fi
 
     tz=$(readlink /etc/localtime 2>/dev/null)
@@ -2213,7 +2282,7 @@ ASEOF
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
 checkdetail() {
     load_check_config || { echo "检查配置无效，请恢复默认设置"; return 1; }
-    local others tcnt processes
+    local others tcnt processes ip_state
     if ! processes=$(proxy_processes); then
         echo '代理内核=fail:无法核验代理进程'
     else
@@ -2248,23 +2317,8 @@ checkdetail() {
     if check_disabled "IP一致"; then
         optional_result "IP一致" ok
     else
-        lastip=""; [ -f "$BASE/lastip" ] && lastip=$(cat "$BASE/lastip")
-        ipst=""; ipdt=""
-        if [ -z "$ip" ]; then ipst="fail"; ipdt="未获取到出口IP"
-        elif [ -z "$lastip" ]; then ipst="ok"; ipdt="首次记录"
-        elif [ "$ip" = "$lastip" ]; then ipst="ok"; ipdt="与上次一致"
-        else ipst="warn"; ipdt="$lastip → $ip"; fi
-        [ -n "$ip" ] && echo "$ip" > "$BASE/lastip"
-        # IP 审查:48h 内出口 IP 变化 ≥3 次提示账号画像风险(只 warn 不 fail)
-        ipn=$(iphist_count "$ip")
-        if [ "$ipn" -ge 3 ] 2>/dev/null; then
-            if [ "$ipst" = "ok" ]; then
-                ipst="warn"; ipdt="48h内出口IP变化${ipn}次,账号画像有风险,建议固定节点"
-            else
-                ipdt="$ipdt;48h内出口IP变化${ipn}次,账号画像有风险,建议固定节点"
-            fi
-        fi
-        optional_result "IP一致" "$ipst" "$ipdt"
+        ip_state=$(ip_consistency "$ip")
+        optional_result "IP一致" "${ip_state%%:*}" "${ip_state#*:}"
     fi
     tz=$(readlink /etc/localtime 2>/dev/null)
     if [ "$tz" = "/var/db/timezone/zoneinfo/$TZ_TARGET" ]; then echo "时区=ok:${tz#/var/db/timezone/zoneinfo/}"; else echo "时区=fail:$tz"; fi

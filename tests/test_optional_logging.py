@@ -7,7 +7,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 import zipfile
 
@@ -83,6 +82,21 @@ esac''')
         self.assertEqual(probe.stdout.splitlines(), [str(self.bin / name) for name in names],
                          "检查前必须确认所有外部探测命令均指向隔离夹具")
 
+    def prepare_ip_timeline(self):
+        self.prepare_checkdetail()
+        self.stub("date", 'if [ "$1" = +%s ]; then echo "$TEST_EPOCH"; else /bin/date "$@"; fi')
+        self.stub("curl", r'''case "$*" in
+  *cdn-cgi/trace*) printf 'ip=%s\nloc=US\n' "$TEST_EXIT_IP" ;;
+  *ipinfo.io*) printf '{"org":"Example Residential"}' ;;
+  *claude.ai*|*api.anthropic.com*) printf '200' ;;
+esac''')
+        self.stub("python3", 'printf "RESULT:%s\n" "$TEST_EXIT_IP"')
+
+    def run_ip_audit(self, command, addr, when):
+        env = dict(self.env, TEST_EXIT_IP=addr, TEST_EPOCH=str(when), TZ="UTC")
+        return subprocess.run(["/bin/bash", str(self.core), command], env=env,
+                              text=True, capture_output=True, timeout=10)
+
     def test_settings_validate_allowlist_and_booleans(self):
         for value in ({"disabled": ["出口IP"]}, {"disabled": ["保镖"]},
                       {"disabled": ["unknown"]}, {"allowOptionalFailures": "yes"},
@@ -145,21 +159,54 @@ esac''')
                              text=True, capture_output=True, env=self.env, timeout=10)
         lines = run.stdout.splitlines()
         self.assertIn("TUN网卡=fail:不在线", lines)
-        self.assertIn("IP一致=warn:192.0.2.1 → 203.0.113.10", lines)
+        ip_row = next(line for line in lines if line.startswith("IP一致="))
+        self.assertTrue(ip_row.startswith("IP一致=warn:48小时内出口IP有变化（最近："), ip_row)
+        self.assertNotIn("192.0.2.1", ip_row)
         self.assertIn("时区=fail:/var/db/timezone/zoneinfo/Asia/Tokyo", lines)
         self.assertIn("地区=fail:ja_JP", lines)
 
-    def test_ip_history_warning_overrides_matching_ip_detail(self):
-        self.prepare_checkdetail()
+    def test_existing_history_warns_after_only_one_transition(self):
+        self.prepare_ip_timeline()
         (self.base / "lastip").write_text("203.0.113.10", encoding="utf-8")
-        now = int(time.time())
+        start = 1_767_225_600  # 2026-01-01 00:00:00 UTC
         (self.base / "iphistory.log").write_text(
-            f"192.0.2.1 {now}\n192.0.2.2 {now}\n", encoding="utf-8")
-        run = subprocess.run(["/bin/bash", str(self.core), "checkdetail"],
-                             text=True, capture_output=True, env=self.env, timeout=10)
-        line = next(line for line in run.stdout.splitlines() if line.startswith("IP一致="))
-        self.assertTrue(line.startswith("IP一致=warn:48h内出口IP变化3次"), line)
-        self.assertNotIn("与上次一致", line)
+            f"192.0.2.1 {start}\n203.0.113.10 {start + 60}\n203.0.113.10 {start + 120}\n",
+            encoding="utf-8")
+        run = self.run_ip_audit("checkdetail", "203.0.113.10", start + 180)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("IP一致=warn:48小时内出口IP有变化（最近：01-01 00:01:00）", run.stdout.splitlines())
+
+    def test_ip_warning_survives_rechecks_and_return_until_exact_expiry(self):
+        self.prepare_ip_timeline()
+        guard = self.home.parent / "installed-bodyguard.sh"
+        guard.write_text('MODE="sing-box"\nHEALTH_SCHEMA=1\n', encoding="utf-8")
+        heartbeat = guard.with_name("claude-bodyguard-health")
+        self.core.write_text(self.core.read_text(encoding="utf-8").replace(
+            "/Library/Application Support/claude-switcher/claude-bodyguard.sh", str(guard)),
+            encoding="utf-8")
+        self.env["TEST_HEARTBEAT"] = str(heartbeat)
+        self.stub("stat", '[ "$3" = "$TEST_HEARTBEAT" ] && echo 0:644')
+        self.stub("launchctl", r"printf 'state = not running\nruns = 10\nlast exit code = 0\n'")
+
+        def audit(command, addr, when):
+            heartbeat.write_text(f"schema=1\ntime={when}\nmode=sing-box\nresult=ok\n", encoding="utf-8")
+            run = self.run_ip_audit(command, addr, when)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            return run.stdout.splitlines()
+
+        a, b = "203.0.113.10", "203.0.113.11"
+        start = 1_767_225_600
+        first_change, back = start + 60, start + 180
+        window = 48 * 60 * 60
+        first_warning = "48小时内出口IP有变化（最近：01-01 00:01:00）"
+        return_warning = "48小时内出口IP有变化（最近：01-01 00:03:00）"
+        self.assertIn("IP一致=ok:首次记录", audit("checkdetail", a, start))
+        self.assertIn("IP一致=warn:" + first_warning, audit("checkdetail", b, first_change))
+        self.assertIn("OK:" + b + "|注意:" + first_warning, audit("check", b, start + 120))
+        self.assertIn("IP一致=warn:" + return_warning, audit("checkdetail", a, back))
+        self.assertIn("IP一致=warn:" + return_warning, audit("checkdetail", a, back + window - 2))
+        self.assertIn("OK:" + a + "|注意:" + return_warning, audit("check", a, back + window - 1))
+        self.assertIn("IP一致=ok:与上次一致", audit("checkdetail", a, back + window))
 
     def test_disabled_ip_consistency_still_skips_history(self):
         self.prepare_checkdetail()
