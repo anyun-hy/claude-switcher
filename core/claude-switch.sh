@@ -1818,8 +1818,12 @@ claude_desktop_processes() {
     printf '%s\n' "$1" | awk -F '\t' -v output="${2:-counts}" '
         NF == 2 && $1 ~ /^[1-9][0-9]*$/ && $2 ~ /^\// {
             if ($2 ~ /\/Claude[.]app\/Contents\/MacOS\/Claude$/) kind = "main"
-            else if ($2 ~ /\/Claude[.]app\/Contents\//) kind = "helper"
-            else next
+            else if ($2 ~ /\/Claude[.]app\/Contents\//) {
+                # Leave standalone CLI launchers and the app updater alone, even inside the bundle.
+                name = tolower($2); sub(/^.*\//, "", name)
+                if (name ~ /^(claude(-code)?([.]exe)?|node(js)?|bun|shipit)$/ || $2 ~ /\/@anthropic-ai\/claude-code\//) next
+                kind = "helper"
+            } else next
             if (output == "targets") printf "%s\t%s\t%s\n", kind, $1, $2
             else counts[kind]++
         }

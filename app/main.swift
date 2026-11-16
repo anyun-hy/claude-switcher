@@ -345,27 +345,32 @@ final class VM: ObservableObject {
         }.map { $0.terminate() }.contains(true)
     }
 
-    func quitClaudeDesktop(helpers: Bool) {
-        guard canQuitClaudeDesktop, claudeDesktopStatus.onlyBackground == helpers else { return }
+    func quitClaudeDesktop() {
+        guard canQuitClaudeDesktop else { return }
         hideAfterSwitch?.cancel()
         isBusy = true
         isQuittingClaudeDesktop = true
         desktopQuitMessage = ""
-        if helpers {
-            run(["quit-desktop-helpers"], timeout: 10) { result in
-                if result.succeeded {
-                    self.beginDesktopQuitCheck(helpers: true)
-                } else {
-                    let reason = result.output.split(whereSeparator: \.isNewline).first { $0.hasPrefix("FAIL:") }
-                    self.finishDesktopQuit(reason.map { String($0.dropFirst(5)) } ?? "未能结束后台进程，请重试")
-                    self.pollClientStateIfNeeded()
-                }
-            }
+        if claudeDesktopStatus.onlyBackground {
+            requestDesktopHelpersQuit()
         } else if desktopQuitRequest() {
             beginDesktopQuitCheck(helpers: false)
         } else {
             finishDesktopQuit("无法请求退出，请从 Claude 菜单退出")
             pollClientStateIfNeeded()
+        }
+    }
+
+    private func requestDesktopHelpersQuit() {
+        desktopQuitCheck = nil
+        run(["quit-desktop-helpers"], timeout: 10) { result in
+            if result.succeeded {
+                self.beginDesktopQuitCheck(helpers: true)
+            } else {
+                let reason = result.output.split(whereSeparator: \.isNewline).first { $0.hasPrefix("FAIL:") }
+                self.finishDesktopQuit(reason.map { String($0.dropFirst(5)) } ?? "未能结束后台进程，请重试")
+                self.pollClientStateIfNeeded()
+            }
         }
     }
 
@@ -384,6 +389,7 @@ final class VM: ObservableObject {
     // 复用代理轮询获取 Claude 进程状态；只有代理状态变化才重跑环境检查。
     func pollClientStateIfNeeded() {
         guard started, !updating, !isPollingClient else { return }
+        guard !isQuittingClaudeDesktop || desktopQuitCheck != nil else { return }
         guard coreAvailable() else {
             if claudeDesktopStatus != .unavailable { claudeDesktopStatus = .unavailable }
             if desktopQuitCheck != nil { finishDesktopQuit("无法确认退出结果") }
@@ -394,15 +400,17 @@ final class VM: ObservableObject {
         isPollingClient = true
         run(["detect-client"], timeout: 5) { result in
             self.isPollingClient = false
-            guard !self.updating else { return }
+            guard !self.updating, !self.isQuittingClaudeDesktop || quitCheck != nil else { return }
             let lines = result.output.split(whereSeparator: \.isNewline)
             let desktopFields = lines.filter { $0.hasPrefix(ClaudeDesktopStatus.fieldPrefix) }
             let desktop = result.succeeded && !lines.contains("process_probe=error")
                 ? ClaudeDesktopStatus(fields: desktopFields) : .unavailable
             if self.claudeDesktopStatus != desktop { self.claudeDesktopStatus = desktop }
             if let check = quitCheck {
-                if desktop == .stopped || (!check.helpers && desktop.onlyBackground) {
+                if desktop == .stopped {
                     self.finishDesktopQuit()
+                } else if !check.helpers && desktop.onlyBackground {
+                    self.requestDesktopHelpersQuit()
                 } else if Date() >= check.deadline {
                     self.finishDesktopQuit(desktop == .unavailable ? "无法确认退出结果" : "仍检测到进程，可重试")
                 }
@@ -1462,19 +1470,20 @@ struct ContentView: View {
 
     private var claudeDesktopCard: some View {
         let status: (label: String, detail: String, symbol: String, color: Color)
-        switch vm.claudeDesktopStatus {
-        case .checking:
+        switch (vm.isQuittingClaudeDesktop, vm.claudeDesktopStatus) {
+        case (true, _):
+            status = ("正在退出", "等待主程序和后台助手退出", "clock", ClaudeTheme.muted)
+        case (false, .checking):
             status = ("检测中", "正在读取桌面进程状态", "clock", ClaudeTheme.muted)
-        case .unavailable:
+        case (false, .unavailable):
             status = ("无法确认", "未能读取桌面进程状态", "questionmark.circle", ClaudeTheme.warning)
-        case .running(let background):
+        case (false, .running(let background)):
             status = ("运行中", "主程序运行中 · 后台进程 \(background) 个", "circle.fill", ClaudeTheme.success)
-        case .backgroundOnly(let count):
+        case (false, .backgroundOnly(let count)):
             status = ("仅后台运行", "主程序已退出 · 仍有 \(count) 个后台进程", "exclamationmark.triangle.fill", ClaudeTheme.warning)
-        case .stopped:
+        case (false, .stopped):
             status = ("已退出", "未检测到主程序或后台进程", "stop.circle", ClaudeTheme.muted)
         }
-        let helpers = vm.claudeDesktopStatus.onlyBackground
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Claude 桌面版").font(.system(size: 13, weight: .semibold))
@@ -1490,12 +1499,9 @@ struct ContentView: View {
             }
             HStack {
                 Spacer()
-                Button { vm.quitClaudeDesktop(helpers: helpers) } label: {
-                    Label(vm.isQuittingClaudeDesktop ? "正在确认退出…" : (helpers ? "结束后台进程" : "退出 Claude"),
-                          systemImage: helpers ? "stop.circle" : "power")
-                }
+                Button { vm.quitClaudeDesktop() } label: { Label("退出 Claude", systemImage: "power") }
                 .disabled(!vm.canQuitClaudeDesktop)
-                .help(helpers ? "结束剩余的 Claude 桌面后台任务" : "正常退出 Claude 桌面版")
+                .help("正常退出 Claude 桌面版并结束残留的桌面助手")
             }
         }
         .padding(16)

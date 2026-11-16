@@ -234,7 +234,10 @@ fi
         unrelated = ((321, 0, TAG_EXE),
                      (322, 502, "/usr/local/bin/claude"),
                      (323, 502, "/Applications/Claude Switcher.app/Contents/MacOS/ClaudeSwitcher"),
-                     (324, 502, "/bin/sleep", DESKTOP))
+                     (324, 502, "/bin/sleep", DESKTOP),
+                     (328, 502, bundle + "/Resources/claude"),
+                     (329, 502, bundle + "/Resources/node", "node @anthropic-ai/claude-code/cli.js"),
+                     (330, 502, bundle + "/Frameworks/Squirrel.framework/Versions/A/Resources/ShipIt"))
         helpers = ((325, 502, renderer), (326, 502, worker))
         for rows, counts in (
             (unrelated + ((327, 502, bundle + "/MacOS/Claude"),) + helpers, "1,2"),
@@ -270,7 +273,10 @@ fi
         helper = "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper"
         self.processes((561, 502, helper), (562, 502, helper), (563, 503, helper),
                        (564, 502, "/usr/local/bin/claude"), (565, 0, TAG_EXE),
-                       (566, 502, "/bin/sleep", helper))
+                       (566, 502, "/bin/sleep", helper),
+                       (567, 502, "/Applications/Claude.app/Contents/Resources/claude"),
+                       (568, 502, "/Applications/Claude.app/Contents/Resources/node", "node @anthropic-ai/claude-code/cli.js"),
+                       (569, 502, "/Applications/Claude.app/Contents/Frameworks/Squirrel.framework/Versions/A/Resources/ShipIt"))
         recheck = self.root / "process-recheck.tsv"
         recheck.write_text(self.table.read_text().replace(f"562\t502\t{helper}", "562\t502\t/bin/sleep"))
         self.env["TEST_PROCESS_RECHECK_TABLE"] = str(recheck)

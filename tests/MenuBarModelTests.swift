@@ -508,40 +508,71 @@ struct MenuBarModelTests {
             case "desktop_quit_controls":
                 let proxy = "configured=tag\nalive=1\ntun_count=1\nothers=none\n"
                 var quitRequests = 0
+                var mainAcceptsQuit = true
                 let vm = VM(core: f.core.path, checkTimeout: 2, operationTimeout: 2,
-                            noticeDefaults: f.noticeDefaults, desktopQuitRequest: { quitRequests += 1; return true })
-                try f.write("client-probe", proxy + "claude_desktop=1,2\n")
+                            noticeDefaults: f.noticeDefaults, desktopQuitRequest: { quitRequests += 1; return mainAcceptsQuit })
+                func snapshot(_ counts: String) throws {
+                    try f.write("client-probe", proxy + "claude_desktop=\(counts)\n")
+                }
+                func pollUntil(_ condition: () -> Bool) throws {
+                    try spin {
+                        if condition() { return true }
+                        vm.pollClientStateIfNeeded()
+                        return false
+                    }
+                }
+                func helperRequests() -> Int { f.calls.filter { $0 == "quit-desktop-helpers" }.count }
+
+                try snapshot("1,2")
                 vm.start(); try f.idle(vm)
-                vm.pollClientStateIfNeeded()
-                try spin { vm.claudeDesktopStatus == .running(background: 2) }
+                try pollUntil { vm.claudeDesktopStatus == .running(background: 2) }
                 try expect(vm.canQuitClaudeDesktop, "主程序运行时可正常退出")
                 try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-desktop-quit", size: NSSize(width: 1060, height: 760))
-                vm.quitClaudeDesktop(helpers: true)
-                try expect(!f.calls.contains("quit-desktop-helpers"), "主程序在线时不能结束助手")
-                vm.quitClaudeDesktop(helpers: false)
-                vm.quitClaudeDesktop(helpers: false)
-                try expect(quitRequests == 1 && vm.isQuittingClaudeDesktop, "提交退出请求不能立即显示已退出或重复执行")
-                try f.write("client-probe", proxy + "claude_desktop=0,2\n")
-                try spin {
-                    if vm.isQuittingClaudeDesktop { vm.pollClientStateIfNeeded() }
-                    return !vm.isQuittingClaudeDesktop && vm.claudeDesktopStatus == .backgroundOnly(2)
+                let probesBefore = f.calls.filter { $0 == "detect-client" }.count
+                vm.quitClaudeDesktop()
+                vm.quitClaudeDesktop()
+                try pollUntil { f.calls.filter { $0 == "detect-client" }.count > probesBefore }
+                try expect(quitRequests == 1 && vm.isQuittingClaudeDesktop && helperRequests() == 0,
+                           "确认主程序退出前，不得清理助手或重复发送退出请求")
+
+                try snapshot("0,2")
+                try pollUntil {
+                    let calls = f.calls
+                    guard let cleanup = calls.firstIndex(of: "quit-desktop-helpers") else { return false }
+                    return calls.dropFirst(cleanup + 1).contains("detect-client")
                 }
-                try expect(vm.canQuitClaudeDesktop && !f.calls.contains("quit-desktop-helpers"), "退出主程序后，后台助手只能手动结束")
+                try expect(helperRequests() == 1 && vm.isQuittingClaudeDesktop && vm.claudeDesktopStatus == .backgroundOnly(2),
+                           "自动处理残留助手后仍需等待确认")
+                try snapshot("0,0")
+                try pollUntil { !vm.isQuittingClaudeDesktop && vm.claudeDesktopStatus == .stopped }
+                try expect(!vm.canQuitClaudeDesktop && helperRequests() == 1 && vm.desktopQuitMessage.isEmpty,
+                           "一次点击足够，确认已退出后停用按钮")
+
+                try snapshot("1,0")
+                try pollUntil { vm.claudeDesktopStatus == .running(background: 0) }
+                vm.quitClaudeDesktop()
+                try snapshot("0,0")
+                try pollUntil { !vm.isQuittingClaudeDesktop && vm.claudeDesktopStatus == .stopped }
+                try expect(quitRequests == 2 && helperRequests() == 1, "正常退出未留助手时不执行清理")
+
+                try snapshot("0,2")
+                try pollUntil { vm.claudeDesktopStatus == .backgroundOnly(2) }
                 try f.write("desktop-quit-exit", "1\n")
-                vm.quitClaudeDesktop(helpers: true)
+                vm.quitClaudeDesktop()
                 try f.idle(vm)
                 try expect(!vm.desktopQuitMessage.isEmpty && vm.claudeDesktopStatus == .backgroundOnly(2), "结束后台失败必须保留实际状态")
                 try f.write("desktop-quit-exit", "0\n")
-                let probesBefore = f.calls.filter { $0 == "detect-client" }.count
-                vm.quitClaudeDesktop(helpers: true)
-                try spin { f.calls.filter { $0 == "detect-client" }.count > probesBefore }
-                try expect(vm.isQuittingClaudeDesktop, "发送信号成功也要等进程确认退出")
-                try f.write("client-probe", proxy + "claude_desktop=0,0\n")
-                try spin {
-                    if vm.isQuittingClaudeDesktop { vm.pollClientStateIfNeeded() }
-                    return !vm.isQuittingClaudeDesktop && vm.claudeDesktopStatus == .stopped
-                }
-                try expect(!vm.canQuitClaudeDesktop && vm.desktopQuitMessage.isEmpty, "确认已退出后停用按钮")
+                vm.quitClaudeDesktop()
+                try snapshot("0,0")
+                try pollUntil { !vm.isQuittingClaudeDesktop && vm.claudeDesktopStatus == .stopped }
+                try expect(quitRequests == 2 && helperRequests() == 3, "仅剩助手时复用同一退出按钮")
+
+                try snapshot("1,2")
+                try pollUntil { vm.claudeDesktopStatus == .running(background: 2) }
+                mainAcceptsQuit = false
+                vm.quitClaudeDesktop()
+                try expect(quitRequests == 3 && helperRequests() == 3 && !vm.desktopQuitMessage.isEmpty,
+                           "无法请求主程序正常退出时，不自动结束助手")
                 try expect(f.calls.filter { $0 == "checkdetail" }.count == 1, "退出 Claude 不重跑网络环境检查")
             case "tag_client_recognized":
                 try f.write("client", "client=tag\n")
@@ -648,14 +679,17 @@ struct MenuBarModelTests {
                 try expect(vm.activeNotice == .officialRelease, "其他面板关闭后可查看提醒")
                 try expect(OfficialReleaseReminder.shouldShow(in: f.noticeDefaults), "手动查看不应自动标记已读")
             case "official_release_window_lifecycle":
+                try f.write("client-probe", "configured=clash-verge\nalive=1\ntun_count=1\nothers=none\nclaude_desktop=0,0\n")
+                let auditCalls = ["checkdetail", "get-client", "status"]
                 let vm = f.vm()
                 let delegate = AppDelegate(vm: vm)
                 delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
                 try spin { vm.activeNotice == .officialRelease }
                 try spin { delegate.mainWindow?.attachedSheet != nil }
                 try f.idle(vm)
+                try spin { f.calls.contains("detect-client") }
                 try expect(delegate.mainWindow?.isVisible == true, "首次提醒需要可见窗口")
-                try expect(f.calls == ["checkdetail", "get-client", "status"], "提醒不得中断或重复启动检查")
+                try expect(f.calls.filter { $0 != "detect-client" } == auditCalls, "提醒不得中断或重复启动检查")
                 vm.acknowledgeOfficialReleaseNotice()
                 try spin { delegate.mainWindow?.attachedSheet == nil }
                 let first = delegate.mainWindow
@@ -669,7 +703,7 @@ struct MenuBarModelTests {
                 vm.presentNotice(.officialRelease)
                 try spin { first?.attachedSheet != nil }
                 try expect(first?.isVisible == true && vm.activeNotice == .officialRelease, "隐藏窗口后可手动复看")
-                try expect(f.calls == ["checkdetail", "get-client", "status"], "手动查看不得重复审计")
+                try expect(f.calls.filter { $0 != "detect-client" } == auditCalls, "手动查看不得重复审计")
                 vm.activeNotice = nil
                 try spin { first?.attachedSheet == nil }
                 first?.orderOut(nil)

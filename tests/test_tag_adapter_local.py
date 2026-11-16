@@ -1,11 +1,14 @@
 """Local TAG adaptation checks, with isolated state and commands."""
+import io
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from macos_process_fixture import shell_function as function, with_process_paths
 
@@ -70,10 +73,60 @@ esac
                     self.assertEqual(run.returncode, expected, run.stdout + run.stderr)
 
     def test_core_and_guard_use_the_same_process_identity_rules(self):
-        core = SOURCE.read_text(encoding="utf-8")
-        guard = GUARD.read_text(encoding="utf-8")
-        for name in ("macos_process_paths", "proxy_processes", "proxy_seen"):
-            self.assertEqual(function(core, name), function(guard, name))
+        # Exercise the actual full-snapshot path in each script. The core can
+        # also accept a PID or a precomputed snapshot for its desktop controls.
+        visible_paths = {
+            301: TAG_EXE.encode(),
+            302: b"/tmp/mihomo-universal-tag-darwin",
+            303: b"/Applications/FlClash.app/Contents/Resources/FlClashCore",
+            304: b"/Applications/ClashX Pro.app/Contents/MacOS/ClashX Pro",
+            305: b"/usr/local/bin/BettboxCore",
+        }
+        samples = {**visible_paths, 306: None, 307: b"relative/verge-mihomo", 308: b"/tmp/unsafe\n/sing-box"}
+
+        def list_pids(pids, size):
+            if pids is not None:
+                pids[:len(samples)] = tuple(samples)
+            return len(samples)
+
+        def read_path(pid, buffer, size):
+            path = samples[pid]
+            if path is None:
+                return -1
+            buffer.value = path
+            return len(path)
+
+        kernel = SimpleNamespace(proc_listallpids=list_pids, proc_pidpath=read_path)
+        expected_snapshot = b"".join(f"{pid}\t".encode() + path + b"\n" for pid, path in visible_paths.items())
+        for script in (SOURCE, GUARD):
+            with self.subTest(script=script.name):
+                source = script.read_text(encoding="utf-8")
+                probe = function(source, "macos_process_paths").split("<<'PY'\n", 1)[1].rsplit("\nPY\n", 1)[0]
+                output = io.BytesIO()
+                with (patch("ctypes.CDLL", return_value=kernel) as load,
+                      patch.object(sys, "argv", ["-"]),
+                      patch.object(sys, "stdout", SimpleNamespace(buffer=output)),
+                      self.assertRaises(SystemExit) as exit_status):
+                    exec(compile(probe, script.name, "exec"), {})
+                load.assert_called_once_with("/usr/lib/libproc.dylib")
+                self.assertEqual(exit_status.exception.code, 0)
+                self.assertEqual(output.getvalue(), expected_snapshot)
+
+                snapshot = self.root / "process-paths.tsv"
+                snapshot.write_bytes(output.getvalue())
+                source = with_process_paths(source)
+                harness = "\n".join(function(source, name) for name in ("macos_process_paths", "proxy_processes", "proxy_seen"))
+                harness += '''
+observed=$(proxy_processes) || exit 1
+proxy_seen "$observed" tag || exit 2
+if proxy_seen "$observed" surge; then exit 3; fi
+printf '%s\n' "$observed"
+'''
+                run = subprocess.run(["/bin/bash"], input=harness,
+                                     env=dict(self.env, TEST_PROCESS_PATHS=str(snapshot)),
+                                     text=True, capture_output=True, timeout=5)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(run.stdout.splitlines(), ["tag\t301", "flclash\t303", "clashx\t304", "bettbox\t305"])
 
     def test_client_discovery_reports_tag(self):
         run = self.run_core("get-client")
