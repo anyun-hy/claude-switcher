@@ -3174,14 +3174,11 @@ self_update() {
         echo "FAIL:工件校验失败,已中止(不排除网络篡改,可稍后重试或手动 update)"; cleanup_update; return 1
     fi
 
-    # 读取现有运行配置:优先从 config.env 读取,老版本从已安装脚本头部兜底读取
+    # 读取现有运行配置:优先继承当前核心变量与 config.env,老版本从已安装脚本头部与守护脚本兜底读取
     candidate="$NEW/core/claude-switch.sh"
-    PM=""; PG=""; CT=""; TZV=""; LCT=""
-    if [ -f "$BIN/claude-switch.sh" ]; then
-        get_cfg() { grep "^$1=\"" "$BIN/claude-switch.sh" | head -1 | cut -d'"' -f2; }
-        PM=$(get_cfg PROXY_MODE); PG=$(get_cfg PROXY_GROUP); CT=$(get_cfg COUNTRY_TARGET)
-        TZV=$(get_cfg TZ_TARGET); LCT=$(get_cfg LOCALE_TARGET)
-    fi
+    APPDIR="/Library/Application Support/claude-switcher"
+    PM="${PROXY_MODE:-}"; PG="${PROXY_GROUP:-}"; CT="${COUNTRY_TARGET:-}"
+    TZV="${TZ_TARGET:-}"; LCT="${LOCALE_TARGET:-}"
     if [ -f "$CONFIG_ENV" ]; then
         get_env_cfg() { grep "^$1=\"" "$CONFIG_ENV" | head -1 | cut -d'"' -f2; }
         [ -n "$(get_env_cfg PROXY_MODE)" ] && PM=$(get_env_cfg PROXY_MODE)
@@ -3189,6 +3186,21 @@ self_update() {
         [ -n "$(get_env_cfg COUNTRY_TARGET)" ] && CT=$(get_env_cfg COUNTRY_TARGET)
         [ -n "$(get_env_cfg TZ_TARGET)" ] && TZV=$(get_env_cfg TZ_TARGET)
         [ -n "$(get_env_cfg LOCALE_TARGET)" ] && LCT=$(get_env_cfg LOCALE_TARGET)
+    fi
+    if [ -f "$BIN/claude-switch.sh" ]; then
+        get_cfg() { grep "^$1=\"" "$BIN/claude-switch.sh" | head -1 | cut -d'"' -f2; }
+        [ -z "$PM" ] && PM=$(get_cfg PROXY_MODE)
+        [ -z "$PG" ] && PG=$(get_cfg PROXY_GROUP)
+        [ -z "$CT" ] && CT=$(get_cfg COUNTRY_TARGET)
+        [ -z "$TZV" ] && TZV=$(get_cfg TZ_TARGET)
+        [ -z "$LCT" ] && LCT=$(get_cfg LOCALE_TARGET)
+    fi
+    if [ -z "$TZV" ] && [ -f "$APPDIR/tz-watchdog.sh" ]; then
+        TZV=$(sed -n 's/^TARGET="\([^"]*\)".*/\1/p' "$APPDIR/tz-watchdog.sh" | head -1)
+    fi
+    if [ -z "$TZV" ]; then
+        [ -n "$CT" ] && TZV=$(default_tz_for "$CT")
+        [ -z "$TZV" ] && TZV="America/New_York"
     fi
 
     # 跳过判断:已迁移 config.env 时直接比对字节,老版本剔除头部5个配置行后比对;并检查 stun-probe/App/守护

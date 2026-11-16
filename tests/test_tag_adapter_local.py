@@ -277,9 +277,16 @@ esac''')
         sock_file = self.root / "tag-mock-fix.sock"
         server = MockTagMihomoServer(sock_file)
         self.addCleanup(server.close)
-        env = dict(self.env, TAG_SOCKET_PATH=str(sock_file), PROXY_MODE="tag", COUNTRY_TARGET="JP", TZ_TARGET="Asia/Tokyo")
+        env = dict(self.env, TAG_SOCKET_PATH=str(sock_file), PROXY_MODE="tag",
+                   COUNTRY_TARGET="JP", TZ_TARGET="Asia/Tokyo", LOCALE_TARGET="ja_JP")
+
+        cfg = self.home / ".claude-switcher/config.env"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text('PROXY_MODE="tag"\nPROXY_GROUP="IpEqual"\nCOUNTRY_TARGET="JP"\nTZ_TARGET="Asia/Tokyo"\nLOCALE_TARGET="ja_JP"\n', encoding="utf-8")
 
         self.stub("sudo", "exit 0")
+        self.stub("osascript", "exit 0")
+        self.stub("readlink", "echo /var/db/timezone/zoneinfo/Asia/Tokyo")
         self.stub("systemsetup", "echo 'Time Zone: Asia/Tokyo'")
         self.stub("networksetup", "exit 0")
         self.stub("defaults", "echo ja_JP")
@@ -326,11 +333,17 @@ class MockTagMihomoServer:
             except OSError:
                 break
             try:
-                req = conn.recv(4096).decode("utf-8", errors="ignore")
-                if not req:
+                req = b""
+                while b"\r\n\r\n" not in req:
+                    chunk = conn.recv(1024)
+                    if not chunk:
+                        break
+                    req += chunk
+                header_part, _, body_part = req.partition(b"\r\n\r\n")
+                if not header_part:
                     conn.close()
                     continue
-                first_line = req.splitlines()[0]
+                first_line = header_part.splitlines()[0].decode("utf-8", errors="ignore")
                 parts = first_line.split(" ")
                 method, path = parts[0], parts[1]
                 if method == "GET" and path == "/configs":
@@ -338,11 +351,22 @@ class MockTagMihomoServer:
                     resp = (f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nContent-Type: application/json\r\n\r\n").encode("utf-8") + body
                     conn.sendall(resp)
                 elif method == "PATCH" and path == "/configs":
-                    header_body = req.split("\r\n\r\n", 1)
-                    if len(header_body) > 1:
-                        payload = json.loads(header_body[1])
-                        if "mode" in payload:
-                            self.mode = str(payload["mode"]).lower()
+                    content_length = 0
+                    for line in header_part.splitlines():
+                        if line.lower().startswith(b"content-length:"):
+                            content_length = int(line.split(b":", 1)[1].strip())
+                    while len(body_part) < content_length:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            break
+                        body_part += chunk
+                    if body_part:
+                        try:
+                            payload = json.loads(body_part.decode("utf-8"))
+                            if "mode" in payload:
+                                self.mode = str(payload["mode"]).lower()
+                        except Exception:
+                            pass
                     resp = b"HTTP/1.1 204 No Content\r\n\r\n"
                     conn.sendall(resp)
                 else:
