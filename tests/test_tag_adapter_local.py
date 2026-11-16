@@ -1,11 +1,14 @@
 """Local TAG adaptation checks, with isolated state and commands."""
 import io
+import json
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -242,6 +245,124 @@ esac''')
                              text=True, capture_output=True, timeout=5)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("selected=bettbox", run.stdout)
+
+    def test_tag_ctl_socket_and_mode_queries(self):
+        sock_file = self.root / "tag-mock.sock"
+        server = MockTagMihomoServer(sock_file)
+        self.addCleanup(server.close)
+        env = dict(self.env, TAG_SOCKET_PATH=str(sock_file))
+
+        run = subprocess.run(["/bin/bash", str(self.core), "tag-ctl", "socket"],
+                             env=env, text=True, capture_output=True, timeout=5)
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(run.stdout.strip(), str(sock_file))
+
+        run = subprocess.run(["/bin/bash", str(self.core), "tag-ctl", "mode"],
+                             env=env, text=True, capture_output=True, timeout=5)
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(run.stdout.strip(), "rule")
+
+        run = subprocess.run(["/bin/bash", str(self.core), "tag-ctl", "set-global"],
+                             env=env, text=True, capture_output=True, timeout=5)
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(run.stdout.strip(), "OK")
+        self.assertEqual(server.mode, "global")
+
+        run = subprocess.run(["/bin/bash", str(self.core), "tag-ctl", "mode"],
+                             env=env, text=True, capture_output=True, timeout=5)
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(run.stdout.strip(), "global")
+
+    def test_tag_webrtc_and_fix_flow(self):
+        sock_file = self.root / "tag-mock-fix.sock"
+        server = MockTagMihomoServer(sock_file)
+        self.addCleanup(server.close)
+        env = dict(self.env, TAG_SOCKET_PATH=str(sock_file), PROXY_MODE="tag", COUNTRY_TARGET="JP", TZ_TARGET="Asia/Tokyo")
+
+        self.stub("sudo", "exit 0")
+        self.stub("systemsetup", "echo 'Time Zone: Asia/Tokyo'")
+        self.stub("networksetup", "exit 0")
+        self.stub("defaults", "echo ja_JP")
+        self.stub("sleep", "exit 0")
+
+        # Stub fake curl trace and STUN probe
+        self.stub("curl", '''case "$*" in
+    *trace*) echo -e "ip=106.178.162.207\\nloc=JP" ;;
+    *) echo 200 ;;
+esac''')
+        # Stub stun-probe.py
+        stun_probe = self.home / ".claude-switcher/stun-probe.py"
+        stun_probe.parent.mkdir(parents=True, exist_ok=True)
+        stun_probe.write_text("print('RESULT:106.178.162.207,106.178.162.207')\n", encoding="utf-8")
+
+        # In rule mode, tag_mode reports rule
+        self.assertEqual(server.mode, "rule")
+
+        # Run fix: it should see rule mode, switch it to global, and verify webrtc
+        run = subprocess.run(["/bin/bash", str(self.core), "fix"],
+                             env=env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("FIX:TAG 内核处于 rule 模式，正在同步为全局模式防 WebRTC 泄漏...", run.stdout)
+        self.assertIn("FIX:TAG 内核已成功同步为全局模式 ✓", run.stdout)
+        self.assertIn("FIX:WebRTC ✓ 仅暴露代理出口IP(全局模式)", run.stdout)
+        self.assertEqual(server.mode, "global")
+
+
+class MockTagMihomoServer:
+    def __init__(self, sock_path):
+        self.sock_path = str(sock_path)
+        self.mode = "rule"
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(self.sock_path)
+        self.sock.listen(5)
+        self.running = True
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        while self.running:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                break
+            try:
+                req = conn.recv(4096).decode("utf-8", errors="ignore")
+                if not req:
+                    conn.close()
+                    continue
+                first_line = req.splitlines()[0]
+                parts = first_line.split(" ")
+                method, path = parts[0], parts[1]
+                if method == "GET" and path == "/configs":
+                    body = json.dumps({"mode": self.mode}).encode("utf-8")
+                    resp = (f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nContent-Type: application/json\r\n\r\n").encode("utf-8") + body
+                    conn.sendall(resp)
+                elif method == "PATCH" and path == "/configs":
+                    header_body = req.split("\r\n\r\n", 1)
+                    if len(header_body) > 1:
+                        payload = json.loads(header_body[1])
+                        if "mode" in payload:
+                            self.mode = str(payload["mode"]).lower()
+                    resp = b"HTTP/1.1 204 No Content\r\n\r\n"
+                    conn.sendall(resp)
+                else:
+                    conn.sendall(b"HTTP/1.1 404 Not Found\r\n\r\n")
+            except Exception:
+                pass
+            finally:
+                conn.close()
+
+    def close(self):
+        self.running = False
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        if os.path.exists(self.sock_path):
+            try:
+                os.unlink(self.sock_path)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

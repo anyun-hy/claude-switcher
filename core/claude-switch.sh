@@ -1559,6 +1559,111 @@ if __name__ == "__main__":
 PY_CLASH_RULES
 fi
 
+if [ "${1:-}" = "tag-ctl" ]; then
+    shift
+    exec "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$@" <<'PY_TAG_CTL'
+"""Control TAG (Mihomo) via local unix socket."""
+import http.client
+import json
+import os
+import socket
+import sys
+from pathlib import Path
+
+
+def get_socket_path():
+    env_path = os.environ.get("TAG_SOCKET_PATH")
+    if env_path:
+        return env_path
+    candidates = []
+    if hasattr(os, "getuid"):
+        uid = os.getuid()
+        candidates.append(f"/var/run/tag-service/users/{uid}/tag-mihomo.sock")
+        candidates.append(f"/private/var/run/tag-service/users/{uid}/tag-mihomo.sock")
+    run_dir = Path("/var/run/tag-service/users")
+    if run_dir.exists():
+        try:
+            for sub in run_dir.iterdir():
+                sock = sub / "tag-mihomo.sock"
+                candidates.append(str(sock))
+        except OSError:
+            pass
+    for c in candidates:
+        if os.path.exists(c):
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.5)
+            try:
+                probe.connect(c)
+                probe.close()
+                return c
+            except OSError:
+                probe.close()
+                continue
+    return None
+
+
+def request(method, path, body=None):
+    sock_path = get_socket_path()
+    if not sock_path:
+        raise RuntimeError("未找到可用的 TAG 控制 Socket")
+    conn = http.client.HTTPConnection("localhost", timeout=2)
+    conn.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.sock.settimeout(2)
+    conn.sock.connect(sock_path)
+    headers = {"Accept": "application/json"}
+    if body:
+        headers["Content-Type"] = "application/json"
+    conn.request(method, path, body=body, headers=headers)
+    resp = conn.getresponse()
+    data = resp.read()
+    if resp.status not in (200, 204):
+        raise RuntimeError(f"TAG 接口返回异常状态码 {resp.status}")
+    if data:
+        try:
+            return json.loads(data.decode("utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(1)
+    action = sys.argv[1]
+    if action == "socket":
+        s = get_socket_path()
+        if s:
+            print(s)
+            sys.exit(0)
+        sys.exit(1)
+    elif action == "mode":
+        try:
+            data = request("GET", "/configs")
+            mode = str(data.get("mode", "")).lower()
+            if mode:
+                print(mode)
+                sys.exit(0)
+            sys.exit(1)
+        except Exception:
+            sys.exit(1)
+    elif action == "set-global":
+        try:
+            payload = json.dumps({"mode": "Global"}).encode("utf-8")
+            request("PATCH", "/configs", body=payload)
+            print("OK")
+            sys.exit(0)
+        except Exception as e:
+            print(f"FAIL:{e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+PY_TAG_CTL
+fi
+
 # ============ 安装时可配置项(默认兜底值;实际运行优先读取 ~/.claude-switcher/config.env) ============
 PROXY_MODE="clash-verge"       # 代理客户端: tag|clash-verge|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto
 PROXY_GROUP="IpEqual"          # Clash 代理组名(安装时自动探测)
@@ -1895,6 +2000,13 @@ stun_ok() { merge_ok; }
 # 当前 Clash 模式(rule/global/direct);读取失败返回空
 clash_mode() { clash_rules mode 2>/dev/null; }
 
+# TAG (Mihomo) 控制接口与模式
+tag_ctl() {
+    "${BASH:-/bin/bash}" "$0" tag-ctl "$@" 2>/dev/null
+}
+tag_mode() { tag_ctl mode; }
+tag_set_global() { "${BASH:-/bin/bash}" "$0" tag-ctl set-global >/dev/null 2>&1; }
+
 # 置顶规则行为检测:三个生态域名全部解析到 fake-ip 段(198.18.x.x)即视为已置顶;未命中域名记入 ROUTE_MISSED
 route_ok() {
     ROUTE_MISSED=""
@@ -2117,6 +2229,8 @@ check() {
     # 置顶规则:Clash Verge 验证运行内核;全局模式下全部流量走代理,规则不适用;其他客户端只看行为检测
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         [ "$(clash_mode)" = "global" ] || merge_ok || fails="$fails;运行中置顶规则未验证"
+    elif [ "$PROXY_MODE" = "tag" ]; then
+        [ "$(tag_mode 2>/dev/null)" = "global" ] || route_ok || fails="$fails;置顶规则缺失(未命中:${ROUTE_MISSED# })"
     else
         route_ok || fails="$fails;置顶规则缺失(未命中:${ROUTE_MISSED# })"
     fi
@@ -2176,6 +2290,29 @@ webrtc_status() {
         fi
         if ! verified=$(clash_rules verify 2>&1); then
             echo "fail:运行规则未验证:${verified#FAIL:}"
+            return
+        fi
+    elif [ "$PROXY_MODE" = "tag" ]; then
+        mode=$(tag_mode 2>/dev/null)
+        if [ "$mode" = "global" ]; then
+            result=$(webrtc_test)
+            probe_rc=$?
+            [ "$probe_rc" -ne 0 ] && { echo "fail:STUN 探测执行失败，未确认 UDP 出口"; return; }
+            case "$result" in
+                RESULT:NONE) echo "warn:UDP 无响应,全局模式下无法验证(可能已被节点拦截)" ;;
+                RESULT:*)
+                    leak=""
+                    wips=${result#RESULT:}
+                    OLDIFS=$IFS; IFS=','
+                    for w in $wips; do [ -n "$1" ] && [ "$w" != "$1" ] && leak="$leak $w"; done
+                    IFS=$OLDIFS
+                    if [ -n "$leak" ]; then
+                        echo "fail:暴露非代理IP:${leak# }"
+                    else
+                        echo "ok:仅暴露代理出口IP(全局模式)"
+                    fi ;;
+                *) echo "fail:STUN 探测结果格式异常" ;;
+            esac
             return
         fi
     fi
@@ -2417,6 +2554,14 @@ checkdetail() {
             echo '规则置顶=ok'
         else
             echo '规则置顶=fail:未生效'
+        fi
+    elif [ "$PROXY_MODE" = "tag" ]; then
+        if [ "$(tag_mode 2>/dev/null)" = "global" ]; then
+            echo '规则置顶=ok:全局模式(全部流量走代理)'
+        elif route_ok; then
+            echo '规则置顶=ok:行为检测通过'
+        else
+            echo "规则置顶=fail:未命中(${ROUTE_MISSED# }),请在 $(proxy_name) 中自行加置顶规则"
         fi
     else
         if route_ok; then
@@ -2666,6 +2811,23 @@ ASEOF
             return 1
         fi
         echo "FIX:置顶规则 ✓ 已验证内核实际加载"
+    elif [ "$PROXY_MODE" = "tag" ]; then
+        local tmode
+        tmode=$(tag_mode 2>/dev/null)
+        if [ "$tmode" = "global" ]; then
+            echo "FIX:TAG 内核已处于全局模式(全部流量已走代理) ✓"
+        else
+            echo "FIX:TAG 内核处于 ${tmode:-未知} 模式，正在同步为全局模式防 WebRTC 泄漏..."
+            if tag_set_global; then
+                sleep 1
+                echo "FIX:TAG 内核已成功同步为全局模式 ✓"
+            else
+                echo "FIX:TAG 内核控制接口未响应 ✗"
+                if ! route_ok; then
+                    echo "FIX:置顶规则 ✗ 请在 $(proxy_name) 中自行添加 DOMAIN-SUFFIX 置顶规则"
+                fi
+            fi
+        fi
     elif [ "$PROXY_MODE" != "flclash" ] && ! route_ok; then
         echo "FIX:置顶规则 ✗ 请在 $(proxy_name) 中自行添加 DOMAIN-SUFFIX 置顶规则"
     fi

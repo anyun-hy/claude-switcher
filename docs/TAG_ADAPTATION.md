@@ -7,6 +7,7 @@
 - 核心脚本支持 `tag` 客户端模式，按完整可执行文件路径识别 TAG 内核：`/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin`，以及 TAG v2 系列可执行路径 `/Applications/TAGv2.app/Contents/MacOS/mihomotag-serv` 和 `/Applications/TAGv2.app/Contents/MacOS/tagv2`。其他客户端或任意包含 `mihomo` 的进程不能据此当成 TAG。
 - 安装器、保镖模板和桌面界面支持同一客户端模式。安装器按实际客户端和出口写入配置，App 安装位置保留为「应用程序」文件夹。界面切换客户端或执行一键修复时，可请求管理员权限同步已安装 root 保镖的模式；完整守护代码升级仍通过安装器或界面更新完成。
 - 这些改动提供 TAG 的基础兼容。Fake-IP 响应及相关网卡、DNS 行为只能作为检查信号，不能证明请求实际走了预期代理节点，也不能证明规则已置顶；仍须在 TAG 中核对 TUN、代理规则和实际出口。
+- 核心脚本支持通过 TAG 本地 Unix socket（`/var/run/tag-service/users/<uid>/tag-mihomo.sock`）读取与下发内核路由模式。当 TAG 内核处于全局模式时，WebRTC 与规则检查自动按全局代理评估；在执行「一键修复」（`fix`）时，若检测到 TAG 内核处于 rule 模式导致 STUN 暴露真实国内 IP，会自动向内核接口同步切换为 Global 模式，确保所有 UDP/STUN 流量经由代理出口，彻底解决 WebRTC 泄漏。
 - 切换器不会自动重写 TAG 的规则文件。启动客户端、检查状态及等待隧道就绪后仍不满足要求时，应由用户在 TAG 中调整配置。
 
 ## 更新通道与安装范围
