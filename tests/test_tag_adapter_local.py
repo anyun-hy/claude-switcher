@@ -206,6 +206,7 @@ printf '654\t/Applications/Claude.app/Contents/MacOS/Claude\n'
         self.stub("pgrep", '[ "$FAKE_TAG" = missing ] && exit 1; echo 321')
         self.stub("ps", '''case "$FAKE_TAG" in
     present) echo "$TAG_EXE" ;;
+    tagv2) echo "/Applications/TAGv2.app/Contents/MacOS/mihomotag-serv" ;;
     spoof) echo /usr/bin/other-process ;;
     *) exit 1 ;;
 esac''')
@@ -218,7 +219,7 @@ esac''')
         env = dict(self.env, H=str(self.home), TAG_EXE=TAG_EXE)
         clash = self.home / "Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
         clash.mkdir(parents=True)
-        for mode, expected in (("present", "tag"), ("spoof", "clash-verge")):
+        for mode, expected in (("present", "tag"), ("tagv2", "tag"), ("spoof", "clash-verge")):
             with self.subTest(mode=mode):
                 run = subprocess.run(["/bin/bash"], input=code, env=dict(env, FAKE_TAG=mode),
                                      text=True, capture_output=True, timeout=5)

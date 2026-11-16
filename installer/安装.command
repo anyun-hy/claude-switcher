@@ -149,8 +149,12 @@ tag_alive() {
     while IFS= read -r pid; do
         case "$pid" in ''|*[!0-9]*) continue ;; esac
         executable=$(ps -p "$pid" -o comm= 2>/dev/null | sed 's/^[[:space:]]*//')
-        [ "$executable" = "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin" ] && return 0
-    done < <(pgrep -f '/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin' 2>/dev/null)
+        case "$executable" in
+            "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin"|\
+            "/Applications/TAGv2.app/Contents/MacOS/mihomotag-serv"|\
+            "/Applications/TAGv2.app/Contents/MacOS/tagv2") return 0 ;;
+        esac
+    done < <(pgrep -f -iE '(/Applications/TAG\.app/|/Applications/TAGv2\.app/)' 2>/dev/null)
     return 1
 }
 if tag_alive; then

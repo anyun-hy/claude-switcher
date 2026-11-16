@@ -1772,7 +1772,9 @@ proxy_processes() {
     printf '%s\n' "$paths" | awk -F '\t' '
         NF == 2 && $1 ~ /^[1-9][0-9]*$/ && $2 ~ /^\// {
             name = $2; sub(/^.*\//, "", name)
-            if ($2 == "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin") mode = "tag"
+            if ($2 == "/Applications/TAG.app/Contents/Resources/bin/mihomo-universal-tag-darwin" || \
+                $2 == "/Applications/TAGv2.app/Contents/MacOS/mihomotag-serv" || \
+                $2 == "/Applications/TAGv2.app/Contents/MacOS/tagv2") mode = "tag"
             else if (name ~ /^verge-mihomo(-[[:alnum:]_.-]+)?$/) mode = "clash-verge"
             else if (name == "FlClashCore" || name == "FlClash") mode = "flclash"
             else if (name == "BettboxCore" || name == "Bettbox") mode = "bettbox"
