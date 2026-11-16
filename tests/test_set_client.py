@@ -216,10 +216,42 @@ esac
         run = self.run_detect()
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertEqual(run.stdout.splitlines(),
-                         ["configured=tag", "alive=0", "tun_count=0", "others=Bettbox"])
+                         ["configured=tag", "alive=0", "tun_count=0", "others=Bettbox", "claude_desktop=1,0"])
         self.assertFalse(self.signals.exists())
         self.assertFalse((self.root / ".claude-switcher").exists())
         self.assertFalse((self.root / "Library").exists())
+
+    def test_desktop_process_state_keeps_orphaned_helpers_visible(self):
+        bundle = "/private/var/folders/test/AppTranslocation/123/d/Claude.app/Contents"
+        renderer = bundle + "/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer)"
+        worker = bundle + "/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper"
+        unrelated = ((321, 0, TAG_EXE),
+                     (322, 502, "/usr/local/bin/claude"),
+                     (323, 502, "/Applications/Claude Switcher.app/Contents/MacOS/ClaudeSwitcher"),
+                     (324, 502, "/bin/sleep", DESKTOP))
+        helpers = ((325, 502, renderer), (326, 502, worker))
+        for rows, counts in (
+            (unrelated + ((327, 502, bundle + "/MacOS/Claude"),) + helpers, "1,2"),
+            (unrelated + helpers, "0,2"),
+            (unrelated, "0,0"),
+        ):
+            with self.subTest(counts=counts):
+                self.processes(*rows)
+                run = self.run_detect()
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertEqual(run.stdout.splitlines(),
+                                 ["configured=tag", "alive=1", "tun_count=1", "others=none", f"claude_desktop={counts}"])
+        self.assertFalse(self.signals.exists())
+        self.assertFalse(self.unsafe_queries.exists())
+        self.assertFalse((self.root / ".claude-switcher").exists())
+
+    def test_failed_process_probe_never_reports_desktop_stopped(self):
+        self.copy.write_text(with_process_paths(self.copy.read_text(encoding="utf-8"), 'return 1'),
+                             encoding="utf-8")
+        run = self.run_detect()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("process_probe=error", run.stdout.splitlines())
+        self.assertNotIn("claude_desktop=", run.stdout)
 
     def test_concurrent_checks_ignore_other_checks_and_argv_only_proxy_names(self):
         script = self.install_guard("tag")
@@ -253,7 +285,7 @@ return 99
         self.assertEqual(guard_result.returncode, 0, guard_result.stdout + guard_result.stderr)
         self.assertEqual(ui_result.returncode, 0, ui_result.stdout + ui_result.stderr)
         self.assertEqual(ui_result.stdout.splitlines(),
-                         ["configured=tag", "alive=1", "tun_count=1", "others=none"])
+                         ["configured=tag", "alive=1", "tun_count=1", "others=none", "claude_desktop=1,0"])
         self.assertFalse(self.signals.exists())
         self.assertFalse(self.unsafe_queries.exists(), "不得再靠命令行搜索判断冲突")
         self.assertFalse((self.root / "Library/Logs/claude-bodyguard.log").exists())

@@ -118,6 +118,8 @@ macOS 核心与保镖用系统返回的可执行文件路径识别代理，搜�
 
 原生 SwiftUI 单文件应用（无 Xcode 工程、无第三方依赖，`swiftc` 一条命令出可执行文件），图标由 Swift 代码程序生成——整个仓库不含一张设计素材。
 
+右侧账号下方显示 Claude 桌面版的进程状态。关闭 Claude 窗口后，如果主程序或应用内的后台助手还在运行，状态卡会继续显示；单独运行的 Claude Code CLI 不计入此状态。
+
 ## 安装
 
 **系统要求**：macOS · Clash Verge / FlClash / Bettbox / TAG / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）· Claude 桌面版 · python3

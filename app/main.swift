@@ -6,6 +6,23 @@ import UniformTypeIdentifiers
 
 enum RowState { case pending, ok, warn, fail, skip }
 
+enum ClaudeDesktopStatus: Equatable {
+    static let fieldPrefix = "claude_desktop="
+    case checking, unavailable, stopped
+    case running(background: Int), backgroundOnly(Int)
+
+    init(fields: [Substring]) {
+        guard fields.count == 1 else { self = .unavailable; return }
+        let counts = fields[0].dropFirst(Self.fieldPrefix.count)
+            .split(separator: ",", omittingEmptySubsequences: false)
+        guard counts.count == 2, let main = Int(counts[0]), let background = Int(counts[1]),
+              main >= 0, background >= 0 else { self = .unavailable; return }
+        if main > 0 { self = .running(background: background) }
+        else if background > 0 { self = .backgroundOnly(background) }
+        else { self = .stopped }
+    }
+}
+
 struct CheckRow: Identifiable {
     let id = UUID()
     let name: String
@@ -117,6 +134,7 @@ final class VM: ObservableObject {
     @Published private(set) var updating = false
     @Published private(set) var coreMissing = false
     @Published private(set) var currentClient = ""
+    @Published private(set) var claudeDesktopStatus: ClaudeDesktopStatus = .checking
     @Published private(set) var isSwitchingClient = false
     @Published var disabledChecks: Set<String> = []
     @Published var allowOptionalFailures = false
@@ -298,14 +316,29 @@ final class VM: ObservableObject {
         checkEnvironment { _ in self.isBusy = false }
     }
 
-    // 只读检测客户端是否关闭、是否开启了多个 TUN 或其他代理软件;发现状态变化时仅触发重新检查,绝不自动切换客户端配置
+    private var canObserveProxyChanges: Bool { !isBusy && !updating && !networkPending && !isSwitchingClient }
+
+    // 复用代理轮询获取 Claude 进程状态；只有代理状态变化才重跑环境检查。
     func pollClientStateIfNeeded() {
-        guard started, !isBusy, !updating, !networkPending, !isSwitchingClient, !isPollingClient, coreAvailable() else { return }
+        guard started, !updating, !isPollingClient else { return }
+        guard coreAvailable() else {
+            if claudeDesktopStatus != .unavailable { claudeDesktopStatus = .unavailable }
+            return
+        }
+        let observeProxy = canObserveProxyChanges
         isPollingClient = true
         run(["detect-client"], timeout: 5) { result in
             self.isPollingClient = false
-            guard result.succeeded, !self.isBusy, !self.updating, !self.isSwitchingClient else { return }
-            let snapshot = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !self.updating else { return }
+            let lines = result.output.split(whereSeparator: \.isNewline)
+            let desktopFields = lines.filter { $0.hasPrefix(ClaudeDesktopStatus.fieldPrefix) }
+            let desktop = result.succeeded && !lines.contains("process_probe=error")
+                ? ClaudeDesktopStatus(fields: desktopFields) : .unavailable
+            if self.claudeDesktopStatus != desktop { self.claudeDesktopStatus = desktop }
+
+            guard observeProxy, self.canObserveProxyChanges, result.succeeded else { return }
+            let snapshot = lines.filter { !$0.hasPrefix(ClaudeDesktopStatus.fieldPrefix) }
+                .joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !snapshot.isEmpty else { return }
             if self.lastObservedState.isEmpty {
                 self.lastObservedState = snapshot
@@ -1158,6 +1191,7 @@ struct ContentView: View {
                             else {
                                 if vm.phase == .failed || vm.phase == .fixing { retryCard }
                                 accountCard
+                                claudeDesktopCard
                             }
                         }
                         .frame(width: 292)
@@ -1350,6 +1384,39 @@ struct ContentView: View {
                 if !vm.note.isEmpty { Text(vm.note).font(.caption).foregroundColor(ClaudeTheme.warning) }
             }
         }
+    }
+
+    private var claudeDesktopCard: some View {
+        let status: (label: String, detail: String, symbol: String, color: Color)
+        switch vm.claudeDesktopStatus {
+        case .checking:
+            status = ("检测中", "正在读取桌面进程状态", "clock", ClaudeTheme.muted)
+        case .unavailable:
+            status = ("无法确认", "未能读取桌面进程状态", "questionmark.circle", ClaudeTheme.warning)
+        case .running(let background):
+            status = ("运行中", "主程序运行中 · 后台进程 \(background) 个", "circle.fill", ClaudeTheme.success)
+        case .backgroundOnly(let count):
+            status = ("仅后台运行", "主程序已退出 · 仍有 \(count) 个后台进程", "exclamationmark.triangle.fill", ClaudeTheme.warning)
+        case .stopped:
+            status = ("已退出", "未检测到主程序或后台进程", "stop.circle", ClaudeTheme.muted)
+        }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Claude 桌面版").font(.system(size: 13, weight: .semibold))
+                Spacer(minLength: 8)
+                Label(status.label, systemImage: status.symbol)
+                    .font(.system(size: 11, weight: .semibold)).foregroundColor(status.color)
+            }
+            Text(status.detail).font(.caption).foregroundColor(ClaudeTheme.muted)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ClaudeTheme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.cardBorder))
+        .accessibilityElement(children: .combine)
+        .help("读取 Claude.app 内的主程序和后台进程，不含单独运行的 Claude Code CLI。")
     }
 
     func accountSubtitle(_ t: String) -> String {
@@ -2287,6 +2354,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func startClientMonitor() {
         monitorTimer?.invalidate()
+        vm.pollClientStateIfNeeded()
         monitorTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.vm.pollClientStateIfNeeded()
         }

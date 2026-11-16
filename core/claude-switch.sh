@@ -1760,7 +1760,11 @@ PY
 
 proxy_processes() {
     local paths
-    paths=$(macos_process_paths 2>/dev/null) || return 1
+    if [ "$#" -gt 0 ]; then
+        paths="$1"
+    else
+        paths=$(macos_process_paths 2>/dev/null) || return 1
+    fi
     printf '%s\n' "$paths" | awk -F '\t' '
         NF == 2 && $1 ~ /^[1-9][0-9]*$/ && $2 ~ /^\// {
             name = $2; sub(/^.*\//, "", name)
@@ -1805,9 +1809,19 @@ detect_other_clients() {
     printf '%s\n' "$list"
 }
 
+claude_desktop_processes() {
+    # Count executables inside the desktop bundle, including orphaned helpers.
+    printf '%s\n' "$1" | awk -F '\t' '
+        NF == 2 && $1 ~ /^[1-9][0-9]*$/ && $2 ~ /^\// {
+            if ($2 ~ /\/Claude[.]app\/Contents\/MacOS\/Claude$/) desktop++
+            else if ($2 ~ /\/Claude[.]app\/Contents\//) helpers++
+        }
+        END { printf "claude_desktop=%d,%d\n", desktop, helpers }'
+}
+
 detect_client_state() {
-    local alive=0 tcnt others="" processes probe_error=0
-    if processes=$(proxy_processes); then
+    local alive=0 tcnt others="" paths processes probe_error=0
+    if paths=$(macos_process_paths 2>/dev/null) && processes=$(proxy_processes "$paths"); then
         proxy_alive "$processes" && alive=1
         others=$(detect_other_clients "$processes")
     else
@@ -1818,7 +1832,11 @@ detect_client_state() {
     echo "alive=$alive"
     echo "tun_count=$tcnt"
     echo "others=${others:-none}"
-    [ "$probe_error" -eq 0 ] || echo "process_probe=error"
+    if [ "$probe_error" -eq 0 ]; then
+        claude_desktop_processes "$paths"
+    else
+        echo "process_probe=error"
+    fi
 }
 
 # 单文件内嵌 Python 的隔离入口;策略从 WEBRTC_POLICY 或持久化文件读取。

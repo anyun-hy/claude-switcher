@@ -76,6 +76,7 @@ private final class Fixture {
         case "$1" in
           checkdetail) delay check; cat "$root/audit"; result check ;;
           status) cat "$root/status"; result status ;;
+          detect-client) cat "$root/client-probe"; result client-probe ;;
           get-client) if [ -f "$root/client" ]; then cat "$root/client"; else echo 'client=clash-verge'; fi ;;
           set-client) printf 'client=%s\\n' "$2" > "$root/client"; echo 'OK:已切换客户端' ;;
           get-check-config) cat "$root/check-config"; result get-config ;;
@@ -420,11 +421,14 @@ struct MenuBarModelTests {
                 try expect(f.calls.dropFirst(before).allSatisfy { $0 == "get-tool-config" || $0 == "network-rebuild state" }, "浏览工具页面只能读取配置和状态")
             case "dashboard_layout":
                 try f.write("client", "client=tag\n")
+                try f.write("client-probe", "configured=tag\nalive=1\ntun_count=1\nothers=none\nclaude_desktop=0,2\n")
                 try f.write("status", "current=A hasA=1 hasB=1 hasC=0 hasD=0 accounts=A,B accB=900M@2026-11-05\n")
                 let details = ["代理内核": "ok:TAG 运行中", "TUN网卡": "ok:检测通过", "出口IP": "ok:203.0.113.10/JP", "IP一致": "ok:与上次一致", "时区": "ok:Asia/Tokyo", "地区": "ok:ja_JP", "IPv6": "ok:已关闭", "DNS": "ok:走隧道", "WebRTC": "ok:STUN 仅返回代理出口地址", "保镖": "ok:巡检在线（2秒前完成）", "规则置顶": "ok:行为检测通过", "客户端语言": "ok:跟随系统（英文）", "ASN属性": "ok:Example Residential", "生态可达性": "ok:claude.ai:403 api:401"]
                 try f.audit(details)
                 let vm = f.vm()
                 vm.start(); try f.idle(vm)
+                vm.pollClientStateIfNeeded()
+                try spin { vm.claudeDesktopStatus == .backgroundOnly(2) }
                 for dark in [false, true] {
                     try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-\(dark ? "dark" : "light")", size: NSSize(width: 1060, height: 760), dark: dark)
                 }
@@ -475,6 +479,31 @@ struct MenuBarModelTests {
                 try f.audit(["TUN网卡": "fail:示例断开"])
                 vm.refresh(); try f.idle(vm)
                 try expect(ContentView(vm: vm).summaryState == .fail && ContentView(vm: vm).summaryTitle.contains("未通过"), "硬性失败必须显示未通过")
+            case "desktop_process_status":
+                let proxy = "configured=tag\nalive=1\ntun_count=1\nothers=none\n"
+                let vm = f.vm(checkTimeout: 4)
+                try f.write("check-delay", "1.5")
+                try f.write("client-probe", proxy + "claude_desktop=1,2\n")
+                vm.start()
+                vm.pollClientStateIfNeeded()
+                try spin { vm.claudeDesktopStatus == .running(background: 2) }
+                try expect(vm.isBusy, "桌面状态不用等环境检查结束")
+                try f.idle(vm)
+
+                func poll(_ snapshot: String, _ expected: ClaudeDesktopStatus) throws {
+                    try f.write("client-probe", snapshot)
+                    vm.pollClientStateIfNeeded()
+                    try spin { vm.claudeDesktopStatus == expected }
+                }
+                try poll(proxy + "claude_desktop=0,2\n", .backgroundOnly(2))
+                try poll(proxy + "claude_desktop=0,0\n", .stopped)
+                try poll(proxy, .unavailable)
+                try expect(f.calls.filter { $0 == "checkdetail" }.count == 1, "Claude 状态变化不能触发环境检查")
+
+                let changedProxy = proxy.replacingOccurrences(of: "tun_count=1", with: "tun_count=0")
+                try poll(changedProxy + "claude_desktop=0,0\n", .stopped)
+                try spin { f.calls.filter { $0 == "checkdetail" }.count == 2 }
+                try f.idle(vm)
             case "tag_client_recognized":
                 try f.write("client", "client=tag\n")
                 let vm = f.vm()
