@@ -11,6 +11,11 @@ enum ClaudeDesktopStatus: Equatable {
     case checking, unavailable, stopped
     case running(background: Int), backgroundOnly(Int)
 
+    var onlyBackground: Bool {
+        if case .backgroundOnly = self { return true }
+        return false
+    }
+
     init(fields: [Substring]) {
         guard fields.count == 1 else { self = .unavailable; return }
         let counts = fields[0].dropFirst(Self.fieldPrefix.count)
@@ -135,6 +140,8 @@ final class VM: ObservableObject {
     @Published private(set) var coreMissing = false
     @Published private(set) var currentClient = ""
     @Published private(set) var claudeDesktopStatus: ClaudeDesktopStatus = .checking
+    @Published private(set) var isQuittingClaudeDesktop = false
+    @Published private(set) var desktopQuitMessage = ""
     @Published private(set) var isSwitchingClient = false
     @Published var disabledChecks: Set<String> = []
     @Published var allowOptionalFailures = false
@@ -185,6 +192,8 @@ final class VM: ObservableObject {
     private let operationTimeout: TimeInterval
     private let updateTimeout: TimeInterval
     private let noticeDefaults: UserDefaults
+    private let desktopQuitRequest: () -> Bool
+    private var desktopQuitCheck: (deadline: Date, helpers: Bool)?
     private var consideredStartupNotice = false
     private var started = false
     private var switchRequested = false
@@ -194,15 +203,17 @@ final class VM: ObservableObject {
 
     init(core: String = NSHomeDirectory() + "/.local/bin/claude-switch.sh",
          checkTimeout: TimeInterval = 65, operationTimeout: TimeInterval = 180,
-         updateTimeout: TimeInterval = 600, noticeDefaults: UserDefaults = .standard) {
+         updateTimeout: TimeInterval = 600, noticeDefaults: UserDefaults = .standard,
+         desktopQuitRequest: (() -> Bool)? = nil) {
         self.core = core
         self.checkTimeout = checkTimeout
         self.operationTimeout = operationTimeout
         self.updateTimeout = updateTimeout
         self.noticeDefaults = noticeDefaults
+        self.desktopQuitRequest = desktopQuitRequest ?? Self.requestRegisteredDesktopQuit
     }
 
-    var canQuit: Bool { !toolRunning && !switchRequested && !updating && phase != .fixing && phase != .switching }
+    var canQuit: Bool { !toolRunning && !switchRequested && !updating && !isQuittingClaudeDesktop && phase != .fixing && phase != .switching }
 
     func start() {
         guard !started else { return }
@@ -318,14 +329,68 @@ final class VM: ObservableObject {
 
     private var canObserveProxyChanges: Bool { !isBusy && !updating && !networkPending && !isSwitchingClient }
 
+    var canQuitClaudeDesktop: Bool {
+        guard started, !isBusy, !checkingUpdate, !updating else { return false }
+        switch claudeDesktopStatus {
+        case .running, .backgroundOnly: return true
+        default: return false
+        }
+    }
+
+    private static func requestRegisteredDesktopQuit() -> Bool {
+        // Target running AppKit instances; a quit request must never open Claude.
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop")
+        return apps.filter {
+            !$0.isTerminated && $0.executableURL?.path.hasSuffix("/Claude.app/Contents/MacOS/Claude") == true
+        }.map { $0.terminate() }.contains(true)
+    }
+
+    func quitClaudeDesktop(helpers: Bool) {
+        guard canQuitClaudeDesktop, claudeDesktopStatus.onlyBackground == helpers else { return }
+        hideAfterSwitch?.cancel()
+        isBusy = true
+        isQuittingClaudeDesktop = true
+        desktopQuitMessage = ""
+        if helpers {
+            run(["quit-desktop-helpers"], timeout: 10) { result in
+                if result.succeeded {
+                    self.beginDesktopQuitCheck(helpers: true)
+                } else {
+                    let reason = result.output.split(whereSeparator: \.isNewline).first { $0.hasPrefix("FAIL:") }
+                    self.finishDesktopQuit(reason.map { String($0.dropFirst(5)) } ?? "未能结束后台进程，请重试")
+                    self.pollClientStateIfNeeded()
+                }
+            }
+        } else if desktopQuitRequest() {
+            beginDesktopQuitCheck(helpers: false)
+        } else {
+            finishDesktopQuit("无法请求退出，请从 Claude 菜单退出")
+            pollClientStateIfNeeded()
+        }
+    }
+
+    private func beginDesktopQuitCheck(helpers: Bool) {
+        desktopQuitCheck = (Date().addingTimeInterval(8), helpers)
+        pollClientStateIfNeeded()
+    }
+
+    private func finishDesktopQuit(_ message: String = "") {
+        desktopQuitCheck = nil
+        desktopQuitMessage = message
+        isQuittingClaudeDesktop = false
+        isBusy = false
+    }
+
     // 复用代理轮询获取 Claude 进程状态；只有代理状态变化才重跑环境检查。
     func pollClientStateIfNeeded() {
         guard started, !updating, !isPollingClient else { return }
         guard coreAvailable() else {
             if claudeDesktopStatus != .unavailable { claudeDesktopStatus = .unavailable }
+            if desktopQuitCheck != nil { finishDesktopQuit("无法确认退出结果") }
             return
         }
         let observeProxy = canObserveProxyChanges
+        let quitCheck = desktopQuitCheck  // An observation begun before the request cannot confirm it.
         isPollingClient = true
         run(["detect-client"], timeout: 5) { result in
             self.isPollingClient = false
@@ -335,6 +400,15 @@ final class VM: ObservableObject {
             let desktop = result.succeeded && !lines.contains("process_probe=error")
                 ? ClaudeDesktopStatus(fields: desktopFields) : .unavailable
             if self.claudeDesktopStatus != desktop { self.claudeDesktopStatus = desktop }
+            if let check = quitCheck {
+                if desktop == .stopped || (!check.helpers && desktop.onlyBackground) {
+                    self.finishDesktopQuit()
+                } else if Date() >= check.deadline {
+                    self.finishDesktopQuit(desktop == .unavailable ? "无法确认退出结果" : "仍检测到进程，可重试")
+                }
+            } else if desktop == .stopped && !self.isQuittingClaudeDesktop && !self.desktopQuitMessage.isEmpty {
+                self.desktopQuitMessage = ""
+            }
 
             guard observeProxy, self.canObserveProxyChanges, result.succeeded else { return }
             let snapshot = lines.filter { !$0.hasPrefix(ClaudeDesktopStatus.fieldPrefix) }
@@ -1400,6 +1474,7 @@ struct ContentView: View {
         case .stopped:
             status = ("已退出", "未检测到主程序或后台进程", "stop.circle", ClaudeTheme.muted)
         }
+        let helpers = vm.claudeDesktopStatus.onlyBackground
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Claude 桌面版").font(.system(size: 13, weight: .semibold))
@@ -1409,13 +1484,26 @@ struct ContentView: View {
             }
             Text(status.detail).font(.caption).foregroundColor(ClaudeTheme.muted)
                 .fixedSize(horizontal: false, vertical: true)
+            if !vm.desktopQuitMessage.isEmpty {
+                Text(vm.desktopQuitMessage).font(.caption).foregroundColor(ClaudeTheme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button { vm.quitClaudeDesktop(helpers: helpers) } label: {
+                    Label(vm.isQuittingClaudeDesktop ? "正在确认退出…" : (helpers ? "结束后台进程" : "退出 Claude"),
+                          systemImage: helpers ? "stop.circle" : "power")
+                }
+                .disabled(!vm.canQuitClaudeDesktop)
+                .help(helpers ? "结束剩余的 Claude 桌面后台任务" : "正常退出 Claude 桌面版")
+            }
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(ClaudeTheme.card)
         .clipShape(RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.cardBorder))
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
         .help("读取 Claude.app 内的主程序和后台进程，不含单独运行的 Claude Code CLI。")
     }
 

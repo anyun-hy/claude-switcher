@@ -59,7 +59,13 @@ case "$1" in
 esac
 ''')
         source = SCRIPT.read_text(encoding="utf-8")
-        source = with_process_paths(source, 'cut -f1,3 "$TEST_PROCESS_TABLE"')
+        source = with_process_paths(source, r'''
+if [ "$#" -eq 1 ]; then
+    awk -F '\t' -v pid="$1" '$1 == pid {print $1 "\t" $3}' "${TEST_PROCESS_RECHECK_TABLE:-$TEST_PROCESS_TABLE}"
+else
+    cut -f1,3 "$TEST_PROCESS_TABLE"
+fi
+''')
         source = source.replace("/Library/Application Support/claude-switcher/claude-bodyguard.sh", str(self.guard))
         self.copy.write_text(source, encoding="utf-8")
 
@@ -252,6 +258,38 @@ esac
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("process_probe=error", run.stdout.splitlines())
         self.assertNotIn("claude_desktop=", run.stdout)
+
+    def run_quit_desktop_helpers(self):
+        return subprocess.run(
+            ["/bin/bash", "-c", 'enable -n kill || exit 1; . "$1" quit-desktop-helpers', "core", str(self.copy)],
+            env=self.env, capture_output=True, text=True, timeout=10)
+
+    def test_quit_desktop_helpers_signals_only_reverified_owned_helper(self):
+        (self.root / ".claude-switcher").mkdir()
+        self.stub("id", "#!/bin/sh\necho 502\n")
+        helper = "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper"
+        self.processes((561, 502, helper), (562, 502, helper), (563, 503, helper),
+                       (564, 502, "/usr/local/bin/claude"), (565, 0, TAG_EXE),
+                       (566, 502, "/bin/sleep", helper))
+        recheck = self.root / "process-recheck.tsv"
+        recheck.write_text(self.table.read_text().replace(f"562\t502\t{helper}", "562\t502\t/bin/sleep"))
+        self.env["TEST_PROCESS_RECHECK_TABLE"] = str(recheck)
+        run = self.run_quit_desktop_helpers()
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("FAIL:部分 Claude 后台进程无法结束", run.stdout)
+        self.assertEqual(self.signals.read_text(), "-TERM 561\n")
+        self.assertEqual(list((self.root / ".claude-switcher").iterdir()), [])
+
+    def test_quit_desktop_helpers_does_not_signal_when_main_is_running(self):
+        (self.root / ".claude-switcher").mkdir()
+        self.stub("id", "#!/bin/sh\necho 502\n")
+        self.processes((551, 502, DESKTOP),
+                       (552, 502, "/Applications/Claude.app/Contents/Frameworks/Helper.app/Contents/MacOS/Helper"))
+        run = self.run_quit_desktop_helpers()
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("FAIL:Claude 主程序仍在运行", run.stdout)
+        self.assertFalse(self.signals.exists())
+        self.assertEqual(list((self.root / ".claude-switcher").iterdir()), [])
 
     def test_concurrent_checks_ignore_other_checks_and_argv_only_proxy_names(self):
         script = self.install_guard("tag")

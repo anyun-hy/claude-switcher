@@ -1600,7 +1600,7 @@ case "${1:-}" in
         ;;
 esac
 case "${1:-}" in
-    detect-client|get-tool-config|set-keep-paths|network-rebuild) ;;  # 状态探测不初始化账号目录。
+    detect-client|quit-desktop-helpers|get-tool-config|set-keep-paths|network-rebuild) ;;  # 不初始化账号目录。
     *) mkdir -p "$BASE/accounts" ;;
 esac
 
@@ -1729,7 +1729,7 @@ shadowrocket_up() {
 # Keep the process probe and classifier in sync with daemons/claude-bodyguard.sh.
 # macOS ps comm can report argv[0]. Use the kernel's executable path instead.
 macos_process_paths() {
-    /usr/bin/python3 -I -S -B - <<'PY'
+    /usr/bin/python3 -I -S -B - "$@" <<'PY'
 import ctypes
 import sys
 
@@ -1738,16 +1738,20 @@ lib.proc_listallpids.argtypes = (ctypes.c_void_p, ctypes.c_int)
 lib.proc_listallpids.restype = ctypes.c_int
 lib.proc_pidpath.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
 lib.proc_pidpath.restype = ctypes.c_int
-count = lib.proc_listallpids(None, 0)
-if count <= 0:
-    sys.exit(1)
-pids = (ctypes.c_int * (count + 256))()
-count = lib.proc_listallpids(pids, ctypes.sizeof(pids))
-if not 0 < count < len(pids):
-    sys.exit(1)
+if len(sys.argv) == 2:
+    pids = (int(sys.argv[1]),)
+else:
+    count = lib.proc_listallpids(None, 0)
+    if count <= 0:
+        sys.exit(1)
+    capacity = (ctypes.c_int * (count + 256))()
+    count = lib.proc_listallpids(capacity, ctypes.sizeof(capacity))
+    if not 0 < count < len(capacity):
+        sys.exit(1)
+    pids = capacity[:count]
 buf = ctypes.create_string_buffer(4096)
 readable = False
-for pid in pids[:count]:
+for pid in pids:
     if pid <= 0 or lib.proc_pidpath(pid, buf, len(buf)) <= 0:
         continue
     path = buf.value
@@ -1810,13 +1814,16 @@ detect_other_clients() {
 }
 
 claude_desktop_processes() {
-    # Count executables inside the desktop bundle, including orphaned helpers.
-    printf '%s\n' "$1" | awk -F '\t' '
+    # A single path classifier supplies both counts and eligible helper targets.
+    printf '%s\n' "$1" | awk -F '\t' -v output="${2:-counts}" '
         NF == 2 && $1 ~ /^[1-9][0-9]*$/ && $2 ~ /^\// {
-            if ($2 ~ /\/Claude[.]app\/Contents\/MacOS\/Claude$/) desktop++
-            else if ($2 ~ /\/Claude[.]app\/Contents\//) helpers++
+            if ($2 ~ /\/Claude[.]app\/Contents\/MacOS\/Claude$/) kind = "main"
+            else if ($2 ~ /\/Claude[.]app\/Contents\//) kind = "helper"
+            else next
+            if (output == "targets") printf "%s\t%s\t%s\n", kind, $1, $2
+            else counts[kind]++
         }
-        END { printf "claude_desktop=%d,%d\n", desktop, helpers }'
+        END { if (output == "counts") printf "claude_desktop=%d,%d\n", counts["main"], counts["helper"] }'
 }
 
 detect_client_state() {
@@ -1836,6 +1843,36 @@ detect_client_state() {
         claude_desktop_processes "$paths"
     else
         echo "process_probe=error"
+    fi
+}
+
+quit_desktop_helpers() {
+    local uid paths targets kind pid path owner live failed=0
+    uid=$(id -u) || return 1
+    case "$uid" in
+        ''|0|*[!0-9]*) echo "FAIL:请以当前桌面用户结束后台进程"; return 1 ;;
+    esac
+    cli_lock_acquire || return 1
+    if ! paths=$(macos_process_paths 2>/dev/null) || ! targets=$(claude_desktop_processes "$paths" targets); then
+        echo "FAIL:无法核验 Claude 后台进程"
+        return 1
+    fi
+    if [[ $'\n'$targets == *$'\nmain\t'* ]]; then
+        echo "FAIL:Claude 主程序仍在运行，请先退出 Claude"
+        return 1
+    fi
+    while IFS=$'\t' read -r kind pid path; do
+        [ "$kind" = helper ] || continue
+        owner=$(ps -p "$pid" -o uid= 2>/dev/null) || continue
+        if [ "${owner//[[:space:]]/}" != "$uid" ]; then failed=1; continue; fi
+        # Recheck the executable for this PID just before sending TERM.
+        live=$(macos_process_paths "$pid" 2>/dev/null) || continue
+        [ "$live" = "$pid"$'\t'"$path" ] || continue
+        kill -TERM "$pid" 2>/dev/null || failed=1
+    done <<< "$targets"
+    if [ "$failed" -ne 0 ]; then
+        echo "FAIL:部分 Claude 后台进程无法结束"
+        return 1
     fi
 }
 
@@ -3887,6 +3924,7 @@ case "$operation" in
     set-client) set_client "${2:-}" "${3:-}" ;;
     get-client) get_client ;;
     detect-client) detect_client_state ;;
+    quit-desktop-helpers) quit_desktop_helpers ;;
     update) self_update "${2:-}" ;;
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     open-safe) open_safe "${2:-}" ;;
@@ -3911,7 +3949,7 @@ if [ "$operation" != "checkdetail" ]; then
     rc=$dispatch_rc
 fi
 case "$operation" in
-    get-check-config|set-check-config|get-tool-config|set-keep-paths|export-diagnostics|detect-client|network-rebuild) ;;
+    get-check-config|set-check-config|get-tool-config|set-keep-paths|export-diagnostics|detect-client|quit-desktop-helpers|network-rebuild) ;;
     *) log_result "$started_at" "$operation" "$rc" "$summary" ;;
 esac
 exit "$rc"
