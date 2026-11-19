@@ -1324,84 +1324,104 @@ extension RowState {
 
 // MARK: - 视图
 
-struct IPChangeDisclosure: View {
-    let change: IPChange
-    @Binding var isExpanded: Bool
+struct IPChangeSummary: View {
+    let summary: String
+    @Binding var isShowingDetails: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 12) {
-                Image(systemName: RowState.warn.symbol)
-                    .font(.system(size: 13, weight: .medium))
+        HStack(spacing: 12) {
+            Image(systemName: RowState.warn.symbol)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(ClaudeTheme.warning)
+                .frame(width: 20)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("出口 IP 已变化")
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(ClaudeTheme.warning)
-                    .frame(width: 20)
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("出口 IP 已变化")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(ClaudeTheme.warning)
-                    Text(change.summary)
-                        .font(.caption)
-                        .foregroundColor(ClaudeTheme.muted)
-                }
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                Button {
-                    isExpanded.toggle()
-                } label: {
-                    Label(isExpanded ? "收起对比" : "查看对比",
-                          systemImage: isExpanded ? "chevron.up" : "chevron.down")
-                }
-                .buttonStyle(ClaudeActionStyle())
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(ClaudeTheme.warning.opacity(0.08))
-
-            if isExpanded {
-                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
-                    GridRow {
-                        Color.clear.frame(width: 68, height: 1).accessibilityHidden(true)
-                        Text("变化前").font(.caption).foregroundColor(ClaudeTheme.muted)
-                        Text("当前").font(.caption.weight(.semibold))
-                    }
-                    ForEach(change.fields) { field in
-                        Divider().overlay(ClaudeTheme.divider).gridCellUnsizedAxes(.horizontal)
-                        GridRow(alignment: .top) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(field.key.title).font(.system(size: 12, weight: .medium))
-                                Text(field.status.title)
-                                    .font(.caption2)
-                                    .foregroundColor(field.status == .changed ? ClaudeTheme.warning : ClaudeTheme.muted)
-                            }
-                            .frame(width: 68, alignment: .leading)
-                            value(field.before, field: field, current: false)
-                            value(field.after, field: field, current: true)
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 16)
-                .padding(.top, 10)
-                Text("最近变化 \(change.changedAt)")
+                Text(summary)
                     .font(.caption)
                     .foregroundColor(ClaudeTheme.muted)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button {
+                isShowingDetails.toggle()
+            } label: {
+                Label(isShowingDetails ? "关闭对比" : "查看对比",
+                      systemImage: isShowingDetails ? "xmark" : "chevron.right")
+            }
+            .buttonStyle(ClaudeActionStyle())
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(ClaudeTheme.warning.opacity(0.08))
+    }
+}
+
+struct IPChangeDetails: View {
+    let change: IPChange?
+    let legacyDetail: String?
+    let close: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("出口 IP 对比").font(.system(size: 14, weight: .semibold))
+                    if let change {
+                        Text("最近变化 \(change.changedAt)").font(.caption).foregroundColor(ClaudeTheme.muted)
+                    }
+                }
+                Spacer()
+                ClaudeIconButton(systemName: "xmark", help: "关闭出口 IP 对比", action: close)
+            }
+            if let change {
+                ForEach(change.fields) { field in
+                    Divider().overlay(ClaudeTheme.divider)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(field.key.title).font(.system(size: 12, weight: .medium))
+                            Spacer()
+                            Text(field.status.title)
+                                .font(.caption2)
+                                .foregroundColor(field.status == .changed ? ClaudeTheme.warning : ClaudeTheme.muted)
+                        }
+                        value(field.before, field: field, current: false)
+                        value(field.after, field: field, current: true)
+                    }
+                }
+            } else if let legacyDetail {
+                Text(legacyDetail)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
             }
         }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ClaudeTheme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.cardBorder))
     }
 
     private func value(_ value: String?, field: IPChange.Field, current: Bool) -> some View {
         let different = current && field.status == .changed
-        return Text(value ?? "未采集")
-            .font(.system(size: 12, weight: different ? .semibold : .regular,
-                          design: field.key.monospaced ? .monospaced : .default))
-            .foregroundColor(different ? ClaudeTheme.warning : (current && value != nil ? ClaudeTheme.ink : ClaudeTheme.muted))
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-            .textSelection(.enabled)
-            .accessibilityLabel("\(current ? "当前" : "变化前")\(field.key.title) \(value ?? "未采集")")
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(current ? "当前" : "变化前")
+                .font(.caption2)
+                .foregroundColor(ClaudeTheme.muted)
+                .frame(width: 36, alignment: .leading)
+                .accessibilityHidden(true)
+            Text(value ?? "未采集")
+                .font(.system(size: 12, weight: different ? .semibold : .regular,
+                              design: field.key.monospaced ? .monospaced : .default))
+                .foregroundColor(different ? ClaudeTheme.warning : (current && value != nil ? ClaudeTheme.ink : ClaudeTheme.muted))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+                .accessibilityLabel("\(current ? "当前" : "变化前")\(field.key.title) \(value ?? "未采集")")
+        }
     }
 }
 
@@ -1420,6 +1440,11 @@ struct ContentView: View {
                         checksCard.frame(maxWidth: .infinity)
                         VStack(spacing: 16) {
                             clientCard
+                            if vm.showIPComparison, vm.ipChange != nil || legacyIPComparison != nil {
+                                IPChangeDetails(change: vm.ipChange, legacyDetail: legacyIPComparison) {
+                                    vm.showIPComparison = false
+                                }
+                            }
                             if vm.coreMissing { setupCard }
                             else {
                                 if vm.phase == .failed || vm.phase == .fixing { retryCard }
@@ -1534,6 +1559,10 @@ struct ContentView: View {
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.cardBorder))
     }
 
+    private var legacyIPComparison: String? {
+        vm.rows.first { $0.name == IPChange.rowName && $0.state == .warn && $0.detail.contains("\n") }?.detail
+    }
+
     var checksCard: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
@@ -1546,10 +1575,10 @@ struct ContentView: View {
             }.padding(.horizontal, 16).padding(.vertical, 10)
             Divider().overlay(ClaudeTheme.divider)
             ForEach(Array(vm.rows.enumerated()), id: \.element.id) { index, row in
-                if row.name == IPChange.rowName, row.state == .warn, let change = vm.ipChange {
-                    IPChangeDisclosure(change: change, isExpanded: $vm.showIPComparison)
+                if row.name == IPChange.rowName, row.state == .warn,
+                   let summary = vm.ipChange?.summary ?? legacyIPComparison.map({ $0.components(separatedBy: "\n").first ?? $0 }) {
+                    IPChangeSummary(summary: summary, isShowingDetails: $vm.showIPComparison)
                 } else {
-                    let wrapsDetail = row.name == IPChange.rowName && row.state == .warn
                     HStack(spacing: 12) {
                         Image(systemName: row.icon)
                             .font(.system(size: 13)).foregroundColor(ClaudeTheme.muted)
@@ -1559,8 +1588,7 @@ struct ContentView: View {
                         Text(row.detail.isEmpty ? "—" : row.detail)
                             .font(.system(size: 12))
                             .foregroundColor(row.state == .warn ? ClaudeTheme.warning : ClaudeTheme.muted)
-                            .lineLimit(wrapsDetail ? nil : 1).truncationMode(.middle)
-                            .fixedSize(horizontal: false, vertical: wrapsDetail)
+                            .lineLimit(1).truncationMode(.middle)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .help(row.name == "保镖在线" && !vm.guardLastEvent.isEmpty
                                   ? row.detail + "\n上次保护事件：" + vm.guardLastEvent : row.detail)
@@ -1570,7 +1598,6 @@ struct ContentView: View {
                             .frame(width: 62, alignment: .leading)
                     }
                     .padding(.horizontal, 16)
-                    .padding(.vertical, wrapsDetail ? 4 : 0)
                     .frame(minHeight: 31)
                     .accessibilityElement(children: .combine)
                 }

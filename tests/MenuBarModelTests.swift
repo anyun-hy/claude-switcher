@@ -454,7 +454,7 @@ struct MenuBarModelTests {
                     "summary": "跨网段 · 国家变化 · ASN 变化",
                     "fields": [
                         ["key": "ip", "before": "2001:db8:1234:5678:90ab:cdef:1234:5678", "after": "203.0.113.10", "status": "changed"],
-                        ["key": "prefix", "before": "2001:db8:1234::/48", "after": "203.0.113.0/24", "status": "changed"],
+                        ["key": "prefix", "before": "2001:db8:1234::/48 (RIPEstat BGP)", "after": "203.0.113.0/24 (RIPEstat BGP)", "status": "changed"],
                         ["key": "location", "before": "US / California / Palo Alto", "after": "JP / Tokyo / Shinjuku", "status": "changed"],
                         ["key": "asn", "before": "AS64512", "after": "AS64513", "status": "changed"],
                         ["key": "org", "before": "Example Fiber", "after": "Example Hosting", "status": "changed"],
@@ -473,14 +473,18 @@ struct MenuBarModelTests {
                            "对照表应收到完整的 IPv6 地址")
                 try expect(change.fields.last?.before == nil && change.fields.last?.status == .unknown,
                            "旧样本缺失的类型应显示未确认")
-                let width: CGFloat = 498
-                let collapsed = NSHostingView(rootView: IPChangeDisclosure(change: change, isExpanded: .constant(false)).frame(width: width))
-                let expanded = NSHostingView(rootView: IPChangeDisclosure(change: change, isExpanded: .constant(true)).frame(width: width))
-                try expect(collapsed.fittingSize.height <= 68 && expanded.fittingSize.height > collapsed.fittingSize.height,
-                           "初始应只显示摘要，展开才显示前后对照")
+                let width: CGFloat = 480
+                let collapsed = NSHostingView(rootView: ContentView(vm: vm).checksCard.frame(width: width))
+                let collapsedHeight = collapsed.fittingSize.height
                 try render(ContentView(vm: vm).frame(width: 860, height: 620),
                            name: "dashboard-warning-compact", size: NSSize(width: 860, height: 620))
                 vm.showIPComparison = true
+                let showingDetails = NSHostingView(rootView: ContentView(vm: vm).checksCard.frame(width: width))
+                try expect(abs(showingDetails.fittingSize.height - collapsedHeight) < 1,
+                           "打开右侧对比时，左侧检查列表高度不能变化")
+                let panel = NSHostingView(rootView: IPChangeDetails(change: change, legacyDetail: nil, close: {}).frame(width: 292))
+                try expect(panel.fittingSize.width <= 292 && panel.fittingSize.height > 160,
+                           "对比详情需完整排进原有右栏宽度")
                 for dark in [false, true] {
                     try render(ContentView(vm: vm).frame(width: 860, height: 900),
                                name: "dashboard-ip-comparison-\(dark ? "dark" : "light")",
