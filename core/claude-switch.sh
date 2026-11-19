@@ -535,6 +535,14 @@ ALL_CHECKS = ("代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "�
               "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性")
 DEFAULTS = {"disabled": [], "allowOptionalFailures": False, "logging": True}
 LOG_LIMIT = 512 * 1024
+# Preserve the existing macOS carrier recognition independently of an ASN's PeeringDB label.
+KNOWN_CARRIERS = (
+    "Comcast", "AT&T", "Verizon", "Spectrum", "Charter", "Cox", "T-Mobile", "Cable", "esidential",
+    "NTT", "KDDI", "SoftBank", "IIJ", "OCN", "So-net",
+    "HiNet", "Chunghwa", "CHT", "kbro", "Taiwan", "FarEasTone", "Data Communication",
+    "Singtel", "StarHub", "M1", "HKT", "PCCW", "HKBN", "HGC",
+    "BT", "Sky", "Virgin", "TalkTalk", "Vodafone", "Deutsche Telekom", "1&1", "O2",
+)
 
 
 def fail():
@@ -580,12 +588,16 @@ def clean_ip_profile(address, raw):
     asn = raw.get("asn")
     if isinstance(asn, str) and re.fullmatch(r"AS[1-9][0-9]{0,9}", asn) and int(asn[2:]) <= 4294967295:
         profile.update(asn=asn, org=profile_text(raw.get("org")), type=profile_text(raw.get("type")))
-    prefix = raw.get("prefix")
-    if isinstance(prefix, str) and re.fullmatch(r"[0-9a-fA-F.:]+/[0-9]{1,3}", prefix):
+    for key in ("prefix", "bgp_prefix"):
+        prefix = raw.get(key)
+        if not isinstance(prefix, str) or not re.fullmatch(r"[0-9a-fA-F.:]+/[0-9]{1,3}", prefix):
+            continue
+        if key == "bgp_prefix" and "asn" not in profile:
+            continue
         try:
             network = ipaddress.ip_network(prefix)
             if network.prefixlen and address in network:
-                profile["prefix"] = str(network)
+                profile[key] = str(network)
         except ValueError:
             pass
     return {key: value for key, value in profile.items() if value}
@@ -617,9 +629,18 @@ def parse_egress_profile():
 
 def describe_egress_profile():
     with os.fdopen(3, encoding="utf-8", errors="replace") as sample:
+        address = parse_address(sample.readline(80).strip())
         profile = json_object(sample.readline(4096))
         networks = json_object(sample.read(16384)).get("data")
+    with os.fdopen(4, encoding="utf-8", errors="replace") as sample:
+        route = json_object(sample.read(16384))
     number = profile.get("asn", "")[2:]
+    route_data = route.get("data")
+    if (number and address is not None and route.get("status") == "ok" and isinstance(route_data, dict)
+            and isinstance(route_data.get("asns"), list) and number in route_data["asns"]):
+        validated = clean_ip_profile(address, dict(profile, bgp_prefix=route_data.get("prefix")))
+        if "bgp_prefix" in validated:
+            profile["bgp_prefix"] = validated["bgp_prefix"]
     if number and isinstance(networks, list):
         for network in networks:
             if not isinstance(network, dict) or str(network.get("asn")) != number:
@@ -632,10 +653,14 @@ def describe_egress_profile():
             break
     kind = profile.get("type", "")
     identity = " ".join(filter(None, (profile.get("asn"), profile.get("org"))))
-    detail = [identity, kind or "网络类型未确认"]
-    if "prefix" in profile:
+    detail = [identity, f"ASN 登记 {kind}" if kind else "网络类型未确认"]
+    if "bgp_prefix" in profile:
+        detail.append("BGP 网段 " + profile["bgp_prefix"])
+    elif "prefix" in profile:
         detail.append("网段 " + profile["prefix"])
-    print(("ok:" if kind == "Cable/DSL/ISP" else "warn:") + " · ".join(filter(None, detail)))
+    org = profile.get("org", "")
+    status = "ok" if kind == "Cable/DSL/ISP" or any(name in org for name in KNOWN_CARRIERS) else "warn"
+    print(status + ":" + " · ".join(filter(None, detail)))
     print(json.dumps(profile, ensure_ascii=False))
 
 
@@ -666,7 +691,7 @@ def merged_ip_profile(previous, current):
     # An unavailable lookup must not erase a useful sample for the same IP.
     # Discard dependent fields when their new parent value differs.
     prior = previous.copy()
-    for key, dependent in (("country", ("region", "city")), ("region", ("city",)), ("asn", ("org", "type"))):
+    for key, dependent in (("country", ("region", "city")), ("region", ("city",)), ("asn", ("org", "type", "bgp_prefix"))):
         if current.get(key) and prior.get(key) != current[key]:
             for field in dependent:
                 prior.pop(field, None)
@@ -678,10 +703,22 @@ def ip_location(profile, show_profile):
     return " / ".join(filter(None, (profile.get(key) for key in keys)))
 
 
+def ip_prefix(profile):
+    if profile.get("bgp_prefix"):
+        return profile["bgp_prefix"], "RIPEstat BGP"
+    if profile.get("prefix"):
+        return profile["prefix"], "地理库"
+    return None, None
+
+
+def ip_prefix_display(value, source):
+    return f"{value} ({source})" if value else None
+
+
 def describe_ip_sample(address, profile, show_profile):
     parts = [f"IP：{address}"]
     if show_profile:
-        parts.append(f"网段 {profile.get('prefix', '未采集')}")
+        parts.append(f"网段 {ip_prefix_display(*ip_prefix(profile)) or '未采集'}")
     parts.append(f"归属地 {ip_location(profile, show_profile) or '未采集'}")
     if show_profile:
         identity = " ".join(filter(None, (profile.get("asn"), profile.get("org"))))
@@ -710,8 +747,11 @@ def compare_ip_profiles(before, after, show_profile):
     verdicts = {"unknown": "未确认", "same": "相同", "changed": "变化"}
     network = []
     if show_profile:
-        network = [(label, compare_ip_values(before.get(key), after.get(key))) for label, key in
-                   (("网段", "prefix"), ("ASN ", "asn"), ("运营组织", "org"), ("网络类型", "type"))]
+        old, old_source = ip_prefix(before)
+        new, new_source = ip_prefix(after)
+        network = [("网段", compare_ip_values(old, new) if old_source == new_source else "unknown")]
+        network.extend((label, compare_ip_values(before.get(key), after.get(key))) for label, key in
+                       (("ASN ", "asn"), ("运营组织", "org"), ("网络类型", "type")))
     return " · ".join(label + verdicts[status] for label, status in
                       network + ip_location_comparisons(before, after, show_profile))
 
@@ -724,14 +764,18 @@ def ip_comparison_event(previous_ip, before, current_ip, after, changed_at, show
     fields = [field("ip", str(previous_ip), str(current_ip))]
     summary = []
     if show_profile:
-        prefix = field("prefix", before.get("prefix"), after.get("prefix"))
-        fields.append(prefix)
-        if prefix["status"] == "changed":
-            old_net = ipaddress.ip_network(prefix["before"])
-            new_net = ipaddress.ip_network(prefix["after"])
+        old, old_source = ip_prefix(before)
+        new, new_source = ip_prefix(after)
+        status = compare_ip_values(old, new) if old_source == new_source else "unknown"
+        fields.append(field("prefix", ip_prefix_display(old, old_source), ip_prefix_display(new, new_source), status))
+        if status == "changed":
+            old_net = ipaddress.ip_network(old)
+            new_net = ipaddress.ip_network(new)
             summary.append("网段变化" if old_net.overlaps(new_net) else "跨网段")
+        elif old_source and new_source and old_source != new_source:
+            summary.append("网段来源不同")
         else:
-            summary.append("同网段换 IP" if prefix["status"] == "same" else "网段未确认")
+            summary.append("同网段换 IP" if status == "same" else "网段未确认")
 
     locations = ip_location_comparisons(before, after, show_profile)
     changed_location = next((label for label, status in locations if status == "changed"), "")
@@ -2390,12 +2434,12 @@ egress_profile_fetch() {
     local processes
     processes=$(proxy_processes) && proxy_alive "$processes" && tun_up &&
         [ -z "$(detect_other_clients "$processes")" ] || return 1
-    curl -q -fs --max-time 2 --max-filesize 16384 "$1" 2>/dev/null
+    curl -q -fs --max-time 2 --max-filesize 16384 "$@" 2>/dev/null
 }
 
 egress_profile() {
-    local address="$1" raw record asn registered=""
-    # Keyless self-lookups only. Never send an old exit address to a provider.
+    local address="$1" raw record asn registered="" route=""
+    # Public lookups only. Never send an old exit address to a provider.
     [[ "$address" =~ ^[0-9A-Fa-f.:]+$ ]] && [ "${#address}" -le 45 ] || return 0
     raw=$(egress_profile_fetch 'https://ipapi.co/json/') || raw=""
     record=$("$0" _support parse-egress-profile 3<<<"$address"$'\n'"$raw")
@@ -2407,8 +2451,10 @@ egress_profile() {
     asn=${record%%$'\n'*}
     if [[ "$asn" =~ ^AS([0-9]+)$ ]]; then
         registered=$(egress_profile_fetch "https://www.peeringdb.com/api/net?asn=${BASH_REMATCH[1]}&fields=asn,info_type,info_types") || registered=""
+        route=$(printf '%s' "$address" | egress_profile_fetch --get --data-urlencode 'resource@-' \
+            'https://stat.ripe.net/data/network-info/data.json') || route=""
     fi
-    "$0" _support describe-egress-profile 3<<<"${record#*$'\n'}"$'\n'"$registered"
+    "$0" _support describe-egress-profile 3<<<"$address"$'\n'"${record#*$'\n'}"$'\n'"$registered" 4<<<"$route"
 }
 
 # ---------- 安全检查 ----------
@@ -2847,7 +2893,7 @@ checkdetail() {
             optional_result "客户端语言" fail "跟随系统(中文)"
         fi
     fi
-    # 13. Registered network type for the sampled ASN; it is not a per-IP classification.
+    # 13. Carrier recognition with the ASN's registered network type as detail.
     optional_result "ASN属性" "${asn_state%%:*}" "${asn_state#*:}"
     # 14. Anthropic 生态可达性
     if check_disabled "生态可达性"; then

@@ -93,14 +93,16 @@ case "$*" in
   *ipapi.co*) printf '%s' "$TEST_IPAPI" ;;
   *ipinfo.io*) printf '%s' "$TEST_IPINFO" ;;
   *peeringdb.com*) printf '%s' "$TEST_PEERING" ;;
+  *stat.ripe.net*) if [ "$(cat)" = "$TEST_EXIT_IP" ]; then printf '%s' "$TEST_RIPE"; fi ;;
   *claude.ai*|*api.anthropic.com*) printf '200' ;;
 esac''')
         self.stub("python3", 'printf "RESULT:%s\n" "$TEST_EXIT_IP"')
 
-    def run_ip_audit(self, command, addr, when, country="US", ipapi=None, ipinfo=None, networks=(), *, app=False):
+    def run_ip_audit(self, command, addr, when, country="US", ipapi=None, ipinfo=None, networks=(), *, app=False, route=None):
         env = dict(self.env, TEST_EXIT_IP=addr, TEST_EPOCH=str(when), TEST_EXIT_COUNTRY=country, TZ="UTC",
                    TEST_IPAPI=json.dumps(ipapi), TEST_IPINFO=json.dumps(ipinfo),
                    TEST_PEERING=json.dumps({"data": list(networks)}),
+                   TEST_RIPE=json.dumps(route),
                    CLAUDE_SWITCHER_IP_COMPARISON="1" if app else "0")
         return subprocess.run(["/bin/bash", str(self.core), command], env=env,
                               text=True, capture_output=True, timeout=10)
@@ -249,7 +251,7 @@ esac''')
         isp = {"asn": 64512, "info_types": ["Cable/DSL/ISP"]}
         run = self.run_ip_audit("checkdetail", a, start, ipapi=first, networks=[isp])
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertIn("ASN属性=ok:AS64512 Example Fiber · Cable/DSL/ISP · 网段 203.0.113.0/24", run.stdout)
+        self.assertIn("ASN属性=ok:AS64512 Example Fiber · ASN 登记 Cable/DSL/ISP · 网段 203.0.113.0/24", run.stdout)
 
         run = self.run_ip_audit("checkdetail", b, start + 60,
                                 ipapi=dict(first, ip=b, city="Mountain View"), networks=[isp])
@@ -265,7 +267,8 @@ esac''')
         same_subnet = self.ip_event(structured.stdout)
         self.assertEqual(same_subnet["summary"], "同网段换 IP · 城市变化")
         self.assertEqual(same_subnet["fields"][1],
-                         {"key": "prefix", "before": "203.0.113.0/24", "after": "203.0.113.0/24", "status": "same"})
+                         {"key": "prefix", "before": "203.0.113.0/24 (地理库)",
+                          "after": "203.0.113.0/24 (地理库)", "status": "same"})
         self.assertEqual(same_subnet["fields"][3]["status"], "same")
 
         third = dict(ip="2001:0db8:0200:0:0:0:0:0042", network="2001:db8:200::/48", asn="AS64513",
@@ -273,12 +276,12 @@ esac''')
         run = self.run_ip_audit("checkdetail", c, start + 120, country="JP", ipapi=third,
                                 networks=[{"asn": 64513, "info_type": "Content"}])
         self.assertIn(f"出口IP=fail:{c}/JP(期望US)", run.stdout)
-        self.assertIn("ASN属性=warn:AS64513 Example Hosting · Content · 网段 2001:db8:200::/48", run.stdout)
+        self.assertIn("ASN属性=warn:AS64513 Example Hosting · ASN 登记 Content · 网段 2001:db8:200::/48", run.stdout)
         warning, before, after, comparison = self.ip_warning(run.stdout)
         self.assertIn("01-01 00:02:00", warning)
         self.assertIn(f"变化前 IP：{b}", before)
         self.assertIn("AS64512 Example Fiber · 类型 Cable/DSL/ISP", before)
-        self.assertIn(f"当前 IP：{c} · 网段 2001:db8:200::/48 · 归属地 JP / Tokyo / Shinjuku", after)
+        self.assertIn(f"当前 IP：{c} · 网段 2001:db8:200::/48 (地理库) · 归属地 JP / Tokyo / Shinjuku", after)
         self.assertIn("AS64513 Example Hosting · 类型 Content", after)
         self.assertEqual(comparison, "网段变化 · ASN 变化 · 运营组织变化 · 网络类型变化 · 国家变化")
 
@@ -300,7 +303,7 @@ esac''')
         self.assertEqual(event["summary"], "跨网段 · 国家变化 · ASN 变化")
         self.assertEqual([field["key"] for field in event["fields"]], ["ip", "prefix", "location", "asn", "org", "type"])
         self.assertEqual(event["fields"][0], {"key": "ip", "before": b, "after": c, "status": "changed"})
-        self.assertEqual(event["fields"][1]["after"], "2001:db8:200::/48")
+        self.assertEqual(event["fields"][1]["after"], "2001:db8:200::/48 (地理库)")
         self.assertEqual(event["fields"][2]["after"], "JP / Tokyo / Shinjuku")
         self.assertEqual(event["fields"][3]["after"], "AS64513")
         exported = self.home.parent / "diagnostics.zip"
@@ -314,6 +317,51 @@ esac''')
                      "AS64513", "Mountain View", "Shinjuku"):
             self.assertNotIn(text.encode(), payload + log)
             self.assertNotIn(text, self.urls.read_text(), "请求只查询当前来源地址与 ASN")
+
+    def test_bgp_prefix_is_verified_and_compared_with_the_same_source(self):
+        self.prepare_ip_timeline()
+        start = 1_767_225_600
+        route = {"status": "ok", "data": {"prefix": "203.0.113.0/24", "asns": ["64512"]}}
+
+        def audit(last_octet, offset, response):
+            ip = f"203.0.113.{last_octet}"
+            profile = dict(ip=ip, network=ip + "/32", asn="AS64512", org="Example Fiber", country_code="US")
+            run = self.run_ip_audit("checkdetail", ip, start + offset, ipapi=profile, route=response, app=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            return run.stdout
+
+        audit(10, 0, None)
+        event = self.ip_event(audit(11, 60, route))
+        self.assertTrue(event["summary"].startswith("网段来源不同"))
+        self.assertEqual(event["fields"][1],
+                         {"key": "prefix", "before": "203.0.113.10/32 (地理库)",
+                          "after": "203.0.113.0/24 (RIPEstat BGP)", "status": "unknown"})
+        output = audit(12, 120, route)
+        self.assertIn("BGP 网段 203.0.113.0/24", output)
+        event = self.ip_event(output)
+        self.assertTrue(event["summary"].startswith("同网段换 IP"))
+        self.assertEqual(event["fields"][1]["status"], "same")
+        for last, data in ((13, {"prefix": "203.0.113.0/24", "asns": ["64513"]}),
+                           (14, {"prefix": "198.51.100.0/24", "asns": ["64512"]})):
+            with self.subTest(data=data):
+                event = self.ip_event(audit(last, 120 + last, {"status": "ok", "data": data}))
+                self.assertEqual(event["fields"][1]["after"], f"203.0.113.{last}/32 (地理库)")
+        self.assertIn("https://stat.ripe.net/data/network-info/data.json", self.urls.read_text())
+        self.assertNotIn("203.0.113", self.urls.read_text())
+
+    def test_known_carrier_passes_with_its_actual_asn_registration(self):
+        self.prepare_ip_timeline()
+        start = 1_767_225_600
+        before, after = "203.0.113.10", "203.0.113.11"
+        profile = dict(ip=before, network="203.0.113.0/24", asn="AS2516", org="KDDI CORPORATION", country_code="JP")
+        networks = [{"asn": 2516, "info_types": ["NSP"]}]
+        for address, when in ((before, start), (after, start + 60)):
+            run = self.run_ip_audit("checkdetail", address, when, country="JP",
+                                    ipapi=dict(profile, ip=address), networks=networks, app=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertIn("ASN属性=ok:AS2516 KDDI CORPORATION · ASN 登记 NSP", run.stdout)
+        network_type = self.ip_event(run.stdout)["fields"][-1]
+        self.assertEqual(network_type, {"key": "type", "before": "NSP", "after": "NSP", "status": "same"})
 
     def test_metadata_rejects_another_ip_unrelated_cidr_and_unmatched_network_type(self):
         self.prepare_ip_timeline()
@@ -365,7 +413,7 @@ esac''')
         self.assertEqual([field["key"] for field in event["fields"]], ["ip", "location"])
         self.assertEqual(event["fields"][1]["before"], "US")
         self.assertNotIn("Palo Alto", structured.stdout)
-        for hostname in ("ipapi.co", "ipinfo.io", "peeringdb.com"):
+        for hostname in ("ipapi.co", "ipinfo.io", "peeringdb.com", "stat.ripe.net"):
             self.assertNotIn(hostname, self.urls.read_text())
 
     def test_disabled_ip_consistency_still_skips_history(self):
