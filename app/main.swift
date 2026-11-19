@@ -36,6 +36,60 @@ struct CheckRow: Identifiable {
     var detail: String = ""
 }
 
+struct IPChange: Decodable {
+    static let rowName = "IP 与上次一致"
+    static let outputPrefix = "#IP变化="
+
+    struct Field: Decodable, Identifiable {
+        enum Key: String, Decodable {
+            case ip, prefix, location, asn, org, type
+
+            var title: String {
+                switch self {
+                case .ip: return "IP 地址"
+                case .prefix: return "网段"
+                case .location: return "归属地"
+                case .asn: return "ASN"
+                case .org: return "运营组织"
+                case .type: return "网络类型"
+                }
+            }
+
+            var monospaced: Bool { self == .ip || self == .prefix || self == .asn }
+        }
+
+        enum Status: String, Decodable {
+            case same, changed, unknown
+
+            var title: String {
+                switch self {
+                case .same: return "相同"
+                case .changed: return "变化"
+                case .unknown: return "未确认"
+                }
+            }
+        }
+
+        let key: Key
+        let before: String?
+        let after: String?
+        let status: Status
+        var id: Key { key }
+    }
+
+    let changedAt: String
+    let summary: String
+    let fields: [Field]
+
+    var hasValidFields: Bool {
+        let keys = fields.map(\.key)
+        guard keys == [.ip, .location] || keys == [.ip, .prefix, .location, .asn, .org, .type],
+              let address = fields.first, address.status == .changed,
+              let before = address.before, let after = address.after else { return false }
+        return !before.isEmpty && !after.isEmpty && before != after
+    }
+}
+
 enum Phase { case checking, ready, failed, switching, done, fixing }
 
 enum NoticePage: String, Identifiable {
@@ -111,7 +165,7 @@ final class VM: ObservableObject {
         CheckRow(name: "代理内核", icon: "cpu"),
         CheckRow(name: "TUN 网卡", icon: "cable.connector"),
         CheckRow(name: "出口 IP", icon: "globe.americas"),
-        CheckRow(name: "IP 与上次一致", icon: "checkmark.seal"),
+        CheckRow(name: IPChange.rowName, icon: "checkmark.seal"),
         CheckRow(name: "时区", icon: "clock"),
         CheckRow(name: "地区", icon: "flag"),
         CheckRow(name: "IPv6 关闭", icon: "6.circle"),
@@ -131,6 +185,8 @@ final class VM: ObservableObject {
     @Published var note = ""
     @Published var fingerprint = ""
     @Published private(set) var guardLastEvent = ""
+    @Published private(set) var ipChange: IPChange?
+    @Published var showIPComparison = false
     @Published private(set) var isBusy = false
     @Published private(set) var lastCheckSummary = "尚未检查"
     @Published var updateText = ""
@@ -470,19 +526,23 @@ final class VM: ObservableObject {
         banner = ""
         note = ""
         guardLastEvent = ""
+        ipChange = nil
         for i in rows.indices { rows[i].state = .pending; rows[i].detail = "" }
-        run(["checkdetail"], timeout: checkTimeout) { result in
+        run(["checkdetail"], timeout: checkTimeout, environment: ["CLAUDE_SWITCHER_IP_COMPARISON": "1"]) { result in
             var allOk = result.succeeded
             var matched = Set<Int>()
             var duplicated = false
             let keyMap: [String: String] = [
                 "代理内核": "代理内核", "TUN网卡": "TUN 网卡", "出口IP": "出口 IP",
-                "IP一致": "IP 与上次一致", "时区": "时区", "地区": "地区",
+                "IP一致": IPChange.rowName, "时区": "时区", "地区": "地区",
                 "IPv6": "IPv6 关闭", "DNS": "DNS 走隧道", "WebRTC": "WebRTC",
                 "保镖": "保镖在线", "规则置顶": "规则置顶",
                 "客户端语言": "客户端语言", "ASN属性": "ASN 属性", "生态可达性": "生态可达性",
             ]
-            for line in result.output.split(separator: "\n") {
+            let lines = result.output.split(separator: "\n", omittingEmptySubsequences: false)
+            let comparisonLines = lines.filter { $0.hasPrefix(IPChange.outputPrefix) }
+            let reportLines = lines.filter { !$0.hasPrefix(IPChange.outputPrefix) }
+            for line in reportLines {
                 if line.hasPrefix("#保镖事件=") {
                     self.guardLastEvent = String(line.dropFirst("#保镖事件=".count))
                     continue
@@ -499,7 +559,9 @@ final class VM: ObservableObject {
                 case "skip": self.rows[idx].state = .skip
                 default: self.rows[idx].state = .fail; allOk = false
                 }
-                self.rows[idx].detail = status.count > 1 ? status[1] : ""
+                let detail = status.count > 1 ? status[1] : ""
+                self.rows[idx].detail = rowName == IPChange.rowName
+                    ? detail.replacingOccurrences(of: "\t", with: "\n") : detail
                 if rowName == "保镖在线", self.rows[idx].state == .warn || self.rows[idx].state == .skip {
                     self.rows[idx].state = .fail
                     self.rows[idx].detail = "保镖必须在线，不能跳过或降级为警告"
@@ -514,8 +576,16 @@ final class VM: ObservableObject {
                     allOk = false
                 }
             }
+            if result.succeeded, !duplicated, matched.count == self.rows.count,
+               self.rows.first(where: { $0.name == IPChange.rowName })?.state == .warn,
+               comparisonLines.count == 1, let line = comparisonLines.first,
+               let change = try? JSONDecoder().decode(IPChange.self, from: Data(line.dropFirst(IPChange.outputPrefix.count).utf8)),
+               change.hasValidFields {
+                self.ipChange = change
+            }
             if !result.succeeded {
-                self.banner = result.output.isEmpty ? "核心脚本执行失败" : result.output
+                let report = reportLines.joined(separator: "\n")
+                self.banner = report.isEmpty ? "核心脚本执行失败" : report
                 for i in self.rows.indices where self.rows[i].state == .pending {
                     self.rows[i].state = .fail
                     self.rows[i].detail = "核心脚本执行失败"
@@ -1254,6 +1324,87 @@ extension RowState {
 
 // MARK: - 视图
 
+struct IPChangeDisclosure: View {
+    let change: IPChange
+    @Binding var isExpanded: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                Image(systemName: RowState.warn.symbol)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(ClaudeTheme.warning)
+                    .frame(width: 20)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("出口 IP 已变化")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(ClaudeTheme.warning)
+                    Text(change.summary)
+                        .font(.caption)
+                        .foregroundColor(ClaudeTheme.muted)
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Button {
+                    isExpanded.toggle()
+                } label: {
+                    Label(isExpanded ? "收起对比" : "查看对比",
+                          systemImage: isExpanded ? "chevron.up" : "chevron.down")
+                }
+                .buttonStyle(ClaudeActionStyle())
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(ClaudeTheme.warning.opacity(0.08))
+
+            if isExpanded {
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                    GridRow {
+                        Color.clear.frame(width: 68, height: 1).accessibilityHidden(true)
+                        Text("变化前").font(.caption).foregroundColor(ClaudeTheme.muted)
+                        Text("当前").font(.caption.weight(.semibold))
+                    }
+                    ForEach(change.fields) { field in
+                        Divider().overlay(ClaudeTheme.divider).gridCellUnsizedAxes(.horizontal)
+                        GridRow(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(field.key.title).font(.system(size: 12, weight: .medium))
+                                Text(field.status.title)
+                                    .font(.caption2)
+                                    .foregroundColor(field.status == .changed ? ClaudeTheme.warning : ClaudeTheme.muted)
+                            }
+                            .frame(width: 68, alignment: .leading)
+                            value(field.before, field: field, current: false)
+                            value(field.after, field: field, current: true)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.top, 10)
+                Text("最近变化 \(change.changedAt)")
+                    .font(.caption)
+                    .foregroundColor(ClaudeTheme.muted)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+            }
+        }
+    }
+
+    private func value(_ value: String?, field: IPChange.Field, current: Bool) -> some View {
+        let different = current && field.status == .changed
+        return Text(value ?? "未采集")
+            .font(.system(size: 12, weight: different ? .semibold : .regular,
+                          design: field.key.monospaced ? .monospaced : .default))
+            .foregroundColor(different ? ClaudeTheme.warning : (current && value != nil ? ClaudeTheme.ink : ClaudeTheme.muted))
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            .textSelection(.enabled)
+            .accessibilityLabel("\(current ? "当前" : "变化前")\(field.key.title) \(value ?? "未采集")")
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var vm: VM
     var height: CGFloat = 760
@@ -1395,30 +1546,34 @@ struct ContentView: View {
             }.padding(.horizontal, 16).padding(.vertical, 10)
             Divider().overlay(ClaudeTheme.divider)
             ForEach(Array(vm.rows.enumerated()), id: \.element.id) { index, row in
-                let wrapsDetail = row.name == "IP 与上次一致" && row.state == .warn
-                HStack(spacing: 12) {
-                    Image(systemName: row.icon)
-                        .font(.system(size: 13)).foregroundColor(ClaudeTheme.muted)
-                        .frame(width: 20)
-                    Text(row.name).font(.system(size: 12.5, weight: .medium))
-                        .frame(width: 116, alignment: .leading)
-                    Text(row.detail.isEmpty ? "—" : row.detail)
-                        .font(.system(size: 12))
-                        .foregroundColor(row.state == .warn ? ClaudeTheme.warning : ClaudeTheme.muted)
-                        .lineLimit(wrapsDetail ? nil : 1).truncationMode(.middle)
-                        .fixedSize(horizontal: false, vertical: wrapsDetail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .help(row.name == "保镖在线" && !vm.guardLastEvent.isEmpty
-                              ? row.detail + "\n上次保护事件：" + vm.guardLastEvent : row.detail)
-                    Label(row.state.label, systemImage: row.state.symbol)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(row.state.color)
-                        .frame(width: 62, alignment: .leading)
+                if row.name == IPChange.rowName, row.state == .warn, let change = vm.ipChange {
+                    IPChangeDisclosure(change: change, isExpanded: $vm.showIPComparison)
+                } else {
+                    let wrapsDetail = row.name == IPChange.rowName && row.state == .warn
+                    HStack(spacing: 12) {
+                        Image(systemName: row.icon)
+                            .font(.system(size: 13)).foregroundColor(ClaudeTheme.muted)
+                            .frame(width: 20)
+                        Text(row.name).font(.system(size: 12.5, weight: .medium))
+                            .frame(width: 116, alignment: .leading)
+                        Text(row.detail.isEmpty ? "—" : row.detail)
+                            .font(.system(size: 12))
+                            .foregroundColor(row.state == .warn ? ClaudeTheme.warning : ClaudeTheme.muted)
+                            .lineLimit(wrapsDetail ? nil : 1).truncationMode(.middle)
+                            .fixedSize(horizontal: false, vertical: wrapsDetail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .help(row.name == "保镖在线" && !vm.guardLastEvent.isEmpty
+                                  ? row.detail + "\n上次保护事件：" + vm.guardLastEvent : row.detail)
+                        Label(row.state.label, systemImage: row.state.symbol)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(row.state.color)
+                            .frame(width: 62, alignment: .leading)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, wrapsDetail ? 4 : 0)
+                    .frame(minHeight: 31)
+                    .accessibilityElement(children: .combine)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, wrapsDetail ? 4 : 0)
-                .frame(minHeight: 31)
-                .accessibilityElement(children: .combine)
                 if index < vm.rows.count - 1 {
                     Divider().overlay(ClaudeTheme.divider).padding(.leading, 48)
                 }

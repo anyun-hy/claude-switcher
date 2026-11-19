@@ -85,17 +85,34 @@ esac''')
     def prepare_ip_timeline(self):
         self.prepare_checkdetail()
         self.stub("date", 'if [ "$1" = +%s ]; then echo "$TEST_EPOCH"; else /bin/date "$@"; fi')
-        self.stub("curl", r'''case "$*" in
-  *cdn-cgi/trace*) printf 'ip=%s\nloc=US\n' "$TEST_EXIT_IP" ;;
-  *ipinfo.io*) printf '{"org":"Example Residential"}' ;;
+        self.urls = self.home.parent / "curl-urls"
+        self.env["TEST_CURL_URLS"] = str(self.urls)
+        self.stub("curl", r'''printf '%s\n' "${!#}" >> "$TEST_CURL_URLS"
+case "$*" in
+  *cdn-cgi/trace*) printf 'ip=%s\nloc=%s\n' "$TEST_EXIT_IP" "${TEST_EXIT_COUNTRY:-US}" ;;
+  *ipapi.co*) printf '%s' "$TEST_IPAPI" ;;
+  *ipinfo.io*) printf '%s' "$TEST_IPINFO" ;;
+  *peeringdb.com*) printf '%s' "$TEST_PEERING" ;;
   *claude.ai*|*api.anthropic.com*) printf '200' ;;
 esac''')
         self.stub("python3", 'printf "RESULT:%s\n" "$TEST_EXIT_IP"')
 
-    def run_ip_audit(self, command, addr, when):
-        env = dict(self.env, TEST_EXIT_IP=addr, TEST_EPOCH=str(when), TZ="UTC")
+    def run_ip_audit(self, command, addr, when, country="US", ipapi=None, ipinfo=None, networks=(), *, app=False):
+        env = dict(self.env, TEST_EXIT_IP=addr, TEST_EPOCH=str(when), TEST_EXIT_COUNTRY=country, TZ="UTC",
+                   TEST_IPAPI=json.dumps(ipapi), TEST_IPINFO=json.dumps(ipinfo),
+                   TEST_PEERING=json.dumps({"data": list(networks)}),
+                   CLAUDE_SWITCHER_IP_COMPARISON="1" if app else "0")
         return subprocess.run(["/bin/bash", str(self.core), command], env=env,
                               text=True, capture_output=True, timeout=10)
+
+    def ip_warning(self, output):
+        row = next(line for line in output.splitlines() if line.startswith("IP一致=warn:"))
+        return row.split("\t")
+
+    def ip_event(self, output):
+        events = [line.split("=", 1)[1] for line in output.splitlines() if line.startswith("#IP变化=")]
+        self.assertEqual(len(events), 1)
+        return json.loads(events[0])
 
     def test_settings_validate_allowlist_and_booleans(self):
         for value in ({"disabled": ["出口IP"]}, {"disabled": ["保镖"]},
@@ -159,8 +176,13 @@ esac''')
                              text=True, capture_output=True, env=self.env, timeout=10)
         lines = run.stdout.splitlines()
         self.assertIn("TUN网卡=fail:不在线", lines)
-        ip_row = next(line for line in lines if line.startswith("IP一致="))
-        self.assertTrue(ip_row.startswith("IP一致=warn:48小时内出口IP有变化（变化前 IP：192.0.2.1；最近："), ip_row)
+        warning, before, after, comparison = self.ip_warning(run.stdout)
+        self.assertTrue(warning.startswith("IP一致=warn:48小时内出口IP有变化（最近："), warning)
+        self.assertIn("变化前 IP：192.0.2.1", before)
+        self.assertIn("当前 IP：203.0.113.10", after)
+        self.assertIn("网段未确认", comparison)
+        self.assertEqual(self.calls.read_text().splitlines().count("curl"), 3,
+                         "TUN 离线时只保留原有探测，不查询 IP 属性")
         self.assertIn("时区=fail:/var/db/timezone/zoneinfo/Asia/Tokyo", lines)
         self.assertIn("地区=fail:ja_JP", lines)
 
@@ -173,8 +195,11 @@ esac''')
             encoding="utf-8")
         run = self.run_ip_audit("checkdetail", "203.0.113.10", start + 180)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertIn("IP一致=warn:48小时内出口IP有变化（变化前 IP：192.0.2.1；最近：01-01 00:01:00）",
-                      run.stdout.splitlines())
+        warning, before, after, comparison = self.ip_warning(run.stdout)
+        self.assertEqual(warning, "IP一致=warn:48小时内出口IP有变化（最近：01-01 00:01:00）")
+        self.assertIn("变化前 IP：192.0.2.1 · 网段 未采集 · 归属地 未采集", before)
+        self.assertIn("当前 IP：203.0.113.10 · 网段 未采集 · 归属地 US", after)
+        self.assertIn("国家未确认", comparison)
 
     def test_ip_warning_survives_rechecks_and_return_until_exact_expiry(self):
         self.prepare_ip_timeline()
@@ -200,22 +225,157 @@ esac''')
         window = 48 * 60 * 60
         first_warning = "48小时内出口IP有变化（最近：01-01 00:01:00）"
         return_warning = "48小时内出口IP有变化（最近：01-01 00:03:00）"
-        first_detail = f"IP一致=warn:48小时内出口IP有变化（变化前 IP：{a}；最近：01-01 00:01:00）"
-        return_detail = f"IP一致=warn:48小时内出口IP有变化（变化前 IP：{b}；最近：01-01 00:03:00）"
+
+        def assert_transition(lines, warning, previous, current):
+            heading, before, after, _ = self.ip_warning("\n".join(lines))
+            self.assertEqual(heading, "IP一致=warn:" + warning)
+            self.assertIn(f"变化前 IP：{previous}", before)
+            self.assertIn(f"当前 IP：{current}", after)
+
         self.assertIn("IP一致=ok:首次记录", audit("checkdetail", a, start))
-        self.assertIn(first_detail, audit("checkdetail", b, first_change))
+        assert_transition(audit("checkdetail", b, first_change), first_warning, a, b)
         self.assertIn("OK:" + b + "|注意:" + first_warning, audit("check", b, start + 120))
-        self.assertIn(return_detail, audit("checkdetail", a, back))
-        self.assertIn(return_detail, audit("checkdetail", a, back + window - 2))
+        assert_transition(audit("checkdetail", a, back), return_warning, b, a)
+        assert_transition(audit("checkdetail", a, back + window - 2), return_warning, b, a)
         self.assertIn("OK:" + a + "|注意:" + return_warning, audit("check", a, back + window - 1))
         self.assertIn("IP一致=ok:与上次一致", audit("checkdetail", a, back + window))
+
+    def test_ip_change_compares_saved_prefix_asn_type_and_location_privately(self):
+        self.prepare_ip_timeline()
+        start = 1_767_225_600
+        a, b, c = "203.0.113.10", "203.0.113.11", "2001:db8:200::42"
+        first = dict(ip=a, network="203.0.113.0/24", asn="AS64512", org="Example Fiber",
+                     country_code="US", region="California", city="Palo Alto")
+        isp = {"asn": 64512, "info_types": ["Cable/DSL/ISP"]}
+        run = self.run_ip_audit("checkdetail", a, start, ipapi=first, networks=[isp])
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("ASN属性=ok:AS64512 Example Fiber · Cable/DSL/ISP · 网段 203.0.113.0/24", run.stdout)
+
+        run = self.run_ip_audit("checkdetail", b, start + 60,
+                                ipapi=dict(first, ip=b, city="Mountain View"), networks=[isp])
+        warning, before, after, comparison = self.ip_warning(run.stdout)
+        self.assertIn("01-01 00:01:00", warning)
+        self.assertIn(f"变化前 IP：{a} · 网段 203.0.113.0/24", before)
+        self.assertIn("US / California / Palo Alto", before)
+        self.assertIn(f"当前 IP：{b} · 网段 203.0.113.0/24", after)
+        self.assertIn("US / California / Mountain View", after)
+        self.assertEqual(comparison, "网段相同 · ASN 相同 · 运营组织相同 · 网络类型相同 · 国家相同 · 地区相同 · 城市变化")
+        structured = self.run_ip_audit("checkdetail", b, start + 90, app=True)
+        self.assertEqual(self.ip_warning(structured.stdout), [warning])
+        same_subnet = self.ip_event(structured.stdout)
+        self.assertEqual(same_subnet["summary"], "同网段换 IP · 城市变化")
+        self.assertEqual(same_subnet["fields"][1],
+                         {"key": "prefix", "before": "203.0.113.0/24", "after": "203.0.113.0/24", "status": "same"})
+        self.assertEqual(same_subnet["fields"][3]["status"], "same")
+
+        third = dict(ip="2001:0db8:0200:0:0:0:0:0042", network="2001:db8:200::/48", asn="AS64513",
+                     org="Example Hosting", country_code="JP", region="Tokyo", city="Shinjuku")
+        run = self.run_ip_audit("checkdetail", c, start + 120, country="JP", ipapi=third,
+                                networks=[{"asn": 64513, "info_type": "Content"}])
+        self.assertIn(f"出口IP=fail:{c}/JP(期望US)", run.stdout)
+        self.assertIn("ASN属性=warn:AS64513 Example Hosting · Content · 网段 2001:db8:200::/48", run.stdout)
+        warning, before, after, comparison = self.ip_warning(run.stdout)
+        self.assertIn("01-01 00:02:00", warning)
+        self.assertIn(f"变化前 IP：{b}", before)
+        self.assertIn("AS64512 Example Fiber · 类型 Cable/DSL/ISP", before)
+        self.assertIn(f"当前 IP：{c} · 网段 2001:db8:200::/48 · 归属地 JP / Tokyo / Shinjuku", after)
+        self.assertIn("AS64513 Example Hosting · 类型 Content", after)
+        self.assertEqual(comparison, "网段变化 · ASN 变化 · 运营组织变化 · 网络类型变化 · 国家变化")
+
+        # Missing metadata on consecutive checks cannot attach another IP's data or erase a good sample.
+        retry = self.run_ip_audit("checkdetail", c, start + 180, country="JP")
+        self.assertEqual(self.ip_warning(retry.stdout), [warning, before, after, comparison])
+        # A slow audit started before a more recent sample cannot create a false change.
+        stale = self.run_ip_audit("checkdetail", a, start + 150, ipapi=first, networks=[isp])
+        self.assertIn("IP一致=warn:已有更新的出口IP记录，请重新检查", stale.stdout)
+        self.assertEqual((self.base / "lastip").read_text().strip(), c)
+        for name in ("iphistory.log", "last-check.txt"):
+            self.assertEqual(stat.S_IMODE((self.base / name).stat().st_mode), 0o600)
+
+        # Verify that the enriched check itself still exports statuses only.
+        structured = self.run_ip_audit("checkdetail", c, start + 240, country="JP", app=True)
+        self.assertEqual(self.ip_warning(structured.stdout), [warning])
+        event = self.ip_event(structured.stdout)
+        self.assertEqual(event["changedAt"], "01-01 00:02:00")
+        self.assertEqual(event["summary"], "跨网段 · 国家变化 · ASN 变化")
+        self.assertEqual([field["key"] for field in event["fields"]], ["ip", "prefix", "location", "asn", "org", "type"])
+        self.assertEqual(event["fields"][0], {"key": "ip", "before": b, "after": c, "status": "changed"})
+        self.assertEqual(event["fields"][1]["after"], "2001:db8:200::/48")
+        self.assertEqual(event["fields"][2]["after"], "JP / Tokyo / Shinjuku")
+        self.assertEqual(event["fields"][3]["after"], "AS64513")
+        exported = self.home.parent / "diagnostics.zip"
+        result = self.support("export-diagnostics", str(exported))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.home / "Library/Logs/claude-switcher/client.log").read_bytes()
+        with zipfile.ZipFile(exported) as archive:
+            self.assertEqual(json.loads(archive.read("recent-status.json"))["checks"]["IP一致"], "warn")
+            payload = b"".join(archive.read(name) for name in archive.namelist())
+        for text in (a, b, c, "2001:db8:200::/48", "203.0.113.0/24", "Example Fiber",
+                     "AS64513", "Mountain View", "Shinjuku"):
+            self.assertNotIn(text.encode(), payload + log)
+            self.assertNotIn(text, self.urls.read_text(), "请求只查询当前来源地址与 ASN")
+
+    def test_metadata_rejects_another_ip_unrelated_cidr_and_unmatched_network_type(self):
+        self.prepare_ip_timeline()
+        start = 1_767_225_600
+        a, b, c = "203.0.113.10", "192.0.2.5", "192.0.2.6"
+        other = dict(ip=a, network="203.0.113.0/24", asn="AS64512", org="Unrelated Org",
+                     country_code="US", city="Other City")
+        run = self.run_ip_audit("checkdetail", a, start)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        run = self.run_ip_audit("checkdetail", b, start + 60, ipapi=other, ipinfo=other)
+        _, _, after, comparison = self.ip_warning(run.stdout)
+        self.assertIn(f"当前 IP：{b} · 网段 未采集 · 归属地 US · ASN 未采集", after)
+        self.assertIn("ASN 未确认", comparison)
+        self.assertIn("ASN属性=warn:未获取", run.stdout)
+        self.assertNotIn("Unrelated Org", run.stdout)
+        self.assertNotIn("peeringdb.com", self.urls.read_text())
+
+        self.urls.write_text("")
+        discordant = dict(ip=c, network="203.0.113.0/24", asn="AS64515", org="Matching IP",
+                          country_code="JP", region="Mismatched Region", city="Mismatched City")
+        run = self.run_ip_audit("checkdetail", c, start + 120, ipapi=discordant,
+                                networks=[{"asn": 64512, "info_types": ["Cable/DSL/ISP"]}])
+        _, _, after, comparison = self.ip_warning(run.stdout)
+        self.assertIn(f"当前 IP：{c} · 网段 未采集 · 归属地 US · ASN AS64515 Matching IP · 类型 未确认", after)
+        self.assertIn("国家相同", comparison)
+        self.assertNotIn("Mismatched", run.stdout)
+        self.assertIn("ASN属性=warn:AS64515 Matching IP · 网络类型未确认", run.stdout)
+        self.assertIn("peeringdb.com/api/net?asn=64515", self.urls.read_text())
+
+    def test_disabled_asn_hides_saved_network_details_and_skips_lookups(self):
+        self.prepare_ip_timeline()
+        a, b = "203.0.113.10", "192.0.2.5"
+        start = 1_767_225_600
+        # The existing IPinfo endpoint is the fallback when the prefix service is unavailable.
+        prior = {"ip": a, "country": "US", "city": "Palo Alto", "org": "AS64512 Example Fiber"}
+        run = self.run_ip_audit("checkdetail", a, start, ipinfo=prior)
+        self.assertIn("ASN属性=warn:AS64512 Example Fiber · 网络类型未确认", run.stdout)
+        self.write_settings({"disabled": ["ASN属性"]})
+        self.urls.write_text("")
+        run = self.run_ip_audit("checkdetail", b, start + 60, country="JP")
+        _, before, after, comparison = self.ip_warning(run.stdout)
+        self.assertEqual(before, f"变化前 IP：{a} · 归属地 US")
+        self.assertEqual(after, f"当前 IP：{b} · 归属地 JP")
+        self.assertEqual(comparison, "国家变化")
+        self.assertIn("ASN属性=skip:用户已禁用", run.stdout)
+        structured = self.run_ip_audit("checkdetail", b, start + 120, country="JP", app=True)
+        event = self.ip_event(structured.stdout)
+        self.assertEqual(event["summary"], "国家变化")
+        self.assertEqual([field["key"] for field in event["fields"]], ["ip", "location"])
+        self.assertEqual(event["fields"][1]["before"], "US")
+        self.assertNotIn("Palo Alto", structured.stdout)
+        for hostname in ("ipapi.co", "ipinfo.io", "peeringdb.com"):
+            self.assertNotIn(hostname, self.urls.read_text())
 
     def test_disabled_ip_consistency_still_skips_history(self):
         self.prepare_checkdetail()
         self.write_settings({"disabled": ["IP一致"]})
         run = subprocess.run(["/bin/bash", str(self.core), "checkdetail"],
-                             text=True, capture_output=True, env=self.env, timeout=10)
+                             text=True, capture_output=True,
+                             env=dict(self.env, CLAUDE_SWITCHER_IP_COMPARISON="1"), timeout=10)
         self.assertIn("IP一致=skip:用户已禁用", run.stdout.splitlines())
+        self.assertNotIn("#IP变化=", run.stdout)
         self.assertFalse((self.base / "lastip").exists())
         self.assertFalse((self.base / "iphistory.log").exists())
 

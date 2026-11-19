@@ -549,18 +549,224 @@ def paths():
 
 def parse_address(value):
     try:
-        return ipaddress.ip_address(value)
+        return ipaddress.ip_address(value) if isinstance(value, str) and "%" not in value else None
     except ValueError:
         return None
 
 
-def observe_ip(now, include_previous):
+def json_object(text):
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else {}
+    except (ValueError, RecursionError):
+        return {}
+
+
+def profile_text(value):
+    if isinstance(value, str) and value and value.isprintable() and "=" not in value:
+        return value.strip()[:100]
+    return ""
+
+
+def country_code(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Z]{2}", value) and value not in ("XX", "ZZ") else ""
+
+
+def clean_ip_profile(address, raw):
+    profile = {}
+    country = country_code(raw.get("country"))
+    if country:
+        profile.update(country=country, region=profile_text(raw.get("region")), city=profile_text(raw.get("city")))
+    asn = raw.get("asn")
+    if isinstance(asn, str) and re.fullmatch(r"AS[1-9][0-9]{0,9}", asn) and int(asn[2:]) <= 4294967295:
+        profile.update(asn=asn, org=profile_text(raw.get("org")), type=profile_text(raw.get("type")))
+    prefix = raw.get("prefix")
+    if isinstance(prefix, str) and re.fullmatch(r"[0-9a-fA-F.:]+/[0-9]{1,3}", prefix):
+        try:
+            network = ipaddress.ip_network(prefix)
+            if network.prefixlen and address in network:
+                profile["prefix"] = str(network)
+        except ValueError:
+            pass
+    return {key: value for key, value in profile.items() if value}
+
+
+def parse_egress_profile():
+    # Both providers report the caller's address. A differently routed response
+    # cannot supply metadata for the Cloudflare sample.
+    with os.fdopen(3, encoding="utf-8", errors="replace") as sample:
+        address = parse_address(sample.readline(80).strip())
+        body = json_object(sample.read(16384))
+    if address is None or body.get("error") or parse_address(body.get("ip")) != address:
+        return
+    org_parts = profile_text(body.get("org")).split(maxsplit=1)
+    asn = body.get("asn")
+    org = " ".join(org_parts)
+    if org_parts and re.fullmatch(r"AS[0-9]+", org_parts[0]):
+        asn = asn or org_parts[0]
+        org = " ".join(org_parts[1:])
+    profile = clean_ip_profile(address, {
+        "asn": asn, "org": org, "prefix": body.get("network"),
+        "country": body.get("country_code") or body.get("country"),
+        "region": body.get("region"), "city": body.get("city"),
+    })
+    if profile:
+        print(profile.get("asn", ""))
+        print(json.dumps(profile, ensure_ascii=False))
+
+
+def describe_egress_profile():
+    with os.fdopen(3, encoding="utf-8", errors="replace") as sample:
+        profile = json_object(sample.readline(4096))
+        networks = json_object(sample.read(16384)).get("data")
+    number = profile.get("asn", "")[2:]
+    if number and isinstance(networks, list):
+        for network in networks:
+            if not isinstance(network, dict) or str(network.get("asn")) != number:
+                continue
+            declared = network.get("info_types")
+            types = {profile_text(item) for item in declared} - {""} if isinstance(declared, list) else set()
+            kind = " / ".join(sorted(types)) or profile_text(network.get("info_type"))
+            if kind:
+                profile["type"] = kind[:100]
+            break
+    kind = profile.get("type", "")
+    identity = " ".join(filter(None, (profile.get("asn"), profile.get("org"))))
+    detail = [identity, kind or "网络类型未确认"]
+    if "prefix" in profile:
+        detail.append("网段 " + profile["prefix"])
+    print(("ok:" if kind == "Cable/DSL/ISP" else "warn:") + " · ".join(filter(None, detail)))
+    print(json.dumps(profile, ensure_ascii=False))
+
+
+def read_ip_samples(history):
+    samples = []
+    try:
+        with history.open(encoding="utf-8", errors="replace") as handle:
+            follows_sample = False
+            for line in handle:
+                if follows_sample and line.startswith("# profile "):
+                    address, timestamp, _ = samples[-1]
+                    samples[-1] = (address, timestamp, clean_ip_profile(address, json_object(line[10:])))
+                    follows_sample = False
+                    continue
+                follows_sample = False
+                fields = line.split()
+                if len(fields) == 2 and re.fullmatch(r"[0-9]{1,12}", fields[1]):
+                    address = parse_address(fields[0])
+                    if address is not None:
+                        samples.append((address, int(fields[1]), {}))
+                        follows_sample = True
+    except FileNotFoundError:
+        pass
+    return samples
+
+
+def merged_ip_profile(previous, current):
+    # An unavailable lookup must not erase a useful sample for the same IP.
+    # Discard dependent fields when their new parent value differs.
+    prior = previous.copy()
+    for key, dependent in (("country", ("region", "city")), ("region", ("city",)), ("asn", ("org", "type"))):
+        if current.get(key) and prior.get(key) != current[key]:
+            for field in dependent:
+                prior.pop(field, None)
+    return dict(prior, **current)
+
+
+def ip_location(profile, show_profile):
+    keys = ("country", "region", "city") if show_profile else ("country",)
+    return " / ".join(filter(None, (profile.get(key) for key in keys)))
+
+
+def describe_ip_sample(address, profile, show_profile):
+    parts = [f"IP：{address}"]
+    if show_profile:
+        parts.append(f"网段 {profile.get('prefix', '未采集')}")
+    parts.append(f"归属地 {ip_location(profile, show_profile) or '未采集'}")
+    if show_profile:
+        identity = " ".join(filter(None, (profile.get("asn"), profile.get("org"))))
+        parts.extend((f"ASN {identity or '未采集'}", f"类型 {profile.get('type', '未确认')}"))
+    return " · ".join(parts)
+
+
+def compare_ip_values(old, new):
+    if not old or not new:
+        return "unknown"
+    return "same" if old.casefold() == new.casefold() else "changed"
+
+
+def ip_location_comparisons(before, after, show_profile):
+    country = compare_ip_values(before.get("country"), after.get("country"))
+    results = [("国家", country)]
+    if show_profile and country == "same":
+        region = compare_ip_values(before.get("region"), after.get("region"))
+        results.append(("地区", region))
+        if region != "changed":
+            results.append(("城市", compare_ip_values(before.get("city"), after.get("city"))))
+    return results
+
+
+def compare_ip_profiles(before, after, show_profile):
+    verdicts = {"unknown": "未确认", "same": "相同", "changed": "变化"}
+    network = []
+    if show_profile:
+        network = [(label, compare_ip_values(before.get(key), after.get(key))) for label, key in
+                   (("网段", "prefix"), ("ASN ", "asn"), ("运营组织", "org"), ("网络类型", "type"))]
+    return " · ".join(label + verdicts[status] for label, status in
+                      network + ip_location_comparisons(before, after, show_profile))
+
+
+def ip_comparison_event(previous_ip, before, current_ip, after, changed_at, show_profile):
+    def field(key, old, new, status=None):
+        return {"key": key, "before": old or None, "after": new or None,
+                "status": status or compare_ip_values(old, new)}
+
+    fields = [field("ip", str(previous_ip), str(current_ip))]
+    summary = []
+    if show_profile:
+        prefix = field("prefix", before.get("prefix"), after.get("prefix"))
+        fields.append(prefix)
+        if prefix["status"] == "changed":
+            old_net = ipaddress.ip_network(prefix["before"])
+            new_net = ipaddress.ip_network(prefix["after"])
+            summary.append("网段变化" if old_net.overlaps(new_net) else "跨网段")
+        else:
+            summary.append("同网段换 IP" if prefix["status"] == "same" else "网段未确认")
+
+    locations = ip_location_comparisons(before, after, show_profile)
+    changed_location = next((label for label, status in locations if status == "changed"), "")
+    if changed_location:
+        location_status = "changed"
+        summary.append(changed_location + "变化")
+    else:
+        location_status = "unknown" if any(status == "unknown" for _, status in locations) else "same"
+        summary.append("国家相同" if locations[0][1] == "same" else "归属地未确认")
+    fields.append(field("location", ip_location(before, show_profile), ip_location(after, show_profile), location_status))
+
+    if show_profile:
+        asn = field("asn", before.get("asn"), after.get("asn"))
+        fields.append(asn)
+        fields.extend(field(key, before.get(key), after.get(key)) for key in ("org", "type"))
+        if asn["status"] == "changed":
+            summary.append("ASN 变化")
+    return {"changedAt": changed_at, "summary": " · ".join(summary), "fields": fields}
+
+
+def observe_ip(now, mode):
     # stdin carries the embedded Python; the private sample arrives on fd 3.
-    with os.fdopen(3, encoding="utf-8") as sample:
-        current = parse_address(sample.read(80).strip())
+    with os.fdopen(3, encoding="utf-8", errors="replace") as sample:
+        current = parse_address(sample.readline(80).strip())
+        country = country_code(sample.readline(12).strip())
+        profile = clean_ip_profile(current, json_object(sample.read(4096))) if current is not None else {}
     if current is None:
         print("fail:未获取到有效出口IP")
         return
+    if country:
+        if profile.get("country") and profile["country"] != country:
+            # Keep Cloudflare's country and discard the conflicting subregion,
+            # including any earlier city/region for the same address.
+            profile.update(region="", city="")
+        profile["country"] = country
     base, _ = paths()
     history, baseline = base / "iphistory.log", base / "lastip"
     if base.is_symlink() or history.is_symlink():
@@ -574,35 +780,36 @@ def observe_ip(now, include_previous):
         if not stat.S_ISREG(os.fstat(previous.fileno()).st_mode):
             fail()
         fcntl.flock(previous, fcntl.LOCK_EX)
-        samples = []
-        try:
-            with history.open(encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    fields = line.split()
-                    if len(fields) == 2 and re.fullmatch(r"[0-9]{1,12}", fields[1]):
-                        addr = parse_address(fields[0])
-                        if addr is not None:
-                            samples.append((addr, int(fields[1])))
-        except FileNotFoundError:
-            pass
+        samples = read_ip_samples(history)
         if not samples:
             legacy = parse_address(previous.read(80).strip())
             if legacy is not None:
                 # Older installations may have a baseline but no history.
-                samples.append((legacy, min(now, int(os.fstat(previous.fileno()).st_mtime))))
+                samples.append((legacy, min(now, int(os.fstat(previous.fileno()).st_mtime)), {}))
         first = not samples
-        samples.append((current, now))
+        if samples:
+            last_address, last_time, last_profile = samples[-1]
+            if now < last_time:
+                print("warn:已有更新的出口IP记录，请重新检查")
+                return
+            if current == last_address:
+                profile = merged_ip_profile(last_profile, profile)
+        samples.append((current, now, profile))
         last_change = None
-        for (old, _), (addr, timestamp) in zip(samples, samples[1:]):
+        for (old, _, old_profile), (addr, timestamp, _) in zip(samples, samples[1:]):
             if addr != old:
-                last_change = (old, timestamp)
-        first_recent = next(i for i, (_, timestamp) in enumerate(samples) if timestamp > cutoff)
+                last_change = (old, timestamp, old_profile)
+        first_recent = next(i for i, (_, timestamp, _) in enumerate(samples) if timestamp > cutoff)
         # The predecessor is needed to recognize a change just inside the window.
         keep = samples[max(0, first_recent - 1):]
         fd, temporary = tempfile.mkstemp(prefix=".iphistory-", dir=base)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.writelines(f"{addr} {timestamp}\n" for addr, timestamp in keep)
+                for addr, timestamp, saved in keep:
+                    # Older cores still read the original two-column address lines.
+                    handle.write(f"{addr} {timestamp}\n")
+                    if saved:
+                        handle.write("# profile " + json.dumps(saved, ensure_ascii=False) + "\n")
             os.replace(temporary, history)
         finally:
             if os.path.exists(temporary):
@@ -611,10 +818,22 @@ def observe_ip(now, include_previous):
         previous.write(f"{current}\n")
         previous.truncate()
     if last_change is not None and last_change[1] > cutoff:
-        previous_ip, timestamp = last_change
+        previous_ip, timestamp, old_profile = last_change
         changed_at = datetime.datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M:%S")
-        previous_detail = f"变化前 IP：{previous_ip}；" if include_previous else ""
-        print(f"warn:48小时内出口IP有变化（{previous_detail}最近：{changed_at}）")
+        warning = f"warn:48小时内出口IP有变化（最近：{changed_at}）"
+        if mode != "summary":
+            show_profile = mode == "detail"
+            if os.environ.get("CLAUDE_SWITCHER_IP_COMPARISON") == "1":
+                event = ip_comparison_event(previous_ip, old_profile, current, profile, changed_at, show_profile)
+                print(warning)
+                print("#IP变化=" + json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+                return
+            warning += "\t" + "\t".join((
+                "变化前 " + describe_ip_sample(previous_ip, old_profile, show_profile),
+                "当前 " + describe_ip_sample(current, profile, show_profile),
+                compare_ip_profiles(old_profile, profile, show_profile),
+            ))
+        print(warning)
     else:
         print("ok:首次记录" if first else "ok:与上次一致")
 
@@ -751,11 +970,15 @@ def main(args):
         fail()
     action = args[0]
     if (action == "observe-ip" and len(args) == 3 and re.fullmatch(r"[0-9]{1,12}", args[1])
-            and args[2] in ("summary", "detail")):
+            and args[2] in ("summary", "detail", "detail-basic")):
         try:
-            observe_ip(int(args[1]), args[2] == "detail")
+            observe_ip(int(args[1]), args[2])
         except (OSError, ValueError, OverflowError):
             fail()
+    elif action == "parse-egress-profile" and len(args) == 1:
+        parse_egress_profile()
+    elif action == "describe-egress-profile" and len(args) == 1:
+        describe_egress_profile()
     elif action == "config" and len(args) == 1:
         config = load_config()
         print("disabled=" + ",".join(config["disabled"]))
@@ -2154,11 +2377,38 @@ locale_for() {
 
 # Interface and launch audits share the same 48-hour transition history.
 ip_consistency() {
-    if [ -z "$1" ]; then
+    local address="$1" country="$2" sampled_at="$3" mode="${4:-summary}" profile="${5:-}"
+    if [ -z "$address" ]; then
         echo 'fail:未获取到出口IP'
         return
     fi
-    "$0" _support observe-ip "$(date +%s)" "${2:-summary}" 3<<<"$1" || echo 'fail:无法核验出口IP历史'
+    "$0" _support observe-ip "$sampled_at" "$mode" 3<<<"$address"$'\n'"$country"$'\n'"$profile" ||
+        echo 'fail:无法核验出口IP历史'
+}
+
+egress_profile_fetch() {
+    local processes
+    processes=$(proxy_processes) && proxy_alive "$processes" && tun_up &&
+        [ -z "$(detect_other_clients "$processes")" ] || return 1
+    curl -q -fs --max-time 2 --max-filesize 16384 "$1" 2>/dev/null
+}
+
+egress_profile() {
+    local address="$1" raw record asn registered=""
+    # Keyless self-lookups only. Never send an old exit address to a provider.
+    [[ "$address" =~ ^[0-9A-Fa-f.:]+$ ]] && [ "${#address}" -le 45 ] || return 0
+    raw=$(egress_profile_fetch 'https://ipapi.co/json/') || raw=""
+    record=$("$0" _support parse-egress-profile 3<<<"$address"$'\n'"$raw")
+    if [ -z "$record" ]; then
+        raw=$(egress_profile_fetch 'https://ipinfo.io/json') || raw=""
+        record=$("$0" _support parse-egress-profile 3<<<"$address"$'\n'"$raw")
+    fi
+    [ -n "$record" ] || return 0
+    asn=${record%%$'\n'*}
+    if [[ "$asn" =~ ^AS([0-9]+)$ ]]; then
+        registered=$(egress_profile_fetch "https://www.peeringdb.com/api/net?asn=${BASH_REMATCH[1]}&fields=asn,info_type,info_types") || registered=""
+    fi
+    "$0" _support describe-egress-profile 3<<<"${record#*$'\n'}"$'\n'"$registered"
 }
 
 # ---------- 安全检查 ----------
@@ -2166,7 +2416,7 @@ check() {
     load_check_config || { echo "FAIL:检查配置无效，请恢复默认设置"; return 1; }
     fails=""
 
-    local others tcnt processes ip_state
+    local others tcnt processes ip_state sampled_at
     if ! processes=$(proxy_processes); then
         fails="$fails;无法核验代理进程"
     else
@@ -2185,12 +2435,13 @@ check() {
     fi
 
     trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    sampled_at=$(date +%s)
     ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
     loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
     [ "$loc" = "$COUNTRY_TARGET" ] || fails="$fails;出口IP异常(${ip:-无}/${loc:-未知},期望$COUNTRY_TARGET)"
     ipwarn=""
     if ! check_disabled "IP一致"; then
-        ip_state=$(ip_consistency "$ip")
+        ip_state=$(ip_consistency "$ip" "$loc" "$sampled_at")
         case "$ip_state" in
             warn:*) ipwarn="注意:${ip_state#warn:}" ;;
             fail:*) optional_failure "IP一致:${ip_state#fail:}" ;;
@@ -2483,7 +2734,7 @@ ASEOF
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
 checkdetail() {
     load_check_config || { echo "检查配置无效，请恢复默认设置"; return 1; }
-    local others tcnt processes ip_state
+    local others tcnt processes ip_state ip_status sampled_at profile_report profile="" asn_state="warn:未获取" ip_mode="detail-basic"
     if ! processes=$(proxy_processes); then
         echo '代理内核=fail:无法核验代理进程'
     else
@@ -2512,14 +2763,26 @@ checkdetail() {
         echo 'TUN网卡=fail:不在线'
     fi
     trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    sampled_at=$(date +%s)
     ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
     loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
     if [ "$loc" = "$COUNTRY_TARGET" ]; then echo "出口IP=ok:$ip/$loc"; else echo "出口IP=fail:${ip:-无}/${loc:-未知}(期望$COUNTRY_TARGET)"; fi
+    if ! check_disabled "ASN属性"; then
+        ip_mode="detail"
+        if [ "$tcnt" -eq 1 ] && profile_report=$(egress_profile "$ip") && [ -n "$profile_report" ]; then
+            asn_state=${profile_report%%$'\n'*}
+            profile=${profile_report#*$'\n'}
+        fi
+    fi
     if check_disabled "IP一致"; then
         optional_result "IP一致" ok
     else
-        ip_state=$(ip_consistency "$ip" detail)
-        optional_result "IP一致" "${ip_state%%:*}" "${ip_state#*:}"
+        ip_state=$(ip_consistency "$ip" "$loc" "$sampled_at" "$ip_mode" "$profile")
+        ip_status=${ip_state%%$'\n'*}
+        optional_result "IP一致" "${ip_status%%:*}" "${ip_status#*:}"
+        if [ "$ip_status" != "$ip_state" ]; then
+            printf '%s\n' "${ip_state#*$'\n'}"
+        fi
     fi
     tz=$(readlink /etc/localtime 2>/dev/null)
     if [ "$tz" = "/var/db/timezone/zoneinfo/$TZ_TARGET" ]; then echo "时区=ok:${tz#/var/db/timezone/zoneinfo/}"; else echo "时区=fail:$tz"; fi
@@ -2584,23 +2847,8 @@ checkdetail() {
             optional_result "客户端语言" fail "跟随系统(中文)"
         fi
     fi
-    # 13. ASN 网络属性(住宅宽带 vs 机房,按目标地区收录主流运营商)
-    if check_disabled "ASN属性"; then
-        optional_result "ASN属性" ok
-    else
-        org=$(curl -s --max-time 6 https://ipinfo.io/json 2>/dev/null | grep '"org"' | cut -d'"' -f4)
-        case "$org" in
-            '') optional_result "ASN属性" warn "未获取" ;;
-            *Comcast*|*AT\&T*|*Verizon*|*Spectrum*|*Charter*|*Cox*|*T-Mobile*|*Cable*|*esidential*|\
-            *NTT*|*KDDI*|*SoftBank*|*IIJ*|*OCN*|*So-net*|\
-            *HiNet*|*Chunghwa*|*CHT*|*kbro*|*Taiwan*|*FarEasTone*|*Data\ Communication*|\
-            *Singtel*|*StarHub*|*M1*|\
-            *HKT*|*PCCW*|*HKBN*|*HGC*|\
-            *BT*|*Sky*|*Virgin*|*TalkTalk*|*Vodafone*|\
-            *Deutsche\ Telekom*|*1\&1*|*O2*) optional_result "ASN属性" ok "$org" ;;
-            *) optional_result "ASN属性" warn "疑似机房($org)" ;;
-        esac
-    fi
+    # 13. Registered network type for the sampled ASN; it is not a per-IP classification.
+    optional_result "ASN属性" "${asn_state%%:*}" "${asn_state#*:}"
     # 14. Anthropic 生态可达性
     if check_disabled "生态可达性"; then
         optional_result "生态可达性" ok
@@ -4088,14 +4336,22 @@ case "$operation" in
     check)  check ;;
     checkdetail)
         OUT_FILE="$BASE/last-check.txt"
+        # The full report contains addresses and belongs in private local state.
+        # Render this invocation's report even if another audit runs concurrently.
+        check_temp=$(mktemp "$BASE/.last-check.XXXXXXXX") || exit 1
+        trap 'rm -f "$check_temp"' EXIT
         {
             echo "# $(date '+%F %T') pid=$$ 开始"
             checkdetail
             rc=$?
             echo "# 结束"
-        } > "$OUT_FILE" 2>&1
-        cat "$OUT_FILE"
-        summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip)$/) print $1 "=" s[1] }' "$OUT_FILE" | tr '\n' ' ')
+        } > "$check_temp" 2>&1
+        cat "$check_temp"
+        summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip)$/) print $1 "=" s[1] }' "$check_temp" | tr '\n' ' ')
+        if [ -d "$OUT_FILE" ] || ! mv -f "$check_temp" "$OUT_FILE"; then
+            echo '无法保存检查结果' >&2
+            rc=1
+        fi
         ;;
     fix) fix ;;
     status) status ;;

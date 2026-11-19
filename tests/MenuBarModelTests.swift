@@ -435,15 +435,61 @@ struct MenuBarModelTests {
                 }
                 try render(ContentView(vm: vm).frame(width: 860, height: 620), name: "dashboard-compact", size: NSSize(width: 860, height: 620))
                 var warning = details
-                let ipWarning = "48小时内出口IP有变化（变化前 IP：2001:db8:1234:5678:90ab:cdef:1234:5678；最近：11-12 09:30:00）"
-                warning["IP一致"] = "warn:\(ipWarning)"
+                let ipWarning = [
+                    "48小时内出口IP有变化（最近：11-12 09:30:00）",
+                    "变化前 IP：2001:db8:1234:5678:90ab:cdef:1234:5678 · 网段 2001:db8:1234::/48 · 归属地 US / California / Palo Alto · ASN AS64512 Example Fiber · 类型 Cable/DSL/ISP",
+                    "当前 IP：203.0.113.10 · 网段 203.0.113.0/24 · 归属地 JP / Tokyo / Shinjuku · ASN AS64513 Example Hosting · 类型 Content",
+                    "网段变化 · ASN 变化 · 运营组织变化 · 网络类型变化 · 国家变化",
+                ]
+                warning["IP一致"] = "warn:" + ipWarning.joined(separator: "\t")
                 warning["WebRTC"] = "skip:用户已禁用"
                 try f.audit(warning); vm.refresh(); try f.idle(vm)
-                try expect(vm.rows.first(where: { $0.name == "IP 与上次一致" })?.detail == ipWarning, "警告应保留完整变化前 IP 和时间")
-                try render(ContentView(vm: vm).frame(width: 1060, height: 760), name: "dashboard-warning", size: NSSize(width: 1060, height: 760))
-                try render(ContentView(vm: vm).frame(width: 860, height: 620), name: "dashboard-warning-compact", size: NSSize(width: 860, height: 620))
+                try expect(vm.rows.first(where: { $0.name == "IP 与上次一致" })?.detail == ipWarning.joined(separator: "\n"),
+                           "旧核心的警告仍应显示完整文本")
+                try expect(vm.ipChange == nil, "未带结构化数据时应走原有警告视图")
+
+                warning["IP一致"] = "warn:\(ipWarning[0])"
+                let comparison: [String: Any] = [
+                    "changedAt": "11-12 09:30:00",
+                    "summary": "跨网段 · 国家变化 · ASN 变化",
+                    "fields": [
+                        ["key": "ip", "before": "2001:db8:1234:5678:90ab:cdef:1234:5678", "after": "203.0.113.10", "status": "changed"],
+                        ["key": "prefix", "before": "2001:db8:1234::/48", "after": "203.0.113.0/24", "status": "changed"],
+                        ["key": "location", "before": "US / California / Palo Alto", "after": "JP / Tokyo / Shinjuku", "status": "changed"],
+                        ["key": "asn", "before": "AS64512", "after": "AS64513", "status": "changed"],
+                        ["key": "org", "before": "Example Fiber", "after": "Example Hosting", "status": "changed"],
+                        ["key": "type", "before": NSNull(), "after": "Content", "status": "unknown"],
+                    ],
+                ]
+                let event = try JSONSerialization.data(withJSONObject: comparison)
+                try f.audit(warning)
+                let audit = try String(contentsOf: f.root.appendingPathComponent("audit"), encoding: .utf8)
+                try f.write("audit", audit + IPChange.outputPrefix + String(decoding: event, as: UTF8.self) + "\n")
+                vm.refresh(); try f.idle(vm)
+                guard let change = vm.ipChange else { throw TestFailure(description: "未识别出口对比") }
+                try expect(vm.rows.count == 14 && vm.phase == .ready && vm.lastCheckSummary == "有警告",
+                           "对比详情应附属于原有警告检查项")
+                try expect(change.fields.first?.before == "2001:db8:1234:5678:90ab:cdef:1234:5678",
+                           "对照表应收到完整的 IPv6 地址")
+                try expect(change.fields.last?.before == nil && change.fields.last?.status == .unknown,
+                           "旧样本缺失的类型应显示未确认")
+                let width: CGFloat = 498
+                let collapsed = NSHostingView(rootView: IPChangeDisclosure(change: change, isExpanded: .constant(false)).frame(width: width))
+                let expanded = NSHostingView(rootView: IPChangeDisclosure(change: change, isExpanded: .constant(true)).frame(width: width))
+                try expect(collapsed.fittingSize.height <= 68 && expanded.fittingSize.height > collapsed.fittingSize.height,
+                           "初始应只显示摘要，展开才显示前后对照")
+                try render(ContentView(vm: vm).frame(width: 860, height: 620),
+                           name: "dashboard-warning-compact", size: NSSize(width: 860, height: 620))
+                vm.showIPComparison = true
+                for dark in [false, true] {
+                    try render(ContentView(vm: vm).frame(width: 860, height: 900),
+                               name: "dashboard-ip-comparison-\(dark ? "dark" : "light")",
+                               size: NSSize(width: 860, height: 900), dark: dark)
+                }
+                vm.showIPComparison = false
                 warning["DNS"] = "fail:未走隧道，请检查客户端 DNS 配置"
                 try f.audit(warning); vm.refresh(); try f.idle(vm)
+                try expect(vm.ipChange == nil, "下一轮缺少对比时不能残留旧数据")
                 let clientHeight = NSHostingView(rootView: ContentView(vm: vm).clientCard.frame(width: 292)).fittingSize.height
                 let retryHeight = NSHostingView(rootView: ContentView(vm: vm).retryCard.frame(width: 292).buttonStyle(ClaudeActionStyle())).fittingSize.height
                 try expect(clientHeight <= 70 && retryHeight <= 76, "代理选择与空错误提示不能挤占账号区域")
