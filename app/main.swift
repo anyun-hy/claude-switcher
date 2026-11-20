@@ -275,7 +275,25 @@ final class VM: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        readCLIVersionFromDisk()
         refresh()
+    }
+
+    // 只读扫描内置 Claude Code 版本目录,不调用核心、不修改任何文件、不影响启动检查时序。
+    private func readCLIVersionFromDisk() {
+        let root = NSHomeDirectory() + "/Library/Application Support/Claude/claude-code"
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: root) else { return }
+        var best = ""
+        var bestParts: [Int] = []
+        for name in entries {
+            let parts = name.split(separator: ".").compactMap { Int($0) }
+            guard parts.count == 3 else { continue }   // 只认 x.y.z 纯数字版本目录
+            if bestParts.isEmpty || (parts.lexicographicallyPrecedes(bestParts) == false) {
+                best = name; bestParts = parts
+            }
+        }
+        if !best.isEmpty { cliVersion = best }
     }
 
     func prepareToShow() {
@@ -617,19 +635,7 @@ final class VM: ObservableObject {
                         self.lastCheckSummary = "待验收"
                     }
                     self.phase = passed && statusOK && !self.networkPending ? .ready : .failed
-                    // 只读读取内置 Claude Code 版本;失败时保持上次值,不影响检查结果。
-                    self.run(["cli-version"], timeout: self.checkTimeout) { versionResult in
-                        if versionResult.succeeded {
-                            for line in versionResult.output.split(separator: "\n") {
-                                let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
-                                if parts.count == 2, parts[0] == "version", !parts[1].isEmpty {
-                                    self.cliVersion = parts[1]
-                                    break
-                                }
-                            }
-                        }
-                        done(passed && statusOK && !self.networkPending)
-                    }
+                    done(passed && statusOK && !self.networkPending)
                 }
             }
         }
