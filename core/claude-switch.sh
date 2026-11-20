@@ -2460,6 +2460,8 @@ egress_profile() {
 # ---------- 安全检查 ----------
 check() {
     load_check_config || { echo "FAIL:检查配置无效，请恢复默认设置"; return 1; }
+    # 启动检查即检测内置 CLI 多版本:发现旧版本自动清理,只留最新,避免多版本长期并存。
+    prune_cli_versions "$DATA"
     fails=""
 
     local others tcnt processes ip_state sampled_at
@@ -2780,6 +2782,8 @@ ASEOF
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
 checkdetail() {
     load_check_config || { echo "检查配置无效，请恢复默认设置"; return 1; }
+    # 启动检查即检测内置 CLI 多版本:发现旧版本自动清理,只留最新,避免多版本长期并存。
+    prune_cli_versions "$DATA"
     local others tcnt processes ip_state ip_status sampled_at profile_report profile="" asn_state="warn:未获取" ip_mode="detail-basic"
     if ! processes=$(proxy_processes); then
         echo '代理内核=fail:无法核验代理进程'
@@ -4124,25 +4128,33 @@ cli_current() {
 # 桌面版内置 CLI 旧版本清理:claude-code/ 下只保留版本号最大的目录,其余删除。
 # 桌面版更新后常留下旧版本目录(数百 MB);快照整目录搬运会把旧版本随切换来回还原、越积越多。
 # 只处理纯数字版本号目录(x.y.z),符号链接与非版本目录一律不动;失败只记 WARN,绝不阻断切换。
+# 清理结果写入全局变量 PRUNED_VERSIONS(删除列表)/PRUNED_LATEST(保留版本),供启动检查与界面报告。
 prune_cli_versions() {
-    local where="$1" root versions latest v
+    local where="$1" root versions latest v pruned=""
+    PRUNED_VERSIONS=""; PRUNED_LATEST=""
     [ "${CLAUDE_SWITCHER_NO_PRUNE_CLI:-0}" != "1" ] || return 0
     root="$where/claude-code"
     [ -d "$root" ] || return 0
     versions=$(find "$root" -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null \
         | xargs -0 -n1 basename 2>/dev/null \
         | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -t . -k 1,1n -k 2,2n -k 3,3n -k 4,4n | uniq)
-    [ "$(printf '%s\n' "$versions" | grep -c .)" -le 1 ] && return 0
     latest=$(printf '%s\n' "$versions" | tail -1)
-    printf '%s\n' "$versions" | while IFS= read -r v; do
+    PRUNED_LATEST="$latest"
+    [ "$(printf '%s\n' "$versions" | grep -c .)" -le 1 ] && return 0
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
         [ "$v" = "$latest" ] && continue
         if [ -L "$root/$v" ] || [ ! -d "$root/$v" ]; then continue; fi
         if rm -rf -- "$root/$v" 2>/dev/null; then
+            pruned="${pruned:+$pruned,}$v"
             log "WARN:已清理内置 CLI 旧版本 $v(保留 $latest),位置 $root"
         else
             log "WARN:内置 CLI 旧版本 $v 清理失败,保留现场:$root/$v"
         fi
-    done
+    done <<EOF
+$versions
+EOF
+    PRUNED_VERSIONS="$pruned"
 }
 
 archive_current() {
