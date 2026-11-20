@@ -2460,8 +2460,6 @@ egress_profile() {
 # ---------- 安全检查 ----------
 check() {
     load_check_config || { echo "FAIL:检查配置无效，请恢复默认设置"; return 1; }
-    # 启动检查即检测内置 CLI 多版本:发现旧版本自动清理,只留最新,避免多版本长期并存。
-    prune_cli_versions "$DATA"
     fails=""
 
     local others tcnt processes ip_state sampled_at
@@ -2782,8 +2780,6 @@ ASEOF
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
 checkdetail() {
     load_check_config || { echo "检查配置无效，请恢复默认设置"; return 1; }
-    # 启动检查即检测内置 CLI 多版本:发现旧版本自动清理,只留最新,避免多版本长期并存。
-    prune_cli_versions "$DATA"
     local others tcnt processes ip_state ip_status sampled_at profile_report profile="" asn_state="warn:未获取" ip_mode="detail-basic"
     if ! processes=$(proxy_processes); then
         echo '代理内核=fail:无法核验代理进程'

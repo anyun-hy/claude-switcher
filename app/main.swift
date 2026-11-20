@@ -180,6 +180,10 @@ final class VM: ObservableObject {
     @Published var phase: Phase = .checking
     @Published var current = "?"
     @Published var cliVersion = "未知"
+    @Published var redundantVersions: [String] = []
+    @Published var redundantSizeMB: Double = 0
+    @Published var isCleaningCli = false
+    @Published var cliCleanResultNotice = ""
     @Published var archived: Set<String> = []
     @Published var stamps: [String: AccountStamp] = [:]
     @Published var banner = ""
@@ -279,21 +283,144 @@ final class VM: ObservableObject {
         refresh()
     }
 
-    // 只读扫描内置 Claude Code 版本目录,不调用核心、不修改任何文件、不影响启动检查时序。
-    private func readCLIVersionFromDisk() {
-        let root = NSHomeDirectory() + "/Library/Application Support/Claude/claude-code"
+    // 递归计算目录占用字节数
+    private func directorySizeBytes(at path: String) -> Int64 {
         let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(atPath: root) else { return }
-        var best = ""
-        var bestParts: [Int] = []
-        for name in entries {
-            let parts = name.split(separator: ".").compactMap { Int($0) }
-            guard parts.count == 3 else { continue }   // 只认 x.y.z 纯数字版本目录
-            if bestParts.isEmpty || (parts.lexicographicallyPrecedes(bestParts) == false) {
-                best = name; bestParts = parts
+        guard let enumerator = fm.enumerator(atPath: path) else { return 0 }
+        var total: Int64 = 0
+        while let file = enumerator.nextObject() as? String {
+            let full = (path as NSString).appendingPathComponent(file)
+            if let attrs = try? fm.attributesOfItem(atPath: full),
+               attrs[.type] as? FileAttributeType == .typeRegular {
+                total += (attrs[.size] as? Int64) ?? 0
             }
         }
-        if !best.isEmpty { cliVersion = best }
+        return total
+    }
+
+    // 扫描内置 Claude Code 版本目录，识别最新版与历史残留旧版（只读分析，不强删）
+    func readCLIVersionFromDisk() {
+        let fm = FileManager.default
+        let home = NSHomeDirectory()
+        let liveRoot = home + "/Library/Application Support/Claude/claude-code"
+        let accountsRoot = home + "/.claude-switcher/accounts"
+
+        var allVersionDirs: [(version: String, parts: [Int], path: String)] = []
+
+        // 1. 扫描当前活动目录
+        if let liveEntries = try? fm.contentsOfDirectory(atPath: liveRoot) {
+            for name in liveEntries {
+                let parts = name.split(separator: ".").compactMap { Int($0) }
+                guard parts.count == 3 else { continue }
+                let fullPath = (liveRoot as NSString).appendingPathComponent(name)
+                var isDir: ObjCBool = false
+                if fm.fileExists(atPath: fullPath, isDirectory: &isDir), isDir.boolValue {
+                    let attrs = try? fm.attributesOfItem(atPath: fullPath)
+                    if attrs?[.type] as? FileAttributeType != .typeSymbolicLink {
+                        allVersionDirs.append((name, parts, fullPath))
+                    }
+                }
+            }
+        }
+
+        // 2. 扫描快照库 accounts/*/claude-code
+        if let accEntries = try? fm.contentsOfDirectory(atPath: accountsRoot) {
+            for acc in accEntries {
+                let accCli = "\(accountsRoot)/\(acc)/claude-code"
+                if let entries = try? fm.contentsOfDirectory(atPath: accCli) {
+                    for name in entries {
+                        let parts = name.split(separator: ".").compactMap { Int($0) }
+                        guard parts.count == 3 else { continue }
+                        let fullPath = (accCli as NSString).appendingPathComponent(name)
+                        var isDir: ObjCBool = false
+                        if fm.fileExists(atPath: fullPath, isDirectory: &isDir), isDir.boolValue {
+                            let attrs = try? fm.attributesOfItem(atPath: fullPath)
+                            if attrs?[.type] as? FileAttributeType != .typeSymbolicLink {
+                                allVersionDirs.append((name, parts, fullPath))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. 找出全机最新版本
+        var best = ""
+        var bestParts: [Int] = []
+        for item in allVersionDirs {
+            if bestParts.isEmpty || (item.parts.lexicographicallyPrecedes(bestParts) == false) {
+                best = item.version
+                bestParts = item.parts
+            }
+        }
+        if !best.isEmpty {
+            cliVersion = best
+        }
+
+        // 4. 统计早于最新版的历史旧版本及占用大小
+        var oldSet = Set<String>()
+        var totalOldBytes: Int64 = 0
+        for item in allVersionDirs {
+            if item.version != best {
+                oldSet.insert(item.version)
+                totalOldBytes += directorySizeBytes(at: item.path)
+            }
+        }
+
+        redundantVersions = Array(oldSet).sorted { a, b in
+            let ap = a.split(separator: ".").compactMap { Int($0) }
+            let bp = b.split(separator: ".").compactMap { Int($0) }
+            return bp.lexicographicallyPrecedes(ap)
+        }
+        redundantSizeMB = Double(totalOldBytes) / (1024.0 * 1024.0)
+    }
+
+    // 手动清理所有历史残留旧版本（活动目录与快照库），只保留最新版
+    func cleanRedundantVersions() {
+        guard !isCleaningCli, !redundantVersions.isEmpty else { return }
+        isCleaningCli = true
+        cliCleanResultNotice = ""
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let fm = FileManager.default
+            let home = NSHomeDirectory()
+            let liveRoot = home + "/Library/Application Support/Claude/claude-code"
+            let accountsRoot = home + "/.claude-switcher/accounts"
+
+            var targets: [String] = []
+            if let entries = try? fm.contentsOfDirectory(atPath: liveRoot) {
+                for name in entries where self.redundantVersions.contains(name) {
+                    targets.append((liveRoot as NSString).appendingPathComponent(name))
+                }
+            }
+            if let accEntries = try? fm.contentsOfDirectory(atPath: accountsRoot) {
+                for acc in accEntries {
+                    let accCli = "\(accountsRoot)/\(acc)/claude-code"
+                    if let entries = try? fm.contentsOfDirectory(atPath: accCli) {
+                        for name in entries where self.redundantVersions.contains(name) {
+                            targets.append((accCli as NSString).appendingPathComponent(name))
+                        }
+                    }
+                }
+            }
+
+            let freedMB = self.redundantSizeMB
+            for path in targets {
+                var isDir: ObjCBool = false
+                if fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue {
+                    let attrs = try? fm.attributesOfItem(atPath: path)
+                    if attrs?[.type] as? FileAttributeType != .typeSymbolicLink {
+                        try? fm.removeItem(atPath: path)
+                    }
+                }
+            }
+
+            DispatchQueue.main.async {
+                self.isCleaningCli = false
+                self.cliCleanResultNotice = String(format: "已清理历史旧版本，释放约 %.1f MB 空间", freedMB)
+                self.readCLIVersionFromDisk()
+            }
+        }
     }
 
     func prepareToShow() {
@@ -684,6 +811,7 @@ final class VM: ObservableObject {
         guard ["0", "1"].contains(fields["network_rebuild"] ?? "0") else { return reset() }
         networkPending = fields["network_rebuild"] == "1"
         if networkPending { phase = .failed }
+        readCLIVersionFromDisk()
         return true
     }
 
@@ -1624,10 +1752,64 @@ struct ContentView: View {
                     Divider().overlay(ClaudeTheme.divider).padding(.leading, 48)
                 }
             }
+            cliVersionNoticeBar
         }
         .background(ClaudeTheme.card)
         .clipShape(RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.cardBorder))
+    }
+
+    @ViewBuilder
+    private var cliVersionNoticeBar: some View {
+        if !vm.redundantVersions.isEmpty {
+            VStack(spacing: 0) {
+                Divider().overlay(ClaudeTheme.divider)
+                HStack(spacing: 12) {
+                    Image(systemName: "trash.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundColor(ClaudeTheme.terracottaDeep)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("内置 Claude Code 存在 \(vm.redundantVersions.count) 个历史版本残留")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(ClaudeTheme.ink)
+                        Text("旧版本：\(vm.redundantVersions.joined(separator: ", "))（约占用 \(String(format: "%.1f", vm.redundantSizeMB)) MB）")
+                            .font(.system(size: 11))
+                            .foregroundColor(ClaudeTheme.muted)
+                    }
+                    Spacer()
+                    Button {
+                        vm.cleanRedundantVersions()
+                    } label: {
+                        if vm.isCleaningCli {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("一键清理").font(.system(size: 11, weight: .medium))
+                        }
+                    }
+                    .buttonStyle(ClaudeActionStyle(primary: true))
+                    .disabled(vm.isCleaningCli || vm.isBusy)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 9)
+                .background(ClaudeTheme.terracottaTint.opacity(0.35))
+            }
+        } else if !vm.cliCleanResultNotice.isEmpty {
+            VStack(spacing: 0) {
+                Divider().overlay(ClaudeTheme.divider)
+                HStack(spacing: 10) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 15))
+                        .foregroundColor(ClaudeTheme.success)
+                    Text(vm.cliCleanResultNotice)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundColor(ClaudeTheme.success)
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(ClaudeTheme.success.opacity(0.08))
+            }
+        }
     }
 
     var clientCard: some View {
