@@ -179,6 +179,7 @@ final class VM: ObservableObject {
     ]
     @Published var phase: Phase = .checking
     @Published var current = "?"
+    @Published var cliVersion = "未知"
     @Published var archived: Set<String> = []
     @Published var stamps: [String: AccountStamp] = [:]
     @Published var banner = ""
@@ -616,7 +617,19 @@ final class VM: ObservableObject {
                         self.lastCheckSummary = "待验收"
                     }
                     self.phase = passed && statusOK && !self.networkPending ? .ready : .failed
-                    done(passed && statusOK && !self.networkPending)
+                    // 只读读取内置 Claude Code 版本;失败时保持上次值,不影响检查结果。
+                    self.run(["cli-version"], timeout: self.checkTimeout) { versionResult in
+                        if versionResult.succeeded {
+                            for line in versionResult.output.split(separator: "\n") {
+                                let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
+                                if parts.count == 2, parts[0] == "version", !parts[1].isEmpty {
+                                    self.cliVersion = parts[1]
+                                    break
+                                }
+                            }
+                        }
+                        done(passed && statusOK && !self.networkPending)
+                    }
                 }
             }
         }
@@ -1641,6 +1654,11 @@ struct ContentView: View {
             }
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
                 ForEach(VM.accountLetters, id: \.self) { accountButton($0, subtitle: accountSubtitle($0)) }
+            }
+            HStack {
+                Text("内置 Claude Code").font(.caption).foregroundColor(ClaudeTheme.muted)
+                Spacer()
+                Text(vm.cliVersion).font(.caption).foregroundColor(ClaudeTheme.terracottaDeep)
             }
             if vm.phase == .switching || vm.phase == .done {
                 Text(vm.banner).font(.caption).foregroundColor(vm.phase == .done ? ClaudeTheme.success : ClaudeTheme.muted)

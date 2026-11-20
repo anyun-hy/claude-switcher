@@ -4004,6 +4004,23 @@ PY
     echo "OK:已导入为账号$target(切换时生效)"
 }
 
+# 只读:桌面版内置 Claude Code 的最新已验证版本(读 .verified 标记,不修改任何文件)
+cli_latest_version() {
+    local root="$DATA/claude-code" v marker
+    [ -d "$root" ] || { echo "unknown"; return 0; }
+    marker=$(find "$root" -maxdepth 3 -mindepth 3 -name '.verified' -type f -print 2>/dev/null \
+        | sed -n "s|^$root/\([0-9][0-9.]*\)/|\1\n|p")
+    if [ -z "$marker" ]; then
+        # 无 .verified 时回退:取纯数字版本目录中版本号最大的一个
+        v=$(find "$root" -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null \
+            | xargs -0 -n1 basename 2>/dev/null \
+            | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -t . -k 1,1n -k 2,2n -k 3,3n -k 4,4n | tail -1)
+        echo "${v:-unknown}"
+    else
+        printf '%s\n' "$marker" | sort -t . -k 1,1n -k 2,2n -k 3,3n -k 4,4n | tail -1
+    fi
+}
+
 status() {
     local cur="none" hasA=0 hasB=0 hasC=0 hasD=0 a dir size stamp accounts="" extras=""
     [ -f "$BASE/current" ] && cur=$(cat "$BASE/current")
@@ -4458,6 +4475,7 @@ case "$operation" in
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     open-safe) open_safe "${2:-}" ;;
     cli-info) cli_info ;;
+    cli-version) printf 'version=%s\n' "$(cli_latest_version)" ;;  # 只读:内置 Claude Code 最新版本
     cli) run_cli "${@:2}" ;;
     cli-current) cli_current ;;
     snapshot-export) snapshot_export "${2:-}" "${3:-}" "${4:-}" ;;
@@ -4469,7 +4487,7 @@ case "$operation" in
     set-keep-paths) "$0" _support keep-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto|--gui]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]|network-rebuild <preview|apply|state|validate|rollback> [args...]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto|--gui]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli-version|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]|network-rebuild <preview|apply|state|validate|rollback> [args...]"; exit 2 ;;
 esac
 # checkdetail 分支内部已保存返回码;其他分支取 case 的最终状态。
 # 判断本身会改变 $?，所以必须先捕获 dispatch_rc，再按操作类型落 rc。
