@@ -321,11 +321,20 @@ Windows 加密快照使用 `.csnap`（PBKDF2-HMAC-SHA256 + AES-256-CBC + HMAC-SH
 
 - PATH 中的 `claude` 路径、解析后的真实路径、`--version`
 - 安装方式推断（native / Homebrew / npm·bun / 未知）
-- 桌面版内置 CLI 的版本（`~/Library/Application Support/Claude/claude-code/...`）
+- 桌面版内置 CLI 的**全部**版本目录（`~/Library/Application Support/Claude/claude-code/` 下的纯数字版本，多版本时会给出提示）
 - 是否同时存在 npm 全局包与 Homebrew 包（多份安装容易互相覆盖）
 - `~/.claude` 配置目录是否存在及体积
 
 该命令**只检测不修改**：不会卸载、升级或删除任何东西；需要重装时按输出里的建议自行执行对应包管理器命令。
+
+### 切换账号时自动清理旧版本
+
+桌面版更新后，`claude-code/` 下常会留下数百 MB 的旧版本目录；而账号快照是整目录搬运动，旧版本会随着切换账号来回还原、越积越多。因此**每次切换账号都会自动执行一次旧版本清理**：
+
+- 归档当前账号前、还原目标账号后各清理一次，活动目录与账号存档同步瘦身
+- 只保留版本号最大的纯数字目录（如 `2.1.328`），其余旧版本（`2.1.317`、`2.1.321` 等）删除并记录到切换日志
+- 安装哈希目录（如 `c141a31688d6`）、非版本名目录与符号链接一律不动
+- 清理失败只记 WARN，绝不阻断切换；设置环境变量 `CLAUDE_SWITCHER_NO_PRUNE_CLI=1` 可关闭该行为
 
 ## Claude Code 多账号联动（macOS CLI）
 

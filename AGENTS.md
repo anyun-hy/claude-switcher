@@ -79,6 +79,7 @@
 | 切换账号后对方看到"新设备" | 正常：快照隔离意味着每个账号有独立设备指纹，这正是设计目标 | 无需处理 |
 | 切换后某些文件没过去／不该过去 | 跨身份保留默认关闭，只复制 `~/.claude-switcher/keep-in-workspace.txt` 中列出的相对路径；绝对路径、含 `..`、符号链接会被跳过 | 对照该文件与 `~/Library/Logs/claude-switch.log` 的 WARN；只保留通用配置，不要把登录态/缓存列进去 |
 | `cli` 启动报「检测到认证环境变量…已拒绝启动」 | shell 配置了 `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` 等覆盖，切换器无法保证账号隔离 | 取消对应变量后再用 `claude-switch.sh cli` 启动；不要为绕过而改代码放宽，认证覆盖本来就不属于按目录隔离模型 |
+| 切换后内置 CLI 旧版本目录越积越多 | 桌面版自动更新在 `claude-code/` 下留旧版本,快照整目录搬运会来回还原 | 切换账号时已自动只留最新纯数字版本(归档前+还原后各一次,记 WARN 日志);不放心可先 `cli-info` 查看,`CLAUDE_SWITCHER_NO_PRUNE_CLI=1` 可关闭 |
 | 切到 B/C/D 后第一次用 `cli` 要求登录 | 预期行为：B–D 各自使用 `~/.claude-switcher/cli-accounts/<槽位>/` 独立目录，首次各登录一次 | 在弹出的 CLI 里完成登录即可；可用官方 `claude auth status` 自查，切换器不读取凭据自动断言；登录过期后仍可能需重新认证 |
 
 ## 安全红线（Agent 必须遵守）

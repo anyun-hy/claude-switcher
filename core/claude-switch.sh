@@ -3815,9 +3815,17 @@ cli_info() {
         echo "安装方式=info:未安装(桌面版可能自带内置 CLI,见下)"
     fi
 
-    bundled=$(ls -d "$HOME/Library/Application Support/Claude/claude-code"/* 2>/dev/null | tail -1)
+    bundled=$(find "$HOME/Library/Application Support/Claude/claude-code" -maxdepth 1 -mindepth 1 -type d 2>/dev/null \
+        | while IFS= read -r d; do basename "$d"; done \
+        | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -t . -k 1,1n -k 2,2n -k 3,3n -k 4,4n | uniq)
     if [ -n "$bundled" ]; then
-        echo "桌面版内置=ok:$(basename "$bundled")"
+        bundled_count=$(printf '%s\n' "$bundled" | grep -c .)
+        bundled_latest=$(printf '%s\n' "$bundled" | tail -1)
+        if [ "$bundled_count" -gt 1 ]; then
+            echo "桌面版内置=warn:多版本 $(printf '%s' "$bundled" | tr '\n' '/' | sed 's:/$::')($bundled_count 份,切换账号时会自动只留最新 $bundled_latest)"
+        else
+            echo "桌面版内置=ok:$bundled_latest"
+        fi
     else
         echo "桌面版内置=info:未发现(Claude 桌面版未安装或版本较旧)"
     fi
@@ -4113,10 +4121,35 @@ cli_current() {
     echo "current=$cur config=$dir"
 }
 
+# 桌面版内置 CLI 旧版本清理:claude-code/ 下只保留版本号最大的目录,其余删除。
+# 桌面版更新后常留下旧版本目录(数百 MB);快照整目录搬运会把旧版本随切换来回还原、越积越多。
+# 只处理纯数字版本号目录(x.y.z),符号链接与非版本目录一律不动;失败只记 WARN,绝不阻断切换。
+prune_cli_versions() {
+    local where="$1" root versions latest v
+    [ "${CLAUDE_SWITCHER_NO_PRUNE_CLI:-0}" != "1" ] || return 0
+    root="$where/claude-code"
+    [ -d "$root" ] || return 0
+    versions=$(find "$root" -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null \
+        | xargs -0 -n1 basename 2>/dev/null \
+        | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -t . -k 1,1n -k 2,2n -k 3,3n -k 4,4n | uniq)
+    [ "$(printf '%s\n' "$versions" | grep -c .)" -le 1 ] && return 0
+    latest=$(printf '%s\n' "$versions" | tail -1)
+    printf '%s\n' "$versions" | while IFS= read -r v; do
+        [ "$v" = "$latest" ] && continue
+        if [ -L "$root/$v" ] || [ ! -d "$root/$v" ]; then continue; fi
+        if rm -rf -- "$root/$v" 2>/dev/null; then
+            log "WARN:已清理内置 CLI 旧版本 $v(保留 $latest),位置 $root"
+        else
+            log "WARN:内置 CLI 旧版本 $v 清理失败,保留现场:$root/$v"
+        fi
+    done
+}
+
 archive_current() {
     local cur="$1"
     local t0 staged current previous moved=0 had_old=0
     t0=$(date +%s)
+    prune_cli_versions "$DATA"
     staged="$BASE/accounts/$cur.new"
     current="$BASE/accounts/$cur"
     previous="$BASE/accounts/$cur.previous"
@@ -4296,6 +4329,7 @@ switch_to() {
                 echo "FAIL:账号$target 还原失败，已停止切换"; return 1
             fi
         fi
+        prune_cli_versions "$DATA"
         # 上次还原失败留下的 stage,在当前账号上重试合并
         if [ -d "$BASE/keep-stage" ]; then
             restore_keep_paths || { echo "FAIL:跨身份保留还原失败，暂存保留在 $BASE/keep-stage"; return 1; }
@@ -4341,6 +4375,7 @@ switch_to() {
         echo "FAIL:载入账号$target 失败，暂存保留在 $BASE/keep-stage"
         return 1
     fi
+    prune_cli_versions "$DATA"
     echo "$target" > "$BASE/current"
 
     if [ -d "$BASE/keep-stage" ]; then

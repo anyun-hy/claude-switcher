@@ -25,6 +25,7 @@ FUNCTIONS = (
     "cli_lock_acquire",
     "cli_lock_release",
     "archive_current",
+    "prune_cli_versions",
     "switch_to",
 )
 
@@ -384,6 +385,56 @@ ditto() {
         )
         self.assertFalse((self.base / "keep-stage").exists())
 
+    def _make_cli_versions(self, *names, where=None):
+        root = (where or self.data) / "claude-code"
+        root.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (root / name).mkdir(parents=True, exist_ok=True)
+            (root / name / "cli.js").write_text("stub", encoding="utf-8")
+
+    def test_switch_prunes_old_cli_versions_in_live_and_archive(self):
+        # 活动目录与快照各躺两份旧版 CLI,切换后两侧都只留最新
+        self._make_cli_versions("2.1.317", "2.1.328")            # 活动目录(当前 A)
+        self.account("B")                                        # 目标 B 存档
+        self._make_cli_versions("2.1.321", "2.1.328", where=self.account("B"))
+        (self.base / "current").write_text("A", encoding="utf-8")
+        (self.data / "marker").write_text("live-A", encoding="utf-8")
+
+        result = self.run_shell("switch_to B")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OK:已切换到账号B", result.stdout)
+        # 归档前已清理:A 的快照只带最新
+        self.assertEqual(
+            sorted(p.name for p in (self.base / "accounts" / "A" / "claude-code").iterdir()),
+            ["2.1.328"],
+        )
+        # 还原后已清理:当前活动目录只带最新
+        self.assertEqual(
+            sorted(p.name for p in (self.data / "claude-code").iterdir()),
+            ["2.1.328"],
+        )
+
+    def test_switch_succeeds_even_if_prune_delete_fails(self):
+        # 清理失败只记 WARN,绝不阻断切换
+        self._make_cli_versions("2.1.317", "2.1.328")
+        self.account("B").joinpath("marker").write_text("saved-B", encoding="utf-8")
+        (self.base / "current").write_text("A", encoding="utf-8")
+        (self.data / "marker").write_text("live-A", encoding="utf-8")
+        # chmod 555 父目录让 rm 失败,结束恢复权限
+        cli_root = self.data / "claude-code"
+        cli_root.chmod(0o555)
+
+        def _restore_perms():
+            # 切换是移动语义:活动目录可能已整体搬到 accounts/A
+            for moved in (cli_root, self.base / "accounts" / "A" / "claude-code"):
+                if moved.exists():
+                    moved.chmod(0o755)
+
+        self.addCleanup(_restore_perms)
+
+        result = self.run_shell("switch_to B")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OK:已切换到账号B", result.stdout)
 
 if __name__ == "__main__":
     unittest.main()
