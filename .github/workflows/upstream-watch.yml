@@ -24,13 +24,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check upstream commits and notify via Issue
+      - name: Check upstream commits and publish reminder
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM_REPO: YOURSJEYO/claude-switcher
           UPSTREAM_BRANCH: main
         run: |
           set -euo pipefail
+
+          # 本仓库可能关闭 Issues。先查询能力，关闭时改用运行摘要，避免每日任务失败。
+          ISSUES_ENABLED=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.has_issues')
+          echo "Issues enabled: ${ISSUES_ENABLED}"
 
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
@@ -42,10 +46,12 @@ jobs:
           # 若上游最新提交已在当前 main 历史中，自动关闭已有的 [Upstream Sync] 提醒 Issue
           if git merge-base --is-ancestor "${UPSTREAM_REF}" HEAD; then
             echo "✓ 当前 main 已包含上游 ${UPSTREAM_REPO}@${UPSTREAM_SHA}，无需同步。"
-            OPEN_ISSUES=$(gh issue list --state open --search "[Upstream Sync] in:title" --json number --jq '.[].number' || true)
-            for num in $OPEN_ISSUES; do
-              gh issue close "$num" --comment "✅ 上游最新提交 (\`${UPSTREAM_SHA}\`) 已合入 \`main\`，自动关闭此同步提醒。"
-            done
+            if [ "${ISSUES_ENABLED}" = "true" ]; then
+              OPEN_ISSUES=$(gh issue list --state open --search "[Upstream Sync] in:title" --json number --jq '.[].number')
+              for num in $OPEN_ISSUES; do
+                gh issue close "$num" --comment "✅ 上游最新提交 (\`${UPSTREAM_SHA}\`) 已合入 \`main\`，自动关闭此同步提醒。"
+              done
+            fi
             exit 0
           fi
 
@@ -89,6 +95,14 @@ jobs:
           } > "${BODY_FILE}"
 
           TITLE="[Upstream Sync] 上游 ${UPSTREAM_REPO} 有 ${COMMIT_COUNT} 个新提交 (${UPSTREAM_SHA})"
+
+          # Issues 关闭时，提醒仍完整保留在 Actions 页面，且日志明确说明通知位置。
+          if [ "${ISSUES_ENABLED}" != "true" ]; then
+            cat "${BODY_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+            echo "仓库已关闭 Issues，上游提醒已写入本次运行的 Summary，未创建或更新 Issue。"
+            rm -f "${BODY_FILE}"
+            exit 0
+          fi
 
           # 检查是否已有同 SHA 的未关闭提醒，避免重复建单
           SAME_SHA_ISSUE=$(gh issue list --state open --search "[Upstream Sync] (${UPSTREAM_SHA}) in:title" --json number --jq '.[0].number // empty' || true)
