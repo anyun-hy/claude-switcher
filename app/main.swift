@@ -1532,6 +1532,7 @@ extension RowState {
 
 struct IPChangeSummary: View {
     let summary: String
+    var changedAt: String? = nil
     @Binding var isShowingDetails: Bool
 
     var body: some View {
@@ -1545,7 +1546,7 @@ struct IPChangeSummary: View {
                 Text("出口 IP 已变化")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(ClaudeTheme.warning)
-                Text(summary)
+                Text(displayText)
                     .font(.caption)
                     .foregroundColor(ClaudeTheme.muted)
             }
@@ -1562,6 +1563,13 @@ struct IPChangeSummary: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(ClaudeTheme.warning.opacity(0.08))
+    }
+
+    private var displayText: String {
+        if let changedAt, !changedAt.isEmpty, !summary.contains(changedAt) {
+            return "\(summary)（最近：\(changedAt)）"
+        }
+        return summary
     }
 }
 
@@ -1593,7 +1601,7 @@ struct IPChangeDetails: View {
                                 .font(.caption2)
                                 .foregroundColor(field.status == .changed ? ClaudeTheme.warning : ClaudeTheme.muted)
                         }
-                        value(field.before, field: field, current: false)
+                        value(field.before, field: field, current: false, timeLabel: field.key == .ip ? change.changedAt : nil)
                         value(field.after, field: field, current: true)
                     }
                 }
@@ -1611,23 +1619,34 @@ struct IPChangeDetails: View {
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(ClaudeTheme.cardBorder))
     }
 
-    private func value(_ value: String?, field: IPChange.Field, current: Bool) -> some View {
+    private func value(_ value: String?, field: IPChange.Field, current: Bool, timeLabel: String? = nil) -> some View {
         let different = current && field.status == .changed
+        let label = current ? "当前" : "变化前"
         return HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(current ? "当前" : "变化前")
+            Text(label)
                 .font(.caption2)
                 .foregroundColor(ClaudeTheme.muted)
                 .frame(width: 36, alignment: .leading)
                 .accessibilityHidden(true)
-            Text(value ?? "未采集")
-                .font(.system(size: 12, weight: different ? .semibold : .regular,
-                              design: field.key.monospaced ? .monospaced : .default))
-                .foregroundColor(different ? ClaudeTheme.warning : (current && value != nil ? ClaudeTheme.ink : ClaudeTheme.muted))
+            displayText(value: value, field: field, different: different, current: current, timeLabel: timeLabel)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
-                .accessibilityLabel("\(current ? "当前" : "变化前")\(field.key.title) \(value ?? "未采集")")
+                .accessibilityLabel("\(label)\(field.key.title) \(value ?? "未采集")\(timeLabel.map { " 记录时间 \($0)" } ?? "")")
         }
+    }
+
+    private func displayText(value: String?, field: IPChange.Field, different: Bool, current: Bool, timeLabel: String?) -> Text {
+        var text = Text(value ?? "未采集")
+            .font(.system(size: 12, weight: different ? .semibold : .regular,
+                          design: field.key.monospaced ? .monospaced : .default))
+            .foregroundColor(different ? ClaudeTheme.warning : (current && value != nil ? ClaudeTheme.ink : ClaudeTheme.muted))
+        if let timeLabel, !timeLabel.isEmpty {
+            text = text + Text(" (\(timeLabel))")
+                .font(.caption2)
+                .foregroundColor(ClaudeTheme.muted)
+        }
+        return text
     }
 }
 
@@ -1783,7 +1802,7 @@ struct ContentView: View {
             ForEach(Array(vm.rows.enumerated()), id: \.element.id) { index, row in
                 if row.name == IPChange.rowName, row.state == .warn,
                    let summary = vm.ipChange?.summary ?? legacyIPComparison.map({ $0.components(separatedBy: "\n").first ?? $0 }) {
-                    IPChangeSummary(summary: summary, isShowingDetails: $vm.showIPComparison)
+                    IPChangeSummary(summary: summary, changedAt: vm.ipChange?.changedAt, isShowingDetails: $vm.showIPComparison)
                 } else {
                     HStack(spacing: 12) {
                         Image(systemName: row.icon)
@@ -1867,6 +1886,30 @@ struct ContentView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
                 .background(ClaudeTheme.success.opacity(0.08))
+            }
+        } else {
+            VStack(spacing: 0) {
+                Divider().overlay(ClaudeTheme.divider)
+                HStack(spacing: 10) {
+                    Image(systemName: "checkmark.shield")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(ClaudeTheme.success)
+                    Text("内置 Claude Code")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(ClaudeTheme.ink)
+                    if !vm.cliVersion.isEmpty && vm.cliVersion != "未知" {
+                        Text("v\(vm.cliVersion)")
+                            .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                            .foregroundColor(ClaudeTheme.terracottaDeep)
+                    }
+                    Spacer()
+                    Text("版本管理正常 · 无冗余残留")
+                        .font(.caption2)
+                        .foregroundColor(ClaudeTheme.muted)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(ClaudeTheme.card)
             }
         }
     }
