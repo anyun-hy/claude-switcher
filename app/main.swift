@@ -181,6 +181,7 @@ final class VM: ObservableObject {
     ]
     @Published var phase: Phase = .checking
     @Published var current = "?"
+    @Published var desktopAppVersion = ""
     @Published var cliVersion = "未知"
     @Published var redundantVersions: [String] = []
     @Published var redundantSizeMB: Double = 0
@@ -357,8 +358,14 @@ final class VM: ObservableObject {
         return total
     }
 
-    // 扫描内置 Claude Code 版本目录，识别最新版与历史残留旧版（只读分析，不强删）
+    // 扫描桌面版 App 版本与内置 Claude Code 版本目录，识别最新版与历史残留旧版（只读分析，不强删）
     func readCLIVersionFromDisk() {
+        if let dict = NSDictionary(contentsOfFile: "/Applications/Claude.app/Contents/Info.plist"),
+           let ver = (dict["CFBundleShortVersionString"] as? String ?? dict["CFBundleVersion"] as? String)?
+               .trimmingCharacters(in: .whitespacesAndNewlines),
+           !ver.isEmpty {
+            desktopAppVersion = ver
+        }
         let fm = FileManager.default
         let home = NSHomeDirectory()
         let liveRoot = home + "/Library/Application Support/Claude/claude-code"
@@ -1890,10 +1897,21 @@ struct ContentView: View {
         } else {
             VStack(spacing: 0) {
                 Divider().overlay(ClaudeTheme.divider)
-                HStack(spacing: 10) {
+                HStack(spacing: 8) {
                     Image(systemName: "checkmark.shield")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundColor(ClaudeTheme.success)
+                    if !vm.desktopAppVersion.isEmpty {
+                        Text("桌面版")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(ClaudeTheme.ink)
+                        Text("v\(vm.desktopAppVersion)")
+                            .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                            .foregroundColor(ClaudeTheme.terracottaDeep)
+                        Text("·")
+                            .font(.system(size: 12))
+                            .foregroundColor(ClaudeTheme.muted)
+                    }
                     Text("内置 Claude Code")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(ClaudeTheme.ink)
@@ -1975,8 +1993,13 @@ struct ContentView: View {
             status = ("已退出", "未检测到主程序或后台进程", "stop.circle", ClaudeTheme.muted)
         }
         return VStack(alignment: .leading, spacing: 8) {
-            HStack {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("Claude 桌面版").font(.system(size: 13, weight: .semibold))
+                if !vm.desktopAppVersion.isEmpty {
+                    Text("v\(vm.desktopAppVersion)")
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundColor(ClaudeTheme.terracottaDeep)
+                }
                 Spacer(minLength: 8)
                 Label(status.label, systemImage: status.symbol)
                     .font(.system(size: 11, weight: .semibold)).foregroundColor(status.color)
