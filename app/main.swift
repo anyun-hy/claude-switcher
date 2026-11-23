@@ -590,6 +590,7 @@ final class VM: ObservableObject {
     func refresh() {
         guard !isBusy else { return }
         hideAfterSwitch?.cancel()
+        cliCleanResultNotice = ""
         if !coreAvailable() { markCoreMissing(); return }
         isBusy = true
         checkEnvironment { _ in self.isBusy = false }
@@ -1020,14 +1021,31 @@ final class VM: ObservableObject {
         }
     }
 
+    private var needsInstalledAppRelaunch: Bool {
+        guard let runningSHA = (Bundle.main.object(forInfoDictionaryKey: "ClaudeSwitcherSourceSHA256") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !runningSHA.isEmpty,
+              let dict = NSDictionary(contentsOfFile: "/Applications/Claude Switcher.app/Contents/Info.plist"),
+              let installedSHA = (dict["ClaudeSwitcherSourceSHA256"] as? String)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              !installedSHA.isEmpty else {
+            return false
+        }
+        return runningSHA != installedSHA
+    }
+
     func checkUpdate() {
         guard !checkingUpdate, !updating else { return }
         checkingUpdate = true
         updateText = "正在检查更新…"
         run(["update-check"], timeout: 120) { result in
-            self.updateText = result.output.isEmpty
+            var text = result.output.isEmpty
                 ? (result.succeeded ? "检查完成，核心脚本没有返回结果" : "检查失败，请重试")
                 : result.output
+            if result.succeeded, text.contains("已是最新版本"), self.needsInstalledAppRelaunch {
+                text += "\n检测到磁盘上的界面 App 已更新，点击「立即更新」即可重启生效。"
+            }
+            self.updateText = text
             self.checkingUpdate = false
         }
     }
@@ -1046,8 +1064,9 @@ final class VM: ObservableObject {
                 ? (result.succeeded ? "更新完成" : "更新失败，请重试")
                 : result.output
             guard result.succeeded else { return }
-            // 只有界面 App 被替换时才需要重启；仅更新核心或守护无需中断界面。
-            if result.output.contains("已同步更新："), result.output.contains("界面App") {
+            // 界面 App 本次被替换，或磁盘上的 App 已比当前内存进程新时，触发自动重启。
+            let appReplaced = result.output.contains("已同步更新：") && result.output.contains("界面App")
+            if appReplaced || self.needsInstalledAppRelaunch {
                 self.updateText += "\n正在重启 Claude 切换器…"
                 if let relaunch = self.onRelaunchRequested {
                     relaunch()
@@ -1881,7 +1900,7 @@ struct ContentView: View {
         } else if !vm.cliCleanResultNotice.isEmpty {
             VStack(spacing: 0) {
                 Divider().overlay(ClaudeTheme.divider)
-                HStack(spacing: 10) {
+                HStack(spacing: 8) {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 15))
                         .foregroundColor(ClaudeTheme.success)
@@ -1889,6 +1908,16 @@ struct ContentView: View {
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundColor(ClaudeTheme.success)
                     Spacer()
+                    if !vm.desktopAppVersion.isEmpty {
+                        Text("桌面版 v\(vm.desktopAppVersion)")
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundColor(ClaudeTheme.muted)
+                    }
+                    if !vm.cliVersion.isEmpty && vm.cliVersion != "未知" {
+                        Text("· 内置 Claude Code v\(vm.cliVersion)")
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundColor(ClaudeTheme.muted)
+                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
