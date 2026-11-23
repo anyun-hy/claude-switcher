@@ -110,7 +110,25 @@ class WindowsEgressRetryStaticTests(unittest.TestCase):
             body = function_body(self.text, name)
             self.assertIn("for ($attempt = 1; $attempt -le $Attempts; $attempt++)", body)
             self.assertIn("Start-Sleep", body)
-            self.assertIn("[int]$Attempts = 3", body)
+            self.assertIn("[int]$Attempts = 6", body)
+
+    def test_retry_budget_covers_the_measured_outage_window(self):
+        """重试轮数必须盖过实测的链路中断时长,否则重试全落在中断窗口里,必然全灭。
+
+        实测(2026-11-08,经隧道连续 25 次):失败请求每次约 5.7 秒
+        (连上之后被掐断,不是快速拒绝),一次中断持续约 34 秒后自行恢复。
+        3 轮只能覆盖约 18 秒,整段落在中断窗口内;6 轮约 40 秒才盖得住。
+        """
+        attempts = int(re.findall(r"\[int\]\$Attempts = (\d+)", self.text)[0])
+        per_attempt_seconds = 5.7
+        outage_seconds = 34.0
+        backoff_seconds = sum(0.4 * n for n in range(1, attempts))
+        window = attempts * per_attempt_seconds + backoff_seconds
+        self.assertGreaterEqual(
+            window,
+            outage_seconds,
+            f"重试窗口 {window:.0f}s 盖不住实测中断 {outage_seconds:.0f}s(轮数 {attempts})",
+        )
 
     def test_probe_code_treats_000_as_transport_failure(self):
         body = function_body(self.text, "Invoke-ProbeCode")
@@ -147,10 +165,12 @@ class WindowsEgressRetryStaticTests(unittest.TestCase):
         self.assertIn("(?m)^loc=", body)
 
     def test_get_egress_does_not_trim_a_possibly_empty_array(self):
-        """空响应时对空数组调 .Trim() 会抛异常中断整轮检查,必须先 join 成字符串。"""
+        """空响应时对空数组调 .Trim() 会抛异常中断整轮检查,必须先 join 成字符串或先判空。"""
         body = function_body(self.text, "Get-Egress")
         self.assertNotRegex(body, r"-replace 'ip=',''\)\.Trim\(\)")
-        self.assertIn("-join '').Trim()", body)
+        self.assertNotRegex(body, r"-join ''\)\.Trim\(\)")
+        # Trim 之前必须先判空:空值一律不调用 Trim
+        self.assertRegex(body, r"if \(\$ip\)\s*\{\s*\$ip\s*=\s*\$ip\.Trim\(\)")
 
     def test_ecosystem_reachability_uses_probe_code(self):
         body = function_body(self.text, "Invoke-CheckDetail")

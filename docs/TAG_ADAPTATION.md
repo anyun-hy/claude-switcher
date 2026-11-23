@@ -1,6 +1,6 @@
 # TAG 适配与上游同步
 
-本仓库是 [anyun-hy/claude-switcher](https://github.com/anyun-hy/claude-switcher)，基于原作者 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) 维护。本次集成的上游代码基线是 [`cf474a23bd4c7467163721399082568f0cb95cf7`](https://github.com/YOURSJEYO/claude-switcher/commit/cf474a23bd4c7467163721399082568f0cb95cf7)。保留原作者署名、Git 历史和上游随代码提供的 [AGPL-3.0-only 许可证](../LICENSE)。
+本仓库是 [anyun-hy/claude-switcher](https://github.com/anyun-hy/claude-switcher)，基于原作者 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) 维护。本次集成的上游代码基线是 [`4b5afcaf122a297063b2f436dd1aad5975f6427d`](https://github.com/YOURSJEYO/claude-switcher/commit/4b5afcaf122a297063b2f436dd1aad5975f6427d)（`v1.10.0`）。保留原作者署名、Git 历史和上游随代码提供的 [AGPL-3.0-only 许可证](../LICENSE)。
 
 ## TAG 适配范围
 

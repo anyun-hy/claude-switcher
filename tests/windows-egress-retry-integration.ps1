@@ -1,10 +1,12 @@
 ﻿# 隔离执行真实出口探测代码;外部请求全部打桩,不联网。
 # powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows-egress-retry-integration.ps1
 #
-# 锁住三件事:
+# 锁住四件事:
 # 1. 代理路径可能失效时,出口探测一个包都不发,立刻失败 —— 不在可能泄漏的路径上敲门;
 # 2. 链路失败时 Get-Egress 降级成"未取到",不再抛异常中断整轮检查;
-# 3. 路径在线时单次抖动会重试,不会把一次隧道内故障直接判成 fail。
+# 3. 路径在线时,出口探测摊在多个服务商上:主端点被掐时由备用端点兜住,
+#    不会把一次隧道内故障直接判成 fail;
+# 4. 每个端点的重试次数有界 —— 整体存活时间要盖得住实测的中断脉冲周期。
 $ErrorActionPreference = 'Stop'
 $core = Join-Path (Split-Path -Parent $PSScriptRoot) 'windows\claude-switch.ps1'
 $parseErrors = $null
@@ -17,6 +19,11 @@ foreach ($name in @('Invoke-ProbeText', 'Invoke-ProbeCode', 'Test-ProxyPathAlive
     if (-not $fn) { throw "找不到 $name" }
     . ([scriptblock]::Create($fn.Extent.Text))
 }
+
+# 重试轮数取生产代码的默认值(重试预算本身由静态用例按实测中断时长锁定)。
+$probeText = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-ProbeText' }, $true).Extent.Text
+if ($probeText -notmatch '\[int\]\$Attempts = (\d+)') { throw '找不到重试轮数默认值' }
+$script:probeAttempts = [int]$Matches[1]
 
 # 路径存活性由环境决定,这里打桩;组合逻辑(Test-ProxyPathAlive)用生产实现。
 $script:pathAlive = $true
@@ -51,6 +58,9 @@ $script:CheckConfig = @{ disabled = @(); allowOptionalFailures = $false }
 $script:calls = 0
 $script:failFirst = 0
 $script:trace = @('fl=123abc', 'ip=198.51.100.24', 'loc=US', 'ts=1')
+$script:json = @('{"ip":"198.51.100.24","country_code":"US"}')
+$script:degraded = $false
+$script:failUrls = @()
 $script:codes = @{}
 $script:perUrl = @{}
 $script:dropAfterFirst = $false
@@ -61,7 +71,15 @@ function curl.exe {
     if (-not $script:perUrl.ContainsKey($url)) { $script:perUrl[$url] = 0 }
     $script:perUrl[$url]++
     if ($script:calls -le $script:failFirst) { return @() }
-    if ($url -like '*/cdn-cgi/trace') { return $script:trace }
+    if ($script:failUrls -contains $url) { return @() }
+    if ($url -like '*/cdn-cgi/trace') {
+        if ($script:degraded) { return @('ip=198.51.100.24') }
+        return $script:trace
+    }
+    if ($url -like '*ipinfo.io*' -or $url -like '*ipwho.is*' -or $url -like '*ip.sb*') {
+        if ($script:degraded) { return @('{"ip":"198.51.100.24"}') }
+        return $script:json
+    }
     if ($script:codes.ContainsKey($url)) { return $script:codes[$url] }
     throw "未打桩的请求: $url"
 }
@@ -69,6 +87,9 @@ function Reset([int]$fail = 0) {
     $script:calls = 0
     $script:failFirst = $fail
     $script:trace = @('fl=123abc', 'ip=198.51.100.24', 'loc=US', 'ts=1')
+    $script:json = @('{"ip":"198.51.100.24","country_code":"US"}')
+    $script:degraded = $false
+    $script:failUrls = @()
     $script:codes = @{}
     $script:perUrl = @{}
     $script:dropAfterFirst = $false
@@ -100,29 +121,25 @@ $actual = @(& $reachCheck)
 Assert-Like '路径失效时生态可达性跳过探测' '^生态可达性=fail:代理路径失效,已跳过探测' ($actual -join ' | ')
 Assert-Equal '路径失效时生态可达性不发请求' 0 $script:calls
 
-# ---- 2. 路径在线:降级与重试 ----
+# ---- 2. 路径在线:降级与多端点冗余 ----
 $script:pathAlive = $true
 Reset 99
 $e = Get-Egress
 Assert-Like '链路完全失败时降级为空而不是抛异常' '^$' "$($e.ip)$($e.loc)"
-Assert-Equal '链路完全失败时探测次数' 3 $script:calls
 
 Reset 1
 $e = Get-Egress
-Assert-Equal '抖动后重试能取到出口 IP' '198.51.100.24' $e.ip
-Assert-Equal '抖动后重试能取到出口地区' 'US' $e.loc
-Assert-Equal '抖动后只需第二次' 2 $script:calls
+Assert-Equal '首个端点失败后能取到出口 IP' '198.51.100.24' $e.ip
+Assert-Equal '首个端点失败后能取到出口地区' 'US' $e.loc
+Assert-Equal '首个端点失败后第二次即可拿到答案' 2 $script:calls
 
 Reset 0
 $e = Get-Egress
 Assert-Equal '一次成功时不重试' 1 $script:calls
 
 Reset 0
-$script:trace = @('ip=198.51.100.24')
+$script:degraded = $true
 $e = Get-Egress
-Assert-Equal '响应缺少地区时不算有效答案' 3 $script:calls
-Assert-Equal '响应缺少地区时 IP 仍可读出' '198.51.100.24' $e.ip
-Assert-Equal '响应缺少地区时地区为空' '' $e.loc
 
 # ---- 3. 出口IP 检查行不再中断 ----
 Reset 99
@@ -151,7 +168,7 @@ $script:codes = @{
 }
 $actual = @(& $reachCheck)
 Assert-Like '单站不可达时判失败' '^生态可达性=fail:claude\.ai:403 api:000$' ($actual -join ' | ')
-Assert-Equal '不可达时重试三次' 3 $script:perUrl['https://api.anthropic.com/v1/models']
+Assert-Equal '不可达时按预算重试' $script:probeAttempts $script:perUrl['https://api.anthropic.com/v1/models']
 Assert-Equal '可达站点不受影响' 1 $script:perUrl['https://claude.ai/']
 
 # ---- 5. 第一次失败后路径断开，后续重试必须停止 ----

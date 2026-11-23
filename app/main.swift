@@ -92,6 +92,8 @@ struct IPChange: Decodable {
 
 enum Phase { case checking, ready, failed, switching, done, fixing }
 
+enum StatusBadgeKind: Equatable { case checking, safe, warning, skipped, failed, switching, fixing, done }
+
 enum NoticePage: String, Identifiable {
     case officialRelease, security
     var id: String { rawValue }
@@ -204,6 +206,7 @@ final class VM: ObservableObject {
     @Published private(set) var isQuittingClaudeDesktop = false
     @Published private(set) var desktopQuitMessage = ""
     @Published private(set) var isSwitchingClient = false
+    @Published private(set) var isQuittingWithClaude = false
     @Published var disabledChecks: Set<String> = []
     @Published var allowOptionalFailures = false
     @Published var loggingEnabled = true
@@ -274,7 +277,63 @@ final class VM: ObservableObject {
         self.desktopQuitRequest = desktopQuitRequest ?? Self.requestRegisteredDesktopQuit
     }
 
-    var canQuit: Bool { !toolRunning && !switchRequested && !updating && !isQuittingClaudeDesktop && phase != .fixing && phase != .switching }
+    var canQuit: Bool { !toolRunning && !switchRequested && !updating && !isQuittingClaudeDesktop && !isQuittingWithClaude && phase != .fixing && phase != .switching }
+
+    var statusBadge: (title: String, kind: StatusBadgeKind) {
+        if networkPending { return ("待验收", .failed) }
+        switch phase {
+        case .checking: return ("检查中", .checking)
+        case .ready:
+            if rows.contains(where: { $0.state == .warn }) { return ("有警告", .warning) }
+            if rows.contains(where: { $0.state == .skip }) { return ("通过（含跳过）", .skipped) }
+            return ("环境安全", .safe)
+        case .failed: return ("检查未过", .failed)
+        case .switching: return ("切换中", .switching)
+        case .fixing: return ("修复中", .fixing)
+        case .done: return ("完成", .done)
+        }
+    }
+
+    func quitWithClaude(
+        onTerminated: @escaping () -> Void = { NSApplication.shared.terminate(nil) },
+        onFailure: ((String) -> Void)? = nil
+    ) {
+        guard canQuit, !isBusy else { return }
+        guard coreAvailable() else {
+            markCoreMissing()
+            onFailure?("未安装核心脚本，请手动退出 Claude")
+            return
+        }
+        isBusy = true
+        isQuittingWithClaude = true
+        banner = "正在温和退出 Claude 桌面版与 Claude Code CLI…"
+        run(["quit-claude"], timeout: operationTimeout) { result in
+            self.isQuittingWithClaude = false
+            self.isBusy = false
+            let ok = result.succeeded && result.output.split(separator: "\n").contains { $0.hasPrefix("OK:") }
+            if ok {
+                onTerminated()
+                return
+            }
+            let message: String
+            if result.output.contains("用法:") {
+                message = "当前核心脚本版本不支持联动关闭，请先更新核心脚本或手动退出 Claude"
+            } else {
+                let failLine = result.output.split(separator: "\n").first { $0.hasPrefix("FAIL:") }.map(String.init)
+                message = failLine ?? (result.output.isEmpty ? "未能退出 Claude，已取消退出切换器" : result.output)
+            }
+            self.banner = message
+            if let onFailure {
+                onFailure(message)
+            } else {
+                let alert = NSAlert()
+                alert.messageText = "未能关闭 Claude"
+                alert.informativeText = message
+                alert.alertStyle = .warning
+                alert.runModal()
+            }
+        }
+    }
 
     func start() {
         guard !started else { return }
@@ -2943,6 +3002,7 @@ struct MenuBarContent: View {
         Text("最近检查：\(vm.lastCheckSummary)")
         if vm.phase == .fixing { Text("正在修复…") }
         if vm.phase == .switching { Text("正在切换账号…") }
+        if vm.isQuittingWithClaude { Text("正在关闭 Claude…") }
         Divider()
         Button("打开主窗口", action: showWindow)
             .keyboardShortcut("o")
@@ -2975,10 +3035,26 @@ struct MenuBarContent: View {
         Button("导出诊断日志") { vm.exportDiagnostics() }
             .disabled(vm.settingsBusy || vm.hasPresentedSheet)
         Divider()
+        Button("退出并关闭 Claude…") { confirmQuitWithClaude(vm: vm) }
+            .disabled(!vm.canQuit || vm.isBusy)
         Button("退出 Claude 切换器") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")
             .disabled(!vm.canQuit)
             .onAppear { vm.refreshAccountStatus() }
+    }
+}
+
+private func confirmQuitWithClaude(vm: VM) {
+    guard vm.canQuit, !vm.isBusy else { return }
+    NSApplication.shared.activate(ignoringOtherApps: true)
+    let alert = NSAlert()
+    alert.messageText = "退出并关闭 Claude？"
+    alert.informativeText = "将依次温和退出 Claude 桌面版、当前用户的 Claude Code CLI 以及 Claude 切换器。未保存的对话或终端任务可能中断；后台保镖与时区看门狗服务不受影响。"
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: "退出并关闭")
+    alert.addButton(withTitle: "取消")
+    if alert.runModal() == .alertFirstButtonReturn {
+        vm.quitWithClaude()
     }
 }
 
@@ -3003,6 +3079,8 @@ struct SwitcherMenu: Scene {
         .menuBarExtraStyle(.menu)
         .commands {
             CommandGroup(replacing: .appTermination) {
+                Button("退出并关闭 Claude…") { confirmQuitWithClaude(vm: vm) }
+                    .disabled(!vm.canQuit || vm.isBusy)
                 Button("退出 Claude 切换器") { NSApplication.shared.terminate(nil) }
                     .keyboardShortcut("q")
                     .disabled(!vm.canQuit)

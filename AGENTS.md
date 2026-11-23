@@ -39,7 +39,7 @@
 8. 时区与 IPv6（已是目标值则跳过对应命令）：`systemsetup -settimezone <TZ_TARGET>`、`networksetup -setv6off Wi-Fi`（需管理员）
 9. 收尾自检：运行 `~/.local/bin/claude-switch.sh checkdetail` 确认各项状态
 
-日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|bettbox|tag|shadowrocket|sing-box|clashx|surge|auto）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `cli [args...]`（以当前桌面账号启动 Claude Code，参数原样透传；启动前审计并拒绝认证环境变量覆盖，B–D 首次使用各自登录一次，各账号历史独立）/ `cli-current`（只读输出当前槽位与映射的 CLAUDE_CONFIG_DIR 目录）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto|--gui]` / `update-check`（macOS 更新：更新源为 `anyun-hy/claude-switcher` 的 `main`。`update-check` 与 `update --check` 只下载并校验，比较核心、`stun-probe.py`、界面与守护脚本，不替换已安装文件、不修改运行配置、不创建更新备份；真实更新通过 `~/.claude-switcher/update.lock` 互斥并注册 `trap` 异常回滚，先更新用户态核心与 `stun-probe.py`、写入 `config.env` 并跑 `checkdetail` 自检，自检通过后才替换 `/Applications/Claude Switcher.app` 及按需提权同步 root 守护（root 执行前二次校验临时文件 SHA256）；界面内点击「立即更新」调用 `update --gui`（超时 600s）并在完成后自动重启；`--auto` 由用户态 LaunchAgent 每 12 小时调用、静默更新核心与 `stun-probe.py` 并落 `~/.claude-switcher/update.log`。归档内 `SHA256SUMS` 防传输损坏与缺文件，信任根为 GitHub HTTPS 与仓库写权限）
+日常维护命令：`check`（静默总检）/ `checkdetail`（14 项逐项）/ `fix`（一键修复）/ `switch A|B|C|D`（切换账号）/ `set-region`（换国家节点后重锁地区目标）/ `set-client <mode>`（安装后更换代理客户端：clash-verge|flclash|bettbox|tag|shadowrocket|sing-box|clashx|surge|auto）/ `fingerprint`（设备指纹体检：字体地区特征/GPU/虚拟机；Canvas/WebGL 用 Web 检测页）/ `cli-info`（Claude Code CLI 只读体检：版本/安装方式/多份安装冲突，不执行卸载升级）/ `cli [args...]`（以当前桌面账号启动 Claude Code，参数原样透传；启动前审计并拒绝认证环境变量覆盖，B–D 首次使用各自登录一次，各账号历史独立）/ `cli-current`（只读输出当前槽位与映射的 CLAUDE_CONFIG_DIR 目录）/ `quit-claude`（温和退出 Claude 桌面版与安装用户的 Claude Code CLI；不强杀，超时返回 FAIL）/ `open-safe <url>`（一次性隔离浏览器打开 http/https 链接；代理未就绪会拒绝，窗口关闭后销毁临时 profile）/ `snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`（macOS 加密快照导出/导入，AES-256 DMG，密码经 stdin，目标槽位非空会拒绝）/ `update [--check|--auto|--gui]` / `update-check`（macOS 更新：更新源为 `anyun-hy/claude-switcher` 的 `main`。`update-check` 与 `update --check` 只下载并校验，比较核心、`stun-probe.py`、界面与守护脚本，不替换已安装文件、不修改运行配置、不创建更新备份；真实更新通过 `~/.claude-switcher/update.lock` 互斥并注册 `trap` 异常回滚，先更新用户态核心与 `stun-probe.py`、写入 `config.env` 并跑 `checkdetail` 自检，自检通过后才替换 `/Applications/Claude Switcher.app` 及按需提权同步 root 守护（root 执行前二次校验临时文件 SHA256）；界面内点击「立即更新」调用 `update --gui`（超时 600s）并在完成后自动重启；`--auto` 由用户态 LaunchAgent 每 12 小时调用、静默更新核心与 `stun-probe.py` 并落 `~/.claude-switcher/update.log`。归档内 `SHA256SUMS` 防传输损坏与缺文件，信任根为 GitHub HTTPS 与仓库写权限）
 
 检查设置：`get-check-config` / `set-check-config <json>` 读写 `~/.claude-switcher/checks.json`，App 齿轮与菜单栏也提供设置入口。只允许关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`生态可达性`；禁用项必须真正跳过探测并显示灰色 `skip`，不能当作通过。`allowOptionalFailures` 只把这 6 项的失败降为警告。出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全、root 权限边界与更新 SHA256 等硬性安全项不可关闭或降级。
 
@@ -56,7 +56,7 @@
 ## 验收标准（全部满足才算装完）
 
 - 终端执行 `~/.local/bin/claude-switch.sh checkdetail` 输出完整 14 行；硬性安全项全部 `=ok`，非关键项只能是 `=ok`、既有警告，或用户显式配置的 `=skip`/降级警告
-- 打开“应用程序”中的 App，无红色硬性安全项，能正常启动 Claude；灰色 `skip` 不得当成绿色通过
+- 打开“应用程序”中的 App（`/Applications/Claude Switcher.app`），无红色硬性安全项，能正常启动 Claude；灰色 `skip` 不得当成绿色通过
 - `launchctl print system/local.claude-bodyguard`、`system/local.tz-watchdog` 与 `gui/$(id -u)/local.claude-update` 均能查到（服务已注册）
 - `/Library/Application Support/claude-switcher/` 下两个守护脚本属 root:wheel、权限 755，当前用户不可写
 - 切换一次账号 B 再切回 A，A 的登录态完好
@@ -117,7 +117,7 @@ Windows 用户请使用 `windows/` 下的 PowerShell 版本。关键差异与注
 - **WPF 视觉结构**：主窗口按导航、环境/代理状态、A–D 四账号卡、检查与工具区域组织信息；本次仅做小范围视觉重构，不改变安全检查、账号切换和工具行为。新版视觉结构尚未经过 Windows 真机渲染与交互验收，不得将静态检查描述为真机渲染通过。
 - **代理客户端**：支持 `clash-verge` / `flclash` / `sing-box` / `clashx` / `surge` / `wireguard` / `other` / `auto`。`set-client` 同时更新核心脚本与 `proxy-mode.txt`，保镖每轮重新读取该文件；不要套用 macOS 的 root 守护同步方式。
 - **工具与快照**：`fingerprint`、`cli-info`、`open-safe`、`diagnose-proxy` 均已提供 Windows 实现。`snapshot-export` / `snapshot-import` 使用流式 `.csnap`（PBKDF2-HMAC-SHA256 200,000 轮、AES-256-CBC、HMAC-SHA256），不与 macOS DMG 兼容；密码仅经 stdin，先认证再解压，目标槽位非空或包路径越界必须拒绝。隔离回归另有 `tests\windows-snapshot-integration.ps1`。
-- **检查设置与日志**：与 macOS 使用相同的 6 项非关键检查白名单和 `allowOptionalFailures` 边界；配置在 `%USERPROFILE%\.claude-switcher\checks.json`，脱敏日志在 `%USERPROFILE%\.claude-switcher\logs\client.log`，512 KiB 轮转。WPF 设置窗口和 `export-diagnostics` 可导出脱敏诊断 zip，不得包含账号、IP、凭据、Clash 配置或原始检查详情。独立代理诊断不得创建账号状态或写客户端日志。
+- **检查设置与日志**：非关键检查白名单比 macOS 多 4 项 IP 信誉检查（`IP纯净度`/`IP代理标记`/`IP机房属性`/`IP黑名单`），共 10 项，`allowOptionalFailures` 同样只覆盖这 10 项；macOS 与 Linux 版尚未同步这 4 项，各自仍为 14 项。信誉检查**不内置任何一家数据源**——用户自己在 `checks.json` 的 `ipReputation` 里指定 HTTPS 接口、阈值与缓存天数，没配就显示「未配置」而不假装通过；探测失败与缺字段都判 warn（缺字段 ≠ 没有风险），只有确认脏（风险分超阈值 / 公开代理 / VPN / Tor / 黑名单命中）才判 fail，机房属性只 warn。密钥只走请求头，不进 URL、日志与缓存，`get-check-config` 不回显密钥。配置在 `%USERPROFILE%\.claude-switcher\checks.json`，脱敏日志在 `%USERPROFILE%\.claude-switcher\logs\client.log`，512 KiB 轮转。WPF 设置窗口和 `export-diagnostics` 可导出脱敏诊断 zip，不得包含账号、IP、凭据、Clash 配置或原始检查详情。独立代理诊断不得创建账号状态或写客户端日志。
 - **已知限制**：新 WPF、FlClash、隔离浏览器、代理诊断、加密快照、安装与更新流程尚未做 Windows 真机验收，静态/XAML 测试不能冒充真机测试；Clash Verge 的 TUN 开关被更新重置后在 Windows 端需手动重开。
 - **自动更新**：启动时静默检查 GitHub 最新 Release，有新版显示提示条；一键更新会下载 zip、校验 SHA256、备份并替换用户目录脚本、重启保镖任务和界面，失败自动回滚，不需要管理员。发布 zip 根必须带 `VERSION`（`release.yml` 已写入），安装后落到 `%USERPROFILE%\.claude-switcher\version.txt`。
 - **Clash 规则**：一键修复先识别 Clash 模式（Mihomo API `/configs`，失败回退 `clash-verge.yaml`/`config.yaml`/`verge.yaml` 的 `mode:`）。全局/直连模式不写规则，仅清理旧 Merge；规则模式只写 `profiles\Script.js` 托管块，重启后用内核 `/rules` 验证前 16 条，失败回滚。安装器不再写 `Merge.yaml`，旧 `prepend-rules`/`---` 会被清理并备份。控制接口地址从 `clash-verge.yaml` → `config.yaml` → `verge.yaml` 依次查找（不支持 unix socket）；「规则置顶」告警括号里会带原因（未配置/拒绝连接/鉴权失败/超时），只读排查用 `rules-status`。
@@ -155,7 +155,7 @@ Linux 用户使用 `linux/` 下的 bash 版本。**开始之前必须先理解�
 **除非维护者在当次对话中明确说明，否则一律不得改动维护者本机的任何安装态、真实配置与系统设置——无论是什么性质的修复或更改。** 下面是常见例子而非穷尽列举；判断标准是"维护者没在当次对话明确要求就不动"，而不是"清单里没写就能动"：
 
 - 不得覆盖 `~/.local/bin/claude-switch.sh`、`~/.local/bin/local.claude-*.plist`
-- 不得重新编译或替换已安装 App（`/Applications/Claude Switcher.app` 或旧版桌面位置）
+- 不得重新编译或替换已安装 App（`/Applications/Claude Switcher.app`，以及历史 `/Applications/Claude切换器.app` / `~/Desktop/Claude切换器.app`）
 - 不得改动 `/Library/Application Support/claude-switcher/`、`/Library/LaunchDaemons/local.claude-*`、`~/Library/LaunchAgents/local.claude-*`
 - 不得触发本机 `update`、不得执行安装器/卸载器
 - 不得改动 `~/.claude-switcher/` 下的真实账号数据与任何配置文件

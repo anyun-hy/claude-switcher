@@ -383,12 +383,17 @@ else
     rm -rf "$APP_STAGE"
     read -n 1 -s -r -p "按任意键退出..."; exit 1
 fi
-if ! install_app_bundle "$APP" "$APP_TARGET"; then
-    rm -rf "$APP_STAGE"
-    echo "✗ App 安装失败，未完成安装"; exit 1
+if [ -n "$DRYRUN" ]; then
+    echo "[演练模式] App 已编译验证，跳过安装到应用程序"
+else
+    if ! install_app_bundle "$APP" "$APP_TARGET"; then
+        rm -rf "$APP_STAGE"
+        echo "✗ App 安装失败，未完成安装"; exit 1
+    fi
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP_TARGET" >/dev/null 2>&1 || true
+    echo "✓ App 已安装到应用程序文件夹"
 fi
 rm -rf "$APP_STAGE"
-echo "✓ App 已安装到应用程序文件夹"
 [ -e "$H/Desktop/Claude切换器.app" ] && echo "ℹ️ 桌面旧版 App 仍保留，可在确认后自行移除。"
 
 # ---- 5. 生成全局扩展脚本(仅 Clash Verge;保留已有 main 与无关配置) ----
@@ -464,7 +469,7 @@ echo "=================================="
 echo ""
 echo "=================================="
 echo "  ✅ 安装完成!"
-echo "  使用: 打开应用程序文件夹中的「Claude Switcher」"
+echo "  使用: 从「应用程序」、启动台或 Spotlight 打开「Claude Switcher」"
 echo "  首次使用: 打开后选账号A(自动收编当前登录)"
 echo "  换了其他国家节点后: 运行 claude-switch.sh set-region 一键重新适配"
 echo "  自动更新已启用(每12小时检查一次),也可手动: claude-switch.sh update"

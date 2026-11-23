@@ -63,9 +63,19 @@ function Get-AppVersion {
     return 'unknown'
 }
 
+# 数字判定。不能只认 [int]/[double]:
+#   PowerShell 5.1 的 ConvertFrom-Json 把整数解成 Int32,
+#   PowerShell 7 解成 Int64 —— 只认一种类型,就会在另一个 shell 上
+#   把完全合法的配置判成「不是数字」,连 checks.json 都读不出来。
+# 布尔与字符串不算数字:JSON 里写 true/"25" 应当被拒绝,而不是被悄悄转换。
+function Test-IpReputationNumber($Value) {
+    if ($null -eq $Value) { return $false }
+    return (@([byte],[int16],[uint16],[int],[uint32],[long],[uint64],[single],[double],[decimal]) -contains $Value.GetType())
+}
+
 function ConvertTo-CheckConfig($Value) {
-    $optional = @('IP一致','DNS','WebRTC','客户端语言','ASN属性','生态可达性')
-    $keys = @('disabled','allowOptionalFailures','logging')
+    $optional = @('IP一致','DNS','WebRTC','客户端语言','ASN属性','生态可达性','IP纯净度','IP代理标记','IP机房属性','IP黑名单')
+    $keys = @('disabled','allowOptionalFailures','logging','ipReputation')
     if ($null -eq $Value -or $Value -isnot [pscustomobject]) { throw '检查配置必须是 JSON 对象' }
     foreach ($key in @($Value.PSObject.Properties.Name)) {
         if ($keys -notcontains $key) { throw '检查配置包含未知字段' }
@@ -90,12 +100,56 @@ function ConvertTo-CheckConfig($Value) {
     }
     if ($Value.PSObject.Properties.Name -contains 'allowOptionalFailures') { $allow = [bool]$Value.allowOptionalFailures }
     if ($Value.PSObject.Properties.Name -contains 'logging') { $logging = [bool]$Value.logging }
-    return @{ disabled = @($optional | Where-Object { $disabled -contains $_ }); allowOptionalFailures = $allow; logging = $logging }
+    # 信誉接口配置。字段全部可选:没配就是没配,检查项会显示「未配置」,
+    # 不会替用户猜一个默认数据源。各家的分数口径不一样,阈值留给用户按自己的
+    # 数据源文档定,所以这里只做类型与范围的校验。
+    $ipReputation = $null
+    if ($Value.PSObject.Properties.Name -contains 'ipReputation') {
+        $raw = $Value.ipReputation
+        if ($null -eq $raw -or $raw -isnot [pscustomobject]) { throw 'ipReputation 必须是 JSON 对象' }
+        $ipKeys = @('url','key','threshold','cacheDays')
+        foreach ($k in @($raw.PSObject.Properties.Name)) {
+            if ($ipKeys -notcontains $k) { throw 'ipReputation 包含未知字段' }
+        }
+        $ipUrl = ''
+        if ($raw.PSObject.Properties.Name -contains 'url') {
+            if ($raw.url -isnot [string]) { throw 'ipReputation.url 必须是字符串' }
+            $ipUrl = $raw.url.Trim()
+        }
+        # 信誉接口必须是 HTTPS:明文响应可以被中间人改写 ——
+        # 把「分数改成 0、代理标记改成 false」是完全可行的,
+        # 那样的返回值会把一个脏出口显示成干净。配置时就拒绝,不要等到运行时静默忽略。
+        if ($ipUrl -and ($ipUrl -notmatch '^https://' -or $ipUrl -match '[\s\x00-\x1f\x7f]')) { throw 'ipReputation.url 必须是 https 地址' }
+        $ipKey = ''
+        $hasKey = $false
+        if ($raw.PSObject.Properties.Name -contains 'key') {
+            if ($raw.key -isnot [string]) { throw 'ipReputation.key 必须是字符串' }
+            if ($raw.key -match '[\r\n\x00-\x1f\x7f]') { throw 'ipReputation.key 包含非法控制字符' }
+            $ipKey = $raw.key
+            $hasKey = $true
+        }
+        $ipThreshold = 0
+        if ($raw.PSObject.Properties.Name -contains 'threshold') {
+            $t = $raw.threshold
+            if (-not (Test-IpReputationNumber $t)) { throw 'ipReputation.threshold 必须是数字' }
+            $ipThreshold = [double]$t
+            if ($ipThreshold -lt 0 -or $ipThreshold -gt 100) { throw 'ipReputation.threshold 必须在 0-100 之间' }
+        }
+        $ipCacheDays = 7
+        if ($raw.PSObject.Properties.Name -contains 'cacheDays') {
+            $d = $raw.cacheDays
+            if (-not (Test-IpReputationNumber $d)) { throw 'ipReputation.cacheDays 必须是数字' }
+            $ipCacheDays = [int]$d
+            if ($ipCacheDays -lt 1 -or $ipCacheDays -gt 90) { throw 'ipReputation.cacheDays 必须在 1-90 之间' }
+        }
+        $ipReputation = @{ url = $ipUrl; key = $ipKey; hasKey = $hasKey; threshold = $ipThreshold; cacheDays = $ipCacheDays }
+    }
+    return @{ disabled = @($optional | Where-Object { $disabled -contains $_ }); allowOptionalFailures = $allow; logging = $logging; ipReputation = $ipReputation }
 }
 
 function Get-CheckConfig {
     if (-not (Test-Path -LiteralPath $CHECK_CONFIG)) {
-        return @{ disabled = @(); allowOptionalFailures = $false; logging = $true }
+        return @{ disabled = @(); allowOptionalFailures = $false; logging = $true; ipReputation = $null }
     }
     $raw = [System.IO.File]::ReadAllText($CHECK_CONFIG, [System.Text.Encoding]::UTF8)
     if ($raw.Length -gt 16384) { throw '检查配置过大' }
@@ -105,7 +159,29 @@ function Get-CheckConfig {
 function Set-CheckConfigFromJson([string]$Json) {
     if ([string]::IsNullOrWhiteSpace($Json) -or $Json.Length -gt 16384) { throw '检查配置为空或过大' }
     $config = ConvertTo-CheckConfig ($Json | ConvertFrom-Json -ErrorAction Stop)
-    $jsonOut = [pscustomobject]@{ disabled = @($config.disabled); allowOptionalFailures = [bool]$config.allowOptionalFailures; logging = [bool]$config.logging } | ConvertTo-Json -Depth 3
+    # ipReputation 为 null 时不写这个键 —— 保持配置文件的形状稳定,
+    # 也避免把「没配」写成空对象再被下一轮读成「配了但没填」。
+    $payload = [ordered]@{ disabled = @($config.disabled); allowOptionalFailures = [bool]$config.allowOptionalFailures; logging = [bool]$config.logging }
+    if ($null -ne $config.ipReputation) {
+        $effectiveKey = [string]$config.ipReputation.key
+        # 界面通过 get-check-config 读取时不会拿到 key，保存时省略 key 字段。
+        # URL 未变且未显式传入 key 时保留既有密钥；显式传 "" 才清空，换 URL 不带走旧密钥。
+        if (-not $config.ipReputation.hasKey) {
+            try {
+                $existing = Get-CheckConfig
+                if ($existing -and $null -ne $existing.ipReputation -and ([string]$existing.ipReputation.url -eq [string]$config.ipReputation.url)) {
+                    $effectiveKey = [string]$existing.ipReputation.key
+                }
+            } catch {}
+        }
+        $payload['ipReputation'] = [ordered]@{
+            url = [string]$config.ipReputation.url
+            key = $effectiveKey
+            threshold = [double]$config.ipReputation.threshold
+            cacheDays = [int]$config.ipReputation.cacheDays
+        }
+    }
+    $jsonOut = [pscustomobject]$payload | ConvertTo-Json -Depth 4
     $tmp = Join-Path $BASE ('.checks-' + [guid]::NewGuid().Guid + '.tmp')
     try {
         [System.IO.File]::WriteAllText($tmp, $jsonOut, (New-Object System.Text.UTF8Encoding($false)))
@@ -127,12 +203,19 @@ function Format-OptionalResult([string]$Name, [string]$State, [string]$Detail = 
     return "$Name=$State$(if ($Detail) { ":$Detail" })"
 }
 
+function Get-CheckItemNames {
+    # 全部检查项的名字,顺序与界面一致。新增检查项只改这一处,
+    # 日志与诊断包不再各抄一份 —— 抄两份的下场就是加项时漏改一处,
+    # 于是日志里少了那一项、诊断包里也少了那一项,却没人发现。
+    return @('代理内核','TUN网卡','出口IP','IP一致','时区','地区','IPv6','DNS','WebRTC','保镖','规则置顶','客户端语言','ASN属性','生态可达性','IP纯净度','IP代理标记','IP机房属性','IP黑名单')
+}
+
 function Write-ClientLog([string]$Command, [int]$ExitCode, [long]$DurationMs, [string]$Summary = '') {
     try {
         $config = Get-CheckConfig
         if (-not $config.logging) { return }
         if ($Command -notmatch '^[a-z][a-z0-9-]{0,31}$' -or $ExitCode -lt 0 -or $ExitCode -gt 255 -or $DurationMs -lt 0) { return }
-        $all = @('代理内核','TUN网卡','出口IP','IP一致','时区','地区','IPv6','DNS','WebRTC','保镖','规则置顶','客户端语言','ASN属性','生态可达性')
+        $all = Get-CheckItemNames
         $states = @{}
         foreach ($token in ($Summary -split '\s+')) {
             if (-not $token) { continue }
@@ -167,7 +250,7 @@ function Export-Diagnostics([string]$Destination) {
         [System.IO.File]::WriteAllText((Join-Path $stage 'environment.json'), ($envInfo | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
         $status = @{}
         if (Test-Path -LiteralPath "$BASE\last-check.txt") {
-            $all = @('代理内核','TUN网卡','出口IP','IP一致','时区','地区','IPv6','DNS','WebRTC','保镖','规则置顶','客户端语言','ASN属性','生态可达性')
+            $all = Get-CheckItemNames
             foreach ($line in [System.IO.File]::ReadAllLines("$BASE\last-check.txt")) {
                 if ($line -match '^([^=]+)=(ok|warn|fail|skip)(?::.*)?$' -and $all -contains $Matches[1] -and -not $status.ContainsKey($Matches[1])) {
                     $status[$Matches[1]] = $Matches[2]
@@ -340,19 +423,36 @@ function Test-ProxyPathAlive {
     return ((Test-ProxyAlive) -and (Test-TunUp))
 }
 
-# 有界重试仅处理临时传输失败；每次发包前重查路径，失效则立即停止。
+# 有界网络探测重试：仅处理临时传输失败，每次发包前重查代理路径，失效则立即停止。
 # 仍保留进程巡检与实际发包之间的时间窗口，不将重试当作防火墙保证。
+# 重试轮数按实测的链路中断时长定（单次失败约 5.7s，实测中断约 34s），6 轮约 40s 覆盖该窗口；
+# 出口探测另有 Get-Egress 的多端点冗余。健康路径第一轮即返回，不增加额外耗时。
 function Invoke-ProbeText {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
-        [int]$Attempts = 3,
+        [int]$Attempts = 6,
         [int]$TimeoutSec = 8,
-        [scriptblock]$Valid = { param($body) return [bool]$body }
+        [scriptblock]$Valid = { param($body) return [bool]$body },
+        # 可选的额外请求头,形如 @('X-API-Key: abc')。
+        # 带密钥的请求走这里,而不是把密钥拼进 URL —— URL 会进日志与进程命令行。
+        [string[]]$Headers = @()
     )
     $body = ''
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         if (-not (Test-ProxyPathAlive)) { return '' }
-        $body = (& curl.exe -s --max-time $TimeoutSec $Url 2>$null) -join "`n"
+        # 固定 UA:部分出口查询服务(如 api.ip.sb)会拒绝 curl 的默认 UA。
+        # 敏感请求头(如 X-API-Key)经 curl -K - 从 stdin 传递,不进命令行参数与进程列表。
+        $curlArgs = @('-s', '-A', 'claude-switcher/1.0', '--max-time', [string]$TimeoutSec)
+        $curlCfg = @()
+        if ($Headers.Count -gt 0) {
+            $curlArgs += @('-K', '-')
+            foreach ($h in $Headers) {
+                $escaped = ([string]$h).Replace('\', '\\').Replace('"', '\"')
+                $curlCfg += ('header = "' + $escaped + '"')
+            }
+        }
+        $curlArgs += $Url
+        $body = ($curlCfg | & curl.exe @curlArgs 2>$null) -join "`n"
         if ((& $Valid $body)) { return $body }
         if ($attempt -lt $Attempts) { Start-Sleep -Milliseconds (400 * $attempt) }
     }
@@ -363,7 +463,7 @@ function Invoke-ProbeText {
 function Invoke-ProbeCode {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
-        [int]$Attempts = 3,
+        [int]$Attempts = 6,
         [int]$TimeoutSec = 8
     )
     $code = '000'
@@ -384,16 +484,43 @@ function Get-Egress {
     }
     # 响应为空时不能对空数组调用 Trim —— 链路失败必须降级成"未取到",
     # 而不是抛异常中断整轮检查(ip/loc 都取到才算有效答案)。
-    $trace = Invoke-ProbeText -Url 'https://www.cloudflare.com/cdn-cgi/trace' -Valid {
-            param($body)
-            return ($body -match '(?m)^ip=') -and ($body -match '(?m)^loc=')
+    # 多个出口查询服务互为备份:链路中断常常只掐特定目标而不是全面断网,
+    # 把探测摊到几个服务商上,任一拿到答案即可。它们查的都是同一个出口,IP 不变。
+    # 每个端点试两次:一是容忍单个端点的瞬时抖动,二是把整体存活时间拉回
+    # 约 45 秒 —— 实测中断是周期性脉冲(单次约 12~20 秒,整个周期约 40~60 秒),
+    # 每个端点只试一次的话 4 次连续请求只够 22 秒,跨不完一个脉冲就会误报。
+    foreach ($probe in @(
+            @{ Url = 'https://www.cloudflare.com/cdn-cgi/trace'; Kind = 'trace' },
+            @{ Url = 'https://ipinfo.io/json'; Kind = 'json' },
+            @{ Url = 'https://ipwho.is/'; Kind = 'json' },
+            @{ Url = 'https://api.ip.sb/geoip'; Kind = 'json' }
+        )) {
+        if ($probe.Kind -eq 'trace') {
+            $body = Invoke-ProbeText -Url $probe.Url -Attempts 2 -Valid {
+                    param($b)
+                    return ($b -match '(?m)^ip=') -and ($b -match '(?m)^loc=')
+                }
+            $ip  = (((($body -split "`n") | Where-Object { $_ -like 'ip=*' })  -replace 'ip=','') -join '')
+            $loc = (((($body -split "`n") | Where-Object { $_ -like 'loc=*' }) -replace 'loc=','') -join '')
+        } else {
+            $body = Invoke-ProbeText -Url $probe.Url -Attempts 2 -Valid {
+                    param($b)
+                    return ($b -match '"ip"\s*:')
+                }
+            $ip = ''; $loc = ''
+            try {
+                $j = $body | ConvertFrom-Json -ErrorAction Stop
+                $ip = [string]$j.ip
+                if ($j.PSObject.Properties.Name -contains 'country_code') { $loc = [string]$j.country_code }
+                elseif ($j.PSObject.Properties.Name -contains 'country') { $loc = [string]$j.country }
+            } catch { $ip = ''; $loc = '' }
         }
-    if (-not (Test-ProxyPathAlive)) {
-        return @{ ip = ''; loc = ''; skipped = $true }
+        # 空值一律不调用 Trim:空数组上调方法会抛异常。
+        if ($ip)  { $ip  = $ip.Trim() }
+        if ($loc) { $loc = $loc.Trim() }
+        if ($ip -and $loc) { return @{ ip = $ip; loc = $loc; skipped = $false } }
     }
-    $ip  = (((($trace -split "`n") | Where-Object { $_ -like 'ip=*' })  -replace 'ip=','') -join '').Trim()
-    $loc = (((($trace -split "`n") | Where-Object { $_ -like 'loc=*' }) -replace 'loc=','') -join '').Trim()
-    return @{ ip = $ip; loc = $loc; skipped = $false }
+    return @{ ip = ''; loc = ''; skipped = $false }
 }
 
 # ============ 地区映射(安装器与 set-region 共用同一套目标) ============
@@ -1226,6 +1353,203 @@ function Add-IpHistory([string]$Ip) {
     return $unique.Count
 }
 
+# ============ IP 信誉(可选检查项) ============
+#
+# 为什么需要这一项:出口 IP 对了不等于 IP 信誉好。「出口IP」只比对这个 IP 与目标国家
+#   是否一致;同一个国家里的地址,风险天差地别 —— 住宅家宽、机房地址、VPN 出口、
+#   住宅代理池在风控眼里是四种东西。只要把脏地址设成期望值,现有检查照样全绿。
+#   真实事故:出口在某些代理池地址上,账号在几天内被烧,而当时体检表一片绿。
+#
+# 为什么做成「可插拔 + 可关闭」:
+#   信誉数据只有第三方有,没有哪个免费、免密钥、HTTPS、又能稳定分辨「住宅代理池」
+#   的接口是可靠的。实测四个免密接口:有的只返回地理信息不返回风险标记
+#   (缺字段 ≠ 「没有风险」,不能当干净用),有的对同一地址给出不同结论。
+#   所以这里不内置任何一家的判定,而是:
+#     · 用户在 checks.json 里配一个信誉接口(URL + 可选密钥),用谁由用户决定;
+#     · 没配 -> 这四项显示「未配置」,不猜、不假装通过;
+#     · 探测失败 -> 提示失败,不判脏 —— 探测端点改版不该把所有人的检查判红。
+#   阈值由用户给,不在代码里写死任何一家的分数口径。
+#
+# 缓存:按出口 IP 记账,默认 7 天。体检与启动闸共用同一份缓存,
+#   不会把同一个地址反复问出去;判定永远用缓存里的字段现算,
+#   所以调阈值立即生效,不必清缓存。
+
+function Get-IpReputationConfig {
+    # 信誉接口的配置来自 checks.json。未配置就是没配置 —— 返回空串而不是默认值,
+    # 让「未配置」和「配置了但不可用」在界面上是两件事。
+    if ($null -eq $script:CheckConfig) { return $null }
+    $cfg = $script:CheckConfig.ipReputation
+    if ($null -eq $cfg) { return $null }
+    $url = [string]$cfg.url
+    if ([string]::IsNullOrWhiteSpace($url)) { return $null }
+    if ($url -notmatch '^https://') { return $null }
+    return $cfg
+}
+
+function Get-IpReputationCache {
+    return (Join-Path $BASE 'ip-reputation.json')
+}
+
+function Read-IpReputationCache {
+    $path = Get-IpReputationCache
+    if (-not (Test-Path -LiteralPath $path)) { return @{} }
+    try {
+        $raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+        if ($raw.Length -gt 262144) { return @{} }
+        # ConvertFrom-Json 的产物是 PSCustomObject,没有 ContainsKey ——
+        # 统一转成 hashtable 再用,否则后面按字段取值会静默拿到空。
+        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+        $h = @{}
+        foreach ($p in $obj.PSObject.Properties) {
+            # 记录本身也要归一。缓存里存的是「键 -> 记录对象」,
+            # 记录从 JSON 读回来是 PSCustomObject,而判定代码按 hashtable 的
+            # ContainsKey 取字段 —— 不归一的话,第二次检查(命中缓存、没发新请求)
+            # 会在 ContainsKey 上直接炸掉。只归一外层不够。
+            $rec = $p.Value
+            if ($null -eq $rec) { $h[$p.Name] = $null; continue }
+            $r = @{}
+            foreach ($rp in $rec.PSObject.Properties) { $r[$rp.Name] = $rp.Value }
+            $h[$p.Name] = $r
+        }
+        return $h
+    } catch { return @{} }
+}
+
+function Write-IpReputationCache($Cache) {
+    $path = Get-IpReputationCache
+    try {
+        $json = $Cache | ConvertTo-Json -Depth 4 -Compress
+        if ($json.Length -gt 262144) { return }
+        $tmp = "$path.tmp"
+        [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $path -Force -ErrorAction Stop
+    } catch {}
+}
+
+# 把各家接口的返回归一成同一组语义:
+#   score      0-100 的风险分(各家口径不同,阈值由用户给)
+#   level      风险等级原文
+#   proxy      公开代理/住宅代理池
+#   vpn        VPN / 匿名出口
+#   tor        Tor 出口节点
+#   hosting    机房/数据中心地址
+#   blacklist  DNSBL 命中数
+# 归一化只取「明确为真」的标记:字段缺失一律当「未知」而不是「无风险」。
+function ConvertFrom-IpReputationPayload($Payload) {
+    $out = @{}
+    if ($null -eq $Payload) { return $out }
+    $props = $Payload.PSObject.Properties
+    function Field([string[]]$Names, [string]$Kind = 'bool') {
+        # 两轮取名:先精确同名,再通配。顺序不能反 ——
+        # 'proxy' 也会匹配到 'residential_proxy'、'is_proxy',
+        # 先做通配会把「只有住宅代理标记」的返回误读成普通代理命中。
+        foreach ($exact in @($true, $false)) {
+            foreach ($n in $Names) {
+                foreach ($p in $props) {
+                    $hit = if ($exact) { $p.Name -eq $n } else { $p.Name -like "*$n" }
+                    if (-not $hit) { continue }
+                    $v = $p.Value
+                    if ($null -eq $v) { continue }
+                    if ($Kind -eq 'text') {
+                        if ($v -is [string]) {
+                            $t = ($v -replace '[\r\n\x00-\x1f\x7f]', ' ').Trim()
+                            if ($t.Length -gt 40) { $t = $t.Substring(0, 40) }
+                            if ($t) { return $t }
+                        }
+                        continue
+                    }
+                    if ($Kind -eq 'number') {
+                        if (Test-IpReputationNumber $v) { return [double]$v }
+                        if ($v -is [string]) {
+                            $parsed = 0.0
+                            if ([double]::TryParse($v.Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+                                return $parsed
+                            }
+                        }
+                        continue
+                    }
+                    if ($v -is [bool]) { return [bool]$v }
+                    if ($v -is [string]) {
+                        $s = $v.Trim().ToLowerInvariant()
+                        if ($s -eq 'true' -or $s -eq 'yes' -or $s -eq '1') { return $true }
+                        if ($s -eq 'false' -or $s -eq 'no' -or $s -eq '0') { return $false }
+                        continue
+                    }
+                }
+            }
+        }
+        return $null
+    }
+    $score = Field @('fraud_score','fraudscore','risk_score','riskscore','score','threat_score','threatscore') 'number'
+    if ($null -ne $score) { $out['score'] = [double]$score }
+    $level = Field @('risk_level','risklevel','level','verdict','ai_verdict') 'text'
+    if ($null -ne $level) { $out['level'] = [string]$level }
+    $proxy = Field @('is_proxy','proxy','is_residential_proxy','residential_proxy','residential_proxy_access') 'bool'
+    if ($null -ne $proxy) { $out['proxy'] = [bool]$proxy }
+    $vpn = Field @('is_vpn','vpn','is_anonymous_vpn','anonymous_vpn','privacy') 'bool'
+    if ($null -ne $vpn) { $out['vpn'] = [bool]$vpn }
+    $tor = Field @('is_tor','tor','is_tor_exit','tor_exit') 'bool'
+    if ($null -ne $tor) { $out['tor'] = [bool]$tor }
+    $hosting = Field @('is_datacenter','datacenter','is_hosting','hosting','is_cloud','cloud','is_server','server') 'bool'
+    if ($null -ne $hosting) { $out['hosting'] = [bool]$hosting }
+    $bl = Field @('blacklist','blacklists','blacklist_count','dnsbl','abuse_score','abuse_confidence_score') 'number'
+    if ($null -ne $bl) { $out['blacklist'] = [double]$bl }
+    return $out
+}
+
+function Invoke-IpReputationLookup([string]$Ip, $Cfg) {
+    # 用统一的探测助手(和上游其它探测同一个执行器):固定 UA、固定超时、重试语义一致。
+    # 地址作为查询参数传给用户自己配的接口。密钥只出现在请求头里,不进 URL,
+    # 也不写进日志与缓存 —— URL 会进日志与进程命令行。
+    $url = [string]$Cfg.url
+    $sep = if ($url.Contains('?')) { '&' } else { '?' }
+    $full = $url + $sep + 'ip=' + [Uri]::EscapeDataString($Ip)
+    $headers = @()
+    if (-not [string]::IsNullOrWhiteSpace([string]$Cfg.key)) {
+        $headers = @('X-API-Key: ' + [string]$Cfg.key)
+    }
+    # 一次就够:信誉数据不随秒级抖动变化,重试只会把限流打得更狠。
+    $body = Invoke-ProbeText -Url $full -Attempts 1 -TimeoutSec 12 -Headers $headers -Valid {
+            param($b)
+            return ($b -match '"')
+        }
+    if ([string]::IsNullOrWhiteSpace($body)) { return $null }
+    try { return ($body | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+}
+
+# 取出口 IP 的信誉情报。返回 $null 表示「拿不到」——调用方据此提示失败,
+# 而不是把它当成干净。缓存按 IP 记账,TTL 默认 7 天。
+function Get-IpReputation([string]$Ip, $Cfg) {
+    if (-not $Ip) { return $null }
+    # 缓存键带上接口地址:同一个 IP 在不同数据源下结论可以完全不同
+    # (有的源只认机房,有的源能认出住宅代理池)。只按 IP 记账的话,
+    # 用户换了接口就会读到上一个接口留下的旧记录,看起来像"新接口也这么判"。
+    $key = ([string]$Cfg.url) + '|' + $Ip
+    $cache = Read-IpReputationCache
+    $entry = $null
+    if ($cache.ContainsKey($key)) { $entry = $cache[$key] }
+    if ($entry -and $entry.at) {
+        try {
+            $age = ([DateTime]::Now - [DateTime]$entry.at).TotalDays
+            $ttl = 7
+            if ($Cfg -and $Cfg.cacheDays) { $ttl = [int]$Cfg.cacheDays }
+            if ($age -lt $ttl) { return $entry }
+        } catch {}
+    }
+    $payload = Invoke-IpReputationLookup $Ip $Cfg
+    if ($null -eq $payload) {
+        # 拿不到就退回缓存里的旧值(有就还能用),没有就明确返回「拿不到」。
+        if ($entry) { return $entry }
+        return $null
+    }
+    $fields = ConvertFrom-IpReputationPayload $payload
+    $record = @{ at = ([DateTime]::Now).ToString('o') }
+    foreach ($k in $fields.Keys) { $record[$k] = $fields[$k] }
+    $cache[$key] = $record
+    Write-IpReputationCache $cache
+    return $record
+}
+
 function Invoke-CheckDetail {
     try { $script:CheckConfig = Get-CheckConfig } catch { '检查配置无效，请恢复默认设置'; return }
     $pname = Get-ProxyName
@@ -1352,6 +1676,88 @@ function Invoke-CheckDetail {
         $r2 = Invoke-ProbeCode -Url 'https://api.anthropic.com/v1/models'
         if ($r1 -ne '000' -and $r2 -ne '000') { Format-OptionalResult '生态可达性' 'ok' "claude.ai:$r1 api:$r2" } else { Format-OptionalResult '生态可达性' 'fail' "claude.ai:$r1 api:$r2" }
     }
+    # IP 信誉四联检:出口 IP 的公开信誉情报,按公开信誉页面的常用维度拆开显示 ——
+    # 风险分 / 代理标记 / 机房属性 / 黑名单。各家维度口径不同,这里按语义归一。
+    #   出口 IP 对了不等于 IP 信誉好 —— 「出口IP」只比对这个 IP 与目标国家是否一致,
+    #   同一个国家里住宅家宽、机房地址、VPN 出口、住宅代理池在风控眼里是四种东西。
+    #   真实事故:账号在代理池地址上被烧,而当时体检表一片绿。
+    #
+    # 数据源由用户在 checks.json 的 ipReputation 里指定(URL + 可选密钥):
+    #   没配 -> 显示「未配置」,不猜、不假装通过;
+    #   探测失败 -> 显示失败原因,不判脏 —— 探测端点改版不该把所有人的检查判红;
+    #   数据源没提供某一项 -> 该项显示「数据源未提供」,不当成「没有风险」。
+    #   缺字段 ≠ 「否」,这是这类接口最容易骗人的地方。
+    $ipRepCfg = Get-IpReputationConfig
+    if ((Test-CheckDisabled 'IP纯净度') -and (Test-CheckDisabled 'IP代理标记') -and (Test-CheckDisabled 'IP机房属性') -and (Test-CheckDisabled 'IP黑名单')) {
+        # 四项全部禁用时绝不向第三方发送出口 IP，也不写缓存。
+        Format-OptionalResult 'IP纯净度' 'ok'
+        Format-OptionalResult 'IP代理标记' 'ok'
+        Format-OptionalResult 'IP机房属性' 'ok'
+        Format-OptionalResult 'IP黑名单' 'ok'
+    } elseif ($null -eq $ipRepCfg) {
+        Format-OptionalResult 'IP纯净度' 'warn' '未配置信誉数据源'
+        Format-OptionalResult 'IP代理标记' 'warn' '未配置信誉数据源'
+        Format-OptionalResult 'IP机房属性' 'warn' '未配置信誉数据源'
+        Format-OptionalResult 'IP黑名单' 'warn' '未配置信誉数据源'
+    } elseif (-not (Test-ProxyPathAlive)) {
+        # 路径可能失效时不发探测:这个请求会把出口 IP 交给第三方,
+        # 在可能泄漏的路径上敲门等于再暴露一次真实 IP。
+        Format-OptionalResult 'IP纯净度' 'warn' '代理路径失效,已跳过信誉探测'
+        Format-OptionalResult 'IP代理标记' 'warn' '代理路径失效,已跳过信誉探测'
+        Format-OptionalResult 'IP机房属性' 'warn' '代理路径失效,已跳过信誉探测'
+        Format-OptionalResult 'IP黑名单' 'warn' '代理路径失效,已跳过信誉探测'
+    } else {
+        $rep = Get-IpReputation ([string]$e.ip) $ipRepCfg
+        if ($null -eq $rep) {
+            Format-OptionalResult 'IP纯净度' 'warn' '信誉数据源探测失败或未返回可用数据'
+            Format-OptionalResult 'IP代理标记' 'warn' '信誉数据源探测失败或未返回可用数据'
+            Format-OptionalResult 'IP机房属性' 'warn' '信誉数据源探测失败或未返回可用数据'
+            Format-OptionalResult 'IP黑名单' 'warn' '信誉数据源探测失败或未返回可用数据'
+        } else {
+            $threshold = [double]$ipRepCfg.threshold
+            # 纯净度:分数口径由用户的阈值定义。阈值没配(0)时只报分数不判风险。
+            if ($rep.ContainsKey('score')) {
+                $score = [double]$rep['score']
+                $level = if ($rep.ContainsKey('level')) { [string]$rep['level'] } else { '' }
+                if ($threshold -gt 0 -and $score -ge $threshold) {
+                    Format-OptionalResult 'IP纯净度' 'fail' "风险分 $score$(if ($level) { " · $level" })"
+                } else {
+                    Format-OptionalResult 'IP纯净度' 'ok' "风险分 $score$(if ($level) { " · $level" })"
+                }
+            } else {
+                Format-OptionalResult 'IP纯净度' 'warn' '数据源未提供风险分'
+            }
+            # 代理标记:公开代理 / 住宅代理池 / VPN / Tor,任一为真即判失败。
+            $flags = @()
+            $proxyHit = $false
+            foreach ($pair in @(@('proxy','公开代理'), @('vpn','VPN'), @('tor','Tor'))) {
+                if ($rep.ContainsKey($pair[0])) {
+                    if ([bool]$rep[$pair[0]]) { $flags += $pair[1]; $proxyHit = $true }
+                    else { $flags += ("$($pair[1]) 否") }
+                } else {
+                    $flags += ("$($pair[1]) 未知")
+                }
+            }
+            if ($proxyHit) { Format-OptionalResult 'IP代理标记' 'fail' ($flags -join ' · ') }
+            elseif ($flags -match '未知') { Format-OptionalResult 'IP代理标记' 'warn' ($flags -join ' · ') }
+            else { Format-OptionalResult 'IP代理标记' 'ok' ($flags -join ' · ') }
+            # 机房属性:机房地址不等于脏 —— 机房 IP 该提示,但不该按脏处理。
+            if ($rep.ContainsKey('hosting')) {
+                if ([bool]$rep['hosting']) { Format-OptionalResult 'IP机房属性' 'warn' '机房/数据中心地址' }
+                else { Format-OptionalResult 'IP机房属性' 'ok' '非机房地址' }
+            } else {
+                Format-OptionalResult 'IP机房属性' 'warn' '数据源未提供机房属性'
+            }
+            # 黑名单:命中即失败。
+            if ($rep.ContainsKey('blacklist')) {
+                $bl = [double]$rep['blacklist']
+                if ($bl -ge 1) { Format-OptionalResult 'IP黑名单' 'fail' "命中 $bl 项" }
+                else { Format-OptionalResult 'IP黑名单' 'ok' "未命中($bl)" }
+            } else {
+                Format-OptionalResult 'IP黑名单' 'warn' '数据源未提供黑名单信息'
+            }
+        }
+    }
 }
 
 function Invoke-Check {
@@ -1365,7 +1771,10 @@ function Invoke-Check {
         $states[$name] = $state
     }
     $failed = @($states.Keys | Where-Object { $states[$_] -eq 'fail' })
-    if ($invalid -or $states.Count -ne 14 -or $failed.Count -gt 0) {
+    # 期望的检查项数量。项数变了这里必须跟着改 —— 少一项说明检查没跑完,
+    # 多一项说明有重复输出,两种都不该判通过。界面上的项数文案要同步。
+    $expected = (Get-CheckItemNames).Count
+    if ($invalid -or $states.Count -ne $expected -or $failed.Count -gt 0) {
         $script:exitCode = 1
         $detail = if ($failed.Count) { $failed -join '、' } else { '检查输出不完整或重复' }
         "FAIL:$detail"
@@ -2670,6 +3079,10 @@ $summary = ''
 try {
     switch ($command) {
         'checkdetail' {
+            # 先清空:检查过程异常中断时,不能把上一次的结果留在文件里。
+            # UI 用 last-check.txt 渲染逐项颜色、用退出码决定整体结论,
+            # 两者一旦来自不同轮次,就会出现「逐项全绿、整体红」的误导画面。
+            '' | Out-File -Encoding utf8 "$BASE\last-check.txt"
             $r = @(Invoke-CheckDetail)
             $r | Out-File -Encoding utf8 "$BASE\last-check.txt"
             $summary = (($r | ForEach-Object {
@@ -2704,7 +3117,18 @@ try {
         'rules-status' { Invoke-RulesStatus }
         'get-check-config' {
             $config = Get-CheckConfig
-            [pscustomobject]@{ disabled = @($config.disabled); allowOptionalFailures = [bool]$config.allowOptionalFailures; logging = [bool]$config.logging } | ConvertTo-Json -Depth 3 -Compress
+            $payload = [ordered]@{ disabled = @($config.disabled); allowOptionalFailures = [bool]$config.allowOptionalFailures; logging = [bool]$config.logging }
+            # 密钥不回显:这里只告诉设置界面「配没配」和阈值,
+            # 让界面知道要显示哪一项,不去把用户的密钥读回屏幕。
+            if ($null -ne $config.ipReputation) {
+                $payload['ipReputation'] = [ordered]@{
+                    url = [string]$config.ipReputation.url
+                    configured = [bool](-not [string]::IsNullOrWhiteSpace([string]$config.ipReputation.url))
+                    threshold = [double]$config.ipReputation.threshold
+                    cacheDays = [int]$config.ipReputation.cacheDays
+                }
+            }
+            [pscustomobject]$payload | ConvertTo-Json -Depth 4 -Compress
         }
         'set-check-config' {
             Set-CheckConfigFromJson $args[1]

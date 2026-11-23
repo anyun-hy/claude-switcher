@@ -603,24 +603,78 @@ def clean_ip_profile(address, raw):
     return {key: value for key, value in profile.items() if value}
 
 
-def parse_egress_profile():
-    # Both providers report the caller's address. A differently routed response
+def normalize_asn(value):
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, int):
+        return f"AS{value}" if 1 <= value <= 4294967295 else ""
+    if isinstance(value, str):
+        m = re.fullmatch(r"(?:AS)?([1-9][0-9]{0,9})", value.strip(), re.I)
+        if m and int(m.group(1)) <= 4294967295:
+            return "AS" + m.group(1)
+    return ""
+
+
+def parse_egress_profile(source=""):
+    # Public providers report the caller's address. A differently routed response
     # cannot supply metadata for the Cloudflare sample.
     with os.fdopen(3, encoding="utf-8", errors="replace") as sample:
         address = parse_address(sample.readline(80).strip())
         body = json_object(sample.read(16384))
-    if address is None or body.get("error") or parse_address(body.get("ip")) != address:
+    if address is None or not body or body.get("error"):
         return
-    org_parts = profile_text(body.get("org")).split(maxsplit=1)
-    asn = body.get("asn")
-    org = " ".join(org_parts)
-    if org_parts and re.fullmatch(r"AS[0-9]+", org_parts[0]):
-        asn = asn or org_parts[0]
-        org = " ".join(org_parts[1:])
+    if source == "ipwho.is" and body.get("success", True) is False:
+        return
+    reported_ip = body.get("ip")
+    if reported_ip is not None and reported_ip != "":
+        if parse_address(reported_ip) != address:
+            return
+        ip_verified = True
+    else:
+        ip_verified = False
+
+    asn = ""
+    org = ""
+    prefix = None
+    country = None
+    region = None
+    city = None
+
+    if source == "ipwho.is":
+        conn = body.get("connection")
+        if isinstance(conn, dict):
+            asn = normalize_asn(conn.get("asn"))
+            org = profile_text(conn.get("org") or conn.get("isp"))
+        if ip_verified:
+            country = body.get("country_code") or body.get("country")
+            region = body.get("region")
+            city = body.get("city")
+    elif source == "ip.sb":
+        asn = normalize_asn(body.get("asn"))
+        org = profile_text(body.get("asn_organization") or body.get("organization") or body.get("isp"))
+        if ip_verified:
+            country = body.get("country_code") or body.get("country")
+            region = body.get("region")
+            city = body.get("city")
+    else:
+        if not ip_verified:
+            return
+        org_parts = profile_text(body.get("org")).split(maxsplit=1)
+        asn = normalize_asn(body.get("asn"))
+        org = " ".join(org_parts)
+        if org_parts and re.fullmatch(r"AS[0-9]+", org_parts[0], re.I):
+            asn = asn or normalize_asn(org_parts[0])
+            org = " ".join(org_parts[1:])
+        prefix = body.get("network")
+        country = body.get("country_code") or body.get("country")
+        region = body.get("region")
+        city = body.get("city")
+
+    if not ip_verified and not asn:
+        return
     profile = clean_ip_profile(address, {
-        "asn": asn, "org": org, "prefix": body.get("network"),
-        "country": body.get("country_code") or body.get("country"),
-        "region": body.get("region"), "city": body.get("city"),
+        "asn": asn, "org": org, "prefix": prefix,
+        "country": country, "region": region, "city": city,
     })
     if profile:
         print(profile.get("asn", ""))
@@ -1019,8 +1073,8 @@ def main(args):
             observe_ip(int(args[1]), args[2])
         except (OSError, ValueError, OverflowError):
             fail()
-    elif action == "parse-egress-profile" and len(args) == 1:
-        parse_egress_profile()
+    elif action == "parse-egress-profile" and len(args) in (1, 2):
+        parse_egress_profile(args[1] if len(args) == 2 else "")
     elif action == "describe-egress-profile" and len(args) == 1:
         describe_egress_profile()
     elif action == "config" and len(args) == 1:
@@ -2434,20 +2488,62 @@ egress_profile_fetch() {
     local processes
     processes=$(proxy_processes) && proxy_alive "$processes" && tun_up &&
         [ -z "$(detect_other_clients "$processes")" ] || return 1
-    curl -q -fs --max-time 2 --max-filesize 16384 "$@" 2>/dev/null
+    curl -q -fs -A 'claude-switcher/1.0' --max-time 2 --max-filesize 16384 "$@" 2>/dev/null
 }
 
+# 多源出口画像与 ASN 查询:ipapi → ipinfo → ip.sb → ipwho.is,首个成功即停;
+# 代理路径未就绪时不发外部探测;全失败时返回脱敏原因(不含 IP/正文)。
 egress_profile() {
-    local address="$1" raw record asn registered="" route=""
+    local address="$1" processes spec src url out rc code body record="" asn registered="" route="" reasons=""
     # Public lookups only. Never send an old exit address to a provider.
     [[ "$address" =~ ^[0-9A-Fa-f.:]+$ ]] && [ "${#address}" -le 45 ] || return 0
-    raw=$(egress_profile_fetch 'https://ipapi.co/json/') || raw=""
-    record=$("$0" _support parse-egress-profile 3<<<"$address"$'\n'"$raw")
-    if [ -z "$record" ]; then
-        raw=$(egress_profile_fetch 'https://ipinfo.io/json') || raw=""
-        record=$("$0" _support parse-egress-profile 3<<<"$address"$'\n'"$raw")
+    if ! processes=$(proxy_processes) || ! proxy_alive "$processes" || ! tun_up || [ -n "$(detect_other_clients "$processes")" ]; then
+        printf 'warn:未获取(代理路径未就绪)\n'
+        return 0
     fi
-    [ -n "$record" ] || return 0
+    for spec in \
+        "ipapi|https://ipapi.co/json/" \
+        "ipinfo|https://ipinfo.io/json" \
+        "ip.sb|https://api.ip.sb/geoip" \
+        "ipwho.is|https://ipwho.is/"; do
+        src="${spec%%|*}"
+        url="${spec#*|}"
+        out=$(curl -q -s -A 'claude-switcher/1.0' --max-time 2 --max-filesize 16384 -w '\n%{http_code}' "$url" 2>/dev/null); rc=$?
+        if [ "$rc" -ne 0 ]; then
+            reasons="${reasons:+$reasons; }${src}:超时/不可达"
+            continue
+        fi
+        if [ -z "$out" ]; then
+            reasons="${reasons:+$reasons; }${src}:空响应"
+            continue
+        fi
+        code=$(printf '%s\n' "$out" | tail -n 1)
+        case "$code" in
+            200)
+                body=$(printf '%s\n' "$out" | sed '$d') ;;
+            000)
+                reasons="${reasons:+$reasons; }${src}:超时/不可达"
+                continue ;;
+            [0-9][0-9][0-9])
+                reasons="${reasons:+$reasons; }${src}:HTTP ${code}"
+                continue ;;
+            *)
+                body="$out" ;;
+        esac
+        if [ -z "$body" ]; then
+            reasons="${reasons:+$reasons; }${src}:空响应"
+            continue
+        fi
+        record=$("$0" _support parse-egress-profile "$src" 3<<<"$address"$'\n'"$body")
+        if [ -n "$record" ]; then
+            break
+        fi
+        reasons="${reasons:+$reasons; }${src}:无ASN字段"
+    done
+    if [ -z "$record" ]; then
+        printf 'warn:未获取%s\n' "${reasons:+($reasons)}"
+        return 0
+    fi
     asn=${record%%$'\n'*}
     if [[ "$asn" =~ ^AS([0-9]+)$ ]]; then
         registered=$(egress_profile_fetch "https://www.peeringdb.com/api/net?asn=${BASH_REMATCH[1]}&fields=asn,info_type,info_types") || registered=""
@@ -2815,9 +2911,15 @@ checkdetail() {
     if [ "$loc" = "$COUNTRY_TARGET" ]; then echo "出口IP=ok:$ip/$loc"; else echo "出口IP=fail:${ip:-无}/${loc:-未知}(期望$COUNTRY_TARGET)"; fi
     if ! check_disabled "ASN属性"; then
         ip_mode="detail"
-        if [ "$tcnt" -eq 1 ] && profile_report=$(egress_profile "$ip") && [ -n "$profile_report" ]; then
-            asn_state=${profile_report%%$'\n'*}
-            profile=${profile_report#*$'\n'}
+        if [ "$tcnt" -eq 1 ] && proxy_alive "$processes" && [ -z "${others:-}" ]; then
+            if profile_report=$(egress_profile "$ip") && [ -n "$profile_report" ]; then
+                asn_state=${profile_report%%$'\n'*}
+                if [[ "$profile_report" == *$'\n'* ]]; then
+                    profile=${profile_report#*$'\n'}
+                fi
+            fi
+        else
+            asn_state="warn:未获取(代理路径未就绪)"
         fi
     fi
     if check_disabled "IP一致"; then
@@ -4057,6 +4159,15 @@ quit_cli() {
     return 1
 }
 
+quit_all_claude() {
+    cli_lock_acquire || return 1
+    quit_claude || { echo "FAIL:Claude 桌面版未能退出，请手动退出后重试"; return 1; }
+    quit_cli || { echo "FAIL:Claude Code CLI 未能退出，请手动退出后重试"; return 1; }
+    log "已温和退出 Claude 桌面版与 Claude Code CLI"
+    echo "OK:已退出 Claude 桌面版与 Claude Code CLI"
+    return 0
+}
+
 cli_lock_acquire() {
     [ "${CLI_LOCK_HELD:-0}" -eq 1 ] && return 0
     if mkdir "$BASE/cli-operation.lock" 2>/dev/null; then
@@ -4456,6 +4567,7 @@ case "$operation" in
     cli-info) cli_info ;;
     cli) run_cli "${@:2}" ;;
     cli-current) cli_current ;;
+    quit-claude) quit_all_claude ;;
     snapshot-export) snapshot_export "${2:-}" "${3:-}" "${4:-}" ;;
     snapshot-import) snapshot_import "${2:-}" "${3:-}" "${4:-}" ;;
     export-diagnostics) "$0" _support export-diagnostics "${2:-}" ;;
@@ -4465,7 +4577,7 @@ case "$operation" in
     set-keep-paths) "$0" _support keep-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto|--gui]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]|network-rebuild <preview|apply|state|validate|rollback> [args...]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto|--gui]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|quit-claude|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]|network-rebuild <preview|apply|state|validate|rollback> [args...]"; exit 2 ;;
 esac
 # checkdetail 分支内部已保存返回码;其他分支取 case 的最终状态。
 # 判断本身会改变 $?，所以必须先捕获 dispatch_rc，再按操作类型落 rc。

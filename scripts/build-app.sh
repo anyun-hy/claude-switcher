@@ -1,21 +1,29 @@
 #!/bin/bash
 # 统一编译并签名 macOS 界面 App（安装器 / 打包脚本 / 应用内更新共用）
-# 用法: bash scripts/build-app.sh <repo_root> <output_app_path> [version] [fallback_icns]
+# 用法: bash scripts/build-app.sh <repo_root> <output_app_path> [version] [fallback_icns] [arch]
 set -euo pipefail
 
-REPO_ROOT="${1:?用法: build-app.sh <repo_root> <output_app_path> [version] [fallback_icns]}"
-APP_OUT="${2:?用法: build-app.sh <repo_root> <output_app_path> [version] [fallback_icns]}"
+REPO_ROOT="${1:?用法: build-app.sh <repo_root> <output_app_path> [version] [fallback_icns] [arch]}"
+APP_OUT="${2:?用法: build-app.sh <repo_root> <output_app_path> [version] [fallback_icns] [arch]}"
 VERSION="${3:-1.0}"
 FALLBACK_ICNS="${4:-}"
+ARCH="${5:-${CLAUDE_SWITCHER_ARCH:-$(uname -m)}}"
 BUILD_VERSION="$VERSION"
 [ "$VERSION" = "1.0" ] && BUILD_VERSION="1"
+
+case "$ARCH" in
+    arm64|x86_64) ;;
+    *)
+        echo "FAIL:不支持的 macOS 目标架构: $ARCH (仅支持 arm64 或 x86_64)" >&2
+        exit 1
+        ;;
+esac
 
 if ! command -v swiftc >/dev/null 2>&1; then
     echo "FAIL:未检测到 swiftc,无法编译界面 App" >&2
     exit 1
 fi
 
-ARCH="$(uname -m)"
 mkdir -p "$APP_OUT/Contents/MacOS" "$APP_OUT/Contents/Resources"
 
 # 必须带 -target,否则新 SDK 编出的二进制在老系统被拒启动
