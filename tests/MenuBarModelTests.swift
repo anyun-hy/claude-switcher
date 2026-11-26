@@ -77,6 +77,7 @@ private final class Fixture {
           checkdetail) delay check; cat "$root/audit"; result check ;;
           status) cat "$root/status"; result status ;;
           detect-client) cat "$root/client-probe"; result client-probe ;;
+          guard-exit-ip) if [ -f "$root/guard-ip" ]; then cat "$root/guard-ip"; else echo 'status=same'; fi; result guard-ip ;;
           quit-desktop-helpers) result desktop-quit ;;
           get-client) if [ -f "$root/client" ]; then cat "$root/client"; else echo 'client=clash-verge'; fi ;;
           set-client) printf 'client=%s\\n' "$2" > "$root/client"; echo 'OK:已切换客户端' ;;
@@ -1009,6 +1010,53 @@ struct MenuBarModelTests {
                 vm.quitWithClaude(onTerminated: { terminated = true }, onFailure: { failedMessage = $0 })
                 try spin { !failedMessage.isEmpty }
                 try expect(!terminated && failedMessage.contains("不支持联动关闭"), "旧版核心应明确提示不支持")
+            case "exit_ip_monitor":
+                let vm = f.vm()
+                var reveals = 0
+                var alerts: [ExitIPAlert] = []
+                vm.onIPChangeWindowReveal = { reveals += 1 }
+                vm.onIPChangeDetected = { alerts.append($0) }
+                vm.start(); try f.idle(vm)
+                let initialChecks = f.calls.filter { $0 == "checkdetail" }.count
+                // 1. 同一 IP 时不触发重查与告警
+                try f.write("guard-ip", "status=same\nip=106.178.150.201\nloc=JP\n")
+                vm.pollExitIPIfNeeded()
+                try spin { !vm.isPollingExitIP }
+                try f.idle(vm)
+                try expect(f.calls.contains("guard-exit-ip") && alerts.isEmpty && reveals == 0 && f.calls.filter { $0 == "checkdetail" }.count == initialChecks,
+                           "出口 IP 未变化时不应触发告警或重查")
+                // 2. IP 变化且断开 Claude -> 立即唤起窗口、展开对比、刷新审计并告警
+                try f.write("guard-ip", "status=changed\nreason=ip_changed\nbefore=106.178.150.201\nafter=106.178.149.35\nloc=JP\ntarget_loc=JP\ndisconnected=1\n")
+                vm.pollExitIPIfNeeded()
+                try spin { !vm.isPollingExitIP && alerts.count == 1 }
+                try f.idle(vm)
+                try expect(reveals == 1 && vm.showIPComparison, "检测到 IP 变化应立即唤起主窗口并展开对比")
+                try expect(alerts[0].disconnected && alerts[0].before == "106.178.150.201" && alerts[0].after == "106.178.149.35",
+                           "告警应包含完整的新旧 IP 与断连状态")
+                try expect(f.calls.filter { $0 == "checkdetail" }.count == initialChecks + 1, "IP 变化应触发一次完整环境重查")
+                // 3. 持续国家不符且未再次断开 Claude 时应去重，避免每轮死循环刷新
+                try f.write("guard-ip", "status=changed\nreason=country_mismatch\nbefore=1.2.3.4\nafter=1.2.3.4\nloc=US\ntarget_loc=JP\ndisconnected=0\n")
+                vm.pollExitIPIfNeeded()
+                try spin { !vm.isPollingExitIP && alerts.count == 2 }
+                try f.idle(vm)
+                try expect(alerts[1].reason == "country_mismatch", "同 IP 跨国不符也必须触发告警")
+                let checksAfterMismatch = f.calls.filter { $0 == "checkdetail" }.count
+                let guardCallsBefore = f.calls.filter { $0 == "guard-exit-ip" }.count
+                vm.pollExitIPIfNeeded()
+                try spin { !vm.isPollingExitIP && f.calls.filter { $0 == "guard-exit-ip" }.count > guardCallsBefore }
+                try f.idle(vm)
+                try expect(alerts.count == 2 && f.calls.filter { $0 == "checkdetail" }.count == checksAfterMismatch,
+                           "同一未解决的国家不符且未再次断开时不应重复刷新与弹窗")
+                // 4. 恢复正常 (status=same) 后重置去重键，再次异常可重新告警
+                try f.write("guard-ip", "status=same\nip=106.178.149.35\nloc=JP\n")
+                let guardCallsSame = f.calls.filter { $0 == "guard-exit-ip" }.count
+                vm.pollExitIPIfNeeded()
+                try spin { !vm.isPollingExitIP && f.calls.filter { $0 == "guard-exit-ip" }.count > guardCallsSame }
+                try f.idle(vm)
+                try f.write("guard-ip", "status=changed\nreason=country_mismatch\nbefore=1.2.3.4\nafter=1.2.3.4\nloc=US\ntarget_loc=JP\ndisconnected=0\n")
+                vm.pollExitIPIfNeeded()
+                try spin { !vm.isPollingExitIP && alerts.count == 3 }
+                try f.idle(vm)
             default:
                 throw TestFailure(description: "未知测试场景：\(name)")
             }

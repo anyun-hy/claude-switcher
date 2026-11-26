@@ -26,7 +26,7 @@ SCENARIOS = (
     "nonzero_switch", "timeout_switch", "busy_guard", "fix_guard", "failed_fix",
     "checking_allows_quit", "hide_after_success", "reopen_cancels_hide",
     "window_lifecycle", "termination_guard", "status_badge_states",
-    "quit_with_claude_success", "quit_with_claude_failure",
+    "quit_with_claude_success", "quit_with_claude_failure", "exit_ip_monitor",
 )
 
 

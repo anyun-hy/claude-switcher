@@ -4141,7 +4141,7 @@ cli_config_dir() {
 
 cli_pids() {
     local uid="${1:-$(id -u)}"
-    ps -axo pid=,uid=,comm=,args= | awk -v uid="$uid" '
+    ps -axo pid=,uid=,comm=,args= | LC_ALL=C awk -v uid="$uid" '
         $2 == uid && ($3 ~ /(^|\/)(claude|claude\.exe)$/ ||
         ($3 ~ /(^|\/)(node|bun)$/ && $5 ~ /(^|\/)@anthropic-ai\/claude-code\/(bin\/claude(\.exe)?|cli\.js)$/)) { print $1 }'
 }
@@ -4168,12 +4168,93 @@ quit_all_claude() {
     return 0
 }
 
-# 运行期轻量出口 IP 巡检:对比当前出口 IP 与 lastip 基线,若发生变化则立即断开运行中的 Claude 并通知界面重查。
-# 日志中不记录具体 IP 地址以遵守隐私脱敏红线。
+# 急停断开当前用户下的 Claude 桌面版（主程序与后台助手）及 Claude Code CLI。
+# 复用内核路径与 UID 双重校验，避免 pgrep/pkill -f 误伤；返回 0=已断开 1=未运行 2=部分失败。
+terminate_claude_for_guard() {
+    local uid paths targets kind pid path owner live found=0 failed=0 pass pids signaled=""
+    uid=$(id -u) || return 2
+    case "$uid" in
+        ''|*[!0-9]*) return 2 ;;
+    esac
+    if paths=$(macos_process_paths 2>/dev/null); then
+        targets=$(claude_desktop_processes "$paths" targets)
+        for pass in main helper; do
+            while IFS=$'\t' read -r kind pid path; do
+                [ "$kind" = "$pass" ] || continue
+                [ -n "$pid" ] || continue
+                owner=$(ps -p "$pid" -o uid= 2>/dev/null) || continue
+                [ "${owner//[[:space:]]/}" = "$uid" ] || continue
+                live=$(macos_process_paths "$pid" 2>/dev/null) || continue
+                [ "$live" = "$pid"$'\t'"$path" ] || continue
+                found=1
+                if kill -TERM "$pid" 2>/dev/null; then
+                    signaled="${signaled:+$signaled }$pid"
+                else
+                    failed=1
+                fi
+            done <<< "$targets"
+        done
+    fi
+    pids=$(cli_pids "$uid")
+    for pid in $pids; do
+        [ -n "$pid" ] || continue
+        owner=$(ps -p "$pid" -o uid= 2>/dev/null) || continue
+        [ "${owner//[[:space:]]/}" = "$uid" ] || continue
+        found=1
+        if kill -TERM "$pid" 2>/dev/null; then
+            signaled="${signaled:+$signaled }$pid"
+        else
+            failed=1
+        fi
+    done
+    [ "$found" -eq 1 ] || return 1
+    local i still_alive
+    for i in 1 2 3; do
+        still_alive=0
+        for pid in $signaled; do
+            if kill -0 "$pid" 2>/dev/null; then
+                still_alive=1
+                break
+            fi
+        done
+        [ "$still_alive" -eq 0 ] && break
+        sleep 1
+    done
+    [ "$failed" -eq 0 ] && return 0 || return 2
+}
+
+# 运行期轻量出口 IP 巡检:先校验代理与 TUN 在线，再对比当前出口 IP/国家与基线。
+# 若发生变动则按 UID 与内核路径急停 Claude 并通知界面重查；日志中不记录明文 IP。
 guard_exit_ip() {
-    local baseline_ip trace current_ip current_loc had_claude=0
-    [ -f "$BASE/lastip" ] && [ ! -L "$BASE/lastip" ] || { echo "status=no_baseline"; return 0; }
-    baseline_ip=$(head -n 1 "$BASE/lastip" 2>/dev/null | tr -d ' \t\r\n')
+    if [ -e "$NETWORK_PENDING" ] || [ -L "$NETWORK_PENDING" ] \
+        || [ -e /var/run/local.claude-switcher.network-rebuild.lock ] \
+        || [ -d "$BASE/cli-operation.lock" ]; then
+        echo "status=busy"
+        return 0
+    fi
+    local tcnt processes others
+    tcnt=$(tun_count)
+    if [ "$tcnt" -ne 1 ]; then
+        echo "status=proxy_down"
+        return 0
+    fi
+    if ! processes=$(proxy_processes 2>/dev/null) || ! proxy_alive "$processes"; then
+        echo "status=proxy_down"
+        return 0
+    fi
+    others=$(detect_other_clients "$processes")
+    if [ -n "$others" ]; then
+        echo "status=proxy_down"
+        return 0
+    fi
+    local ip_check_disabled=0
+    if load_check_config && check_disabled "IP一致"; then
+        ip_check_disabled=1
+    fi
+    local baseline_ip="" trace current_ip current_loc country_mismatch=0 ip_changed=0 reason="" had_claude=0 term_rc=1
+    if [ -f "$BASE/lastip" ] && [ ! -L "$BASE/lastip" ]; then
+        baseline_ip=$(head -n 1 "$BASE/lastip" 2>/dev/null | tr -d ' \t\r\n')
+    fi
     [ -n "$baseline_ip" ] || { echo "status=no_baseline"; return 0; }
     trace=$(curl -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
     current_ip=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | head -n 1 | tr -d ' \t\r\n')
@@ -4186,22 +4267,31 @@ guard_exit_ip() {
         *.*.*.*|*:*) ;;
         *) echo "status=unreachable"; return 0 ;;
     esac
-    if [ "$current_ip" = "$baseline_ip" ] && { [ -z "$current_loc" ] || [ "$current_loc" = "$COUNTRY_TARGET" ]; }; then
+    [ -n "$current_loc" ] && [ "$current_loc" != "$COUNTRY_TARGET" ] && country_mismatch=1
+    [ "$ip_check_disabled" -eq 0 ] && [ "$current_ip" != "$baseline_ip" ] && ip_changed=1
+    if [ "$country_mismatch" -eq 0 ] && [ "$ip_changed" -eq 0 ]; then
         echo "status=same"
         echo "ip=$current_ip"
         [ -n "$current_loc" ] && echo "loc=$current_loc"
         return 0
     fi
-    if pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 || [ -n "$(cli_pids)" ]; then
-        had_claude=1
-        quit_claude >/dev/null 2>&1 || pkill -TERM -f "/Applications/Claude.app/Contents/MacOS/Claude" 2>/dev/null || true
-        quit_cli >/dev/null 2>&1 || true
-        quit_desktop_helpers >/dev/null 2>&1 || true
-        log "WARN:运行期检测到出口IP变化(地区:${current_loc:-?}),已自动断开 Claude"
+    if [ "$country_mismatch" -eq 1 ] && [ "$ip_changed" -eq 1 ]; then
+        reason="ip_and_country_changed"
+    elif [ "$country_mismatch" -eq 1 ]; then
+        reason="country_mismatch"
     else
-        log "WARN:后台检测到出口IP变化(地区:${current_loc:-?})"
+        reason="ip_changed"
+    fi
+    terminate_claude_for_guard
+    term_rc=$?
+    if [ "$term_rc" -eq 0 ] || [ "$term_rc" -eq 2 ]; then
+        had_claude=1
+        log "WARN:运行期检测到出口异常($reason,地区:${current_loc:-?}),已自动断开 Claude"
+    elif [ "$ip_changed" -eq 1 ]; then
+        log "WARN:后台检测到出口异常($reason,地区:${current_loc:-?})"
     fi
     echo "status=changed"
+    echo "reason=$reason"
     echo "before=$baseline_ip"
     echo "after=$current_ip"
     echo "loc=${current_loc:-?}"

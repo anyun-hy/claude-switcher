@@ -116,6 +116,17 @@ struct CoreResult {
     let succeeded: Bool
 }
 
+struct ExitIPAlert: Equatable {
+    let reason: String
+    let before: String
+    let after: String
+    let loc: String
+    let targetLoc: String
+    let disconnected: Bool
+
+    var dedupeKey: String { "\(reason)|\(before)|\(after)|\(loc)|\(targetLoc)" }
+}
+
 struct AccountStamp: Equatable {
     let size: String
     let date: String
@@ -265,7 +276,8 @@ final class VM: ObservableObject {
     private var hideAfterSwitch: DispatchWorkItem?
     var onSwitchCompleted: (() -> Void)?
     var onRelaunchRequested: (() -> Void)?
-    var onIPChangeDetected: ((String, String, String, Bool) -> Void)?
+    var onIPChangeWindowReveal: (() -> Void)?
+    var onIPChangeDetected: ((ExitIPAlert) -> Void)?
 
     init(core: String = NSHomeDirectory() + "/.local/bin/claude-switch.sh",
          checkTimeout: TimeInterval = 65, operationTimeout: TimeInterval = 180,
@@ -366,6 +378,8 @@ final class VM: ObservableObject {
                .trimmingCharacters(in: .whitespacesAndNewlines),
            !ver.isEmpty {
             desktopAppVersion = ver
+        } else {
+            desktopAppVersion = ""
         }
         let fm = FileManager.default
         let home = NSHomeDirectory()
@@ -586,9 +600,9 @@ final class VM: ObservableObject {
     }
 
     private var isPollingClient = false
-    private var isPollingExitIP = false
+    private(set) var isPollingExitIP = false
     private var lastObservedState = ""
-    private var lastAlertedIPTransition = ""
+    private var lastHandledExitIPKey = ""
 
     func refresh() {
         guard !isBusy else { return }
@@ -705,13 +719,12 @@ final class VM: ObservableObject {
         }
     }
 
-    // 后台周期巡检出口 IP 变化；一旦检测到与 lastip 基线不一致，核心自动断开 Claude 并触发界面重查与告警弹窗。
+    // 后台周期巡检出口 IP / 国家变化；一旦检测到异常，核心先急停 Claude，界面立即唤起并重跑审计后弹窗告警。
     func pollExitIPIfNeeded() {
-        guard started, canObserveProxyChanges, !isPollingExitIP, !isPollingClient else { return }
+        guard started, canObserveProxyChanges, !isPollingExitIP else { return }
         guard coreAvailable() else { return }
-        guard !disabledChecks.contains("IP一致") else { return }
         isPollingExitIP = true
-        run(["guard-exit-ip"], timeout: 12) { result in
+        run(["guard-exit-ip"], timeout: 25) { result in
             self.isPollingExitIP = false
             guard self.canObserveProxyChanges, !self.isBusy, result.succeeded else { return }
             var fields: [String: String] = [:]
@@ -721,25 +734,39 @@ final class VM: ObservableObject {
                     fields[String(parts[0])] = String(parts[1])
                 }
             }
-            guard fields["status"] == "changed",
-                  let before = fields["before"], !before.isEmpty,
-                  let after = fields["after"], !after.isEmpty,
-                  before != after else { return }
-            let disconnected = fields["disconnected"] == "1"
+            if fields["status"] == "same" {
+                self.lastHandledExitIPKey = ""
+                return
+            }
+            guard fields["status"] == "changed" else { return }
+            let reason = fields["reason"] ?? "ip_changed"
+            let before = fields["before"] ?? ""
+            let after = fields["after"] ?? ""
             let loc = fields["loc"] ?? "?"
-            let transition = "\(before)->\(after)"
+            let targetLoc = fields["target_loc"] ?? ""
+            let disconnected = fields["disconnected"] == "1"
+            let ipChanged = !before.isEmpty && !after.isEmpty && before != after
+            let countryMismatch = loc != "?" && !targetLoc.isEmpty && loc != targetLoc
+            guard ipChanged || countryMismatch else { return }
+
+            let alert = ExitIPAlert(reason: reason, before: before, after: after,
+                                    loc: loc, targetLoc: targetLoc, disconnected: disconnected)
+            let isNewAnomaly = self.lastHandledExitIPKey != alert.dedupeKey
+            // 若仍是同一未解决的异常且本次未再次断开 Claude，则不每轮重复刷新与弹窗，避免死循环。
+            guard isNewAnomaly || disconnected else { return }
+            self.lastHandledExitIPKey = alert.dedupeKey
+
             self.hideAfterSwitch?.cancel()
             self.cliCleanResultNotice = ""
-            self.showIPComparison = true
+            if ipChanged { self.showIPComparison = true }
             self.isBusy = true
+            self.onIPChangeWindowReveal?()
             self.pollClientStateIfNeeded()
-            if self.lastAlertedIPTransition != transition {
-                self.lastAlertedIPTransition = transition
-                self.onIPChangeDetected?(before, after, loc, disconnected)
-            }
+            // 先非阻塞刷新 14 项环境检查，拿到完整新对比数据后再弹出告警窗。
             self.checkEnvironment { _ in
-                self.showIPComparison = true
+                if ipChanged { self.showIPComparison = true }
                 self.isBusy = false
+                self.onIPChangeDetected?(alert)
             }
         }
     }
@@ -1669,8 +1696,8 @@ struct IPChangeDetails: View {
                                 .font(.caption2)
                                 .foregroundColor(field.status == .changed ? ClaudeTheme.warning : ClaudeTheme.muted)
                         }
-                        value(field.before, field: field, current: false, timeLabel: field.key == .ip ? change.changedAt : nil)
-                        value(field.after, field: field, current: true)
+                        value(field.before, field: field, current: false)
+                        value(field.after, field: field, current: true, timeLabel: field.key == .ip ? change.changedAt : nil)
                     }
                 }
             } else if let legacyDetail {
@@ -3022,8 +3049,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApplication.shared.setActivationPolicy(.accessory)
         vm.onSwitchCompleted = { [weak self] in self?.mainWindow?.orderOut(nil) }
         vm.onRelaunchRequested = { [weak self] in self?.relaunchApp() }
-        vm.onIPChangeDetected = { [weak self] before, after, loc, disconnected in
-            self?.handleIPChangeAlert(before: before, after: after, loc: loc, disconnected: disconnected)
+        vm.onIPChangeWindowReveal = { [weak self] in self?.showMainWindow() }
+        vm.onIPChangeDetected = { [weak self] alert in
+            self?.handleIPChangeAlert(alert)
         }
         showMainWindow()
         vm.start()
@@ -3042,7 +3070,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self = self else { return }
             self.vm.pollClientStateIfNeeded()
             self.ipPollTickCounter += 1
-            if self.ipPollTickCounter >= 5 {
+            let activeUse: Bool
+            switch self.vm.claudeDesktopStatus {
+            case .running, .backgroundOnly: activeUse = true
+            default: activeUse = self.mainWindow?.isVisible == true
+            }
+            // 活跃使用或主窗口打开时每 21 秒巡检；空闲隐藏时降频为每 60 秒。
+            let threshold = activeUse ? 7 : 20
+            if self.ipPollTickCounter >= threshold {
                 self.ipPollTickCounter = 0
                 self.vm.pollExitIPIfNeeded()
             }
@@ -3057,17 +3092,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    func handleIPChangeAlert(before: String, after: String, loc: String, disconnected: Bool) {
+    func handleIPChangeAlert(_ payload: ExitIPAlert) {
         showMainWindow()
         NSSound.beep()
         let alert = NSAlert()
         alert.alertStyle = .critical
-        if disconnected {
-            alert.messageText = "检测到出口 IP 变化，已自动断开 Claude"
-            alert.informativeText = "运行期间出口 IP 已从 \(before) 变为 \(after)（国家/地区：\(loc)）。\n\n为防止同一会话在新旧 IP 之间跳变触发风控，已自动关闭 Claude 桌面版与 CLI。请核对右侧「出口 IP 对比」与 14 项环境检查结果，确认安全后再重新启动。"
+        let titlePrefix: String
+        let detailLine: String
+        switch payload.reason {
+        case "country_mismatch":
+            titlePrefix = "检测到出口国家不符"
+            detailLine = "当前出口 IP（\(payload.after)）归属国家/地区为 \(payload.loc)，与锁定目标 \(payload.targetLoc) 不一致。"
+        case "ip_and_country_changed":
+            titlePrefix = "检测到出口 IP 与国家变化"
+            detailLine = "出口 IP 已从 \(payload.before) 变为 \(payload.after)，归属国家/地区为 \(payload.loc)（锁定目标 \(payload.targetLoc)）。"
+        default:
+            titlePrefix = "检测到出口 IP 变化"
+            detailLine = "出口 IP 已从 \(payload.before) 变为 \(payload.after)（国家/地区：\(payload.loc)）。"
+        }
+        if payload.disconnected {
+            alert.messageText = "\(titlePrefix)，已自动断开 Claude"
+            alert.informativeText = "\(detailLine)\n\n为防止同一会话在新旧 IP 或跨区之间跳变触发风控，已自动关闭 Claude 桌面版与 CLI。请核对右侧「出口 IP 对比」与 14 项环境检查结果，确认安全后再重新启动。"
         } else {
-            alert.messageText = "检测到出口 IP 变化"
-            alert.informativeText = "后台检测到当前出口 IP 已从 \(before) 变为 \(after)（国家/地区：\(loc)）。\n\n已自动重新执行环境检查并展开右侧「出口 IP 对比」，请留意当前节点与网络环境变化。"
+            alert.messageText = titlePrefix
+            alert.informativeText = "\(detailLine)\n\n已自动重新执行环境检查，请留意当前节点与网络环境变化。"
         }
         alert.addButton(withTitle: "我知道了")
         if let window = mainWindow, window.isVisible, window.attachedSheet == nil {
