@@ -2026,7 +2026,7 @@ case "${1:-}" in
         ;;
 esac
 case "${1:-}" in
-    detect-client|quit-desktop-helpers|get-tool-config|set-keep-paths|network-rebuild) ;;  # 不初始化账号目录。
+    detect-client|guard-exit-ip|quit-desktop-helpers|get-tool-config|set-keep-paths|network-rebuild) ;;  # 不初始化账号目录。
     *) mkdir -p "$BASE/accounts" ;;
 esac
 
@@ -4168,6 +4168,48 @@ quit_all_claude() {
     return 0
 }
 
+# 运行期轻量出口 IP 巡检:对比当前出口 IP 与 lastip 基线,若发生变化则立即断开运行中的 Claude 并通知界面重查。
+# 日志中不记录具体 IP 地址以遵守隐私脱敏红线。
+guard_exit_ip() {
+    local baseline_ip trace current_ip current_loc had_claude=0
+    [ -f "$BASE/lastip" ] && [ ! -L "$BASE/lastip" ] || { echo "status=no_baseline"; return 0; }
+    baseline_ip=$(head -n 1 "$BASE/lastip" 2>/dev/null | tr -d ' \t\r\n')
+    [ -n "$baseline_ip" ] || { echo "status=no_baseline"; return 0; }
+    trace=$(curl -s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    current_ip=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | head -n 1 | tr -d ' \t\r\n')
+    current_loc=$(printf '%s\n' "$trace" | sed -n 's/^loc=//p' | head -n 1 | tr -d ' \t\r\n')
+    if [ -z "$current_ip" ]; then
+        current_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null | tr -d ' \t\r\n')
+    fi
+    case "$current_ip" in
+        *[!0-9a-fA-F.:]*|'') echo "status=unreachable"; return 0 ;;
+        *.*.*.*|*:*) ;;
+        *) echo "status=unreachable"; return 0 ;;
+    esac
+    if [ "$current_ip" = "$baseline_ip" ] && { [ -z "$current_loc" ] || [ "$current_loc" = "$COUNTRY_TARGET" ]; }; then
+        echo "status=same"
+        echo "ip=$current_ip"
+        [ -n "$current_loc" ] && echo "loc=$current_loc"
+        return 0
+    fi
+    if pgrep -f "/Applications/Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1 || [ -n "$(cli_pids)" ]; then
+        had_claude=1
+        quit_claude >/dev/null 2>&1 || pkill -TERM -f "/Applications/Claude.app/Contents/MacOS/Claude" 2>/dev/null || true
+        quit_cli >/dev/null 2>&1 || true
+        quit_desktop_helpers >/dev/null 2>&1 || true
+        log "WARN:运行期检测到出口IP变化(地区:${current_loc:-?}),已自动断开 Claude"
+    else
+        log "WARN:后台检测到出口IP变化(地区:${current_loc:-?})"
+    fi
+    echo "status=changed"
+    echo "before=$baseline_ip"
+    echo "after=$current_ip"
+    echo "loc=${current_loc:-?}"
+    echo "target_loc=$COUNTRY_TARGET"
+    echo "disconnected=$had_claude"
+    return 0
+}
+
 cli_lock_acquire() {
     [ "${CLI_LOCK_HELD:-0}" -eq 1 ] && return 0
     if mkdir "$BASE/cli-operation.lock" 2>/dev/null; then
@@ -4560,6 +4602,7 @@ case "$operation" in
     set-client) set_client "${2:-}" "${3:-}" ;;
     get-client) get_client ;;
     detect-client) detect_client_state ;;
+    guard-exit-ip) guard_exit_ip ;;
     quit-desktop-helpers) quit_desktop_helpers ;;
     update) self_update "${2:-}" ;;
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
@@ -4586,7 +4629,7 @@ if [ "$operation" != "checkdetail" ]; then
     rc=$dispatch_rc
 fi
 case "$operation" in
-    get-check-config|set-check-config|get-tool-config|set-keep-paths|export-diagnostics|detect-client|quit-desktop-helpers|network-rebuild) ;;
+    get-check-config|set-check-config|get-tool-config|set-keep-paths|export-diagnostics|detect-client|guard-exit-ip|quit-desktop-helpers|network-rebuild) ;;
     *) log_result "$started_at" "$operation" "$rc" "$summary" ;;
 esac
 exit "$rc"
