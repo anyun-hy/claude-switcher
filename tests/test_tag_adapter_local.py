@@ -286,6 +286,7 @@ esac''')
 
         self.stub("sudo", "exit 0")
         self.stub("osascript", "exit 0")
+        self.stub("ifconfig", "echo 'inet 198.18.0.1'")
         self.stub("readlink", "echo /var/db/timezone/zoneinfo/Asia/Tokyo")
         self.stub("systemsetup", "echo 'Time Zone: Asia/Tokyo'")
         self.stub("networksetup", "exit 0")
@@ -313,6 +314,94 @@ esac''')
         self.assertIn("FIX:TAG 内核已成功同步为全局模式 ✓", run.stdout)
         self.assertIn("FIX:WebRTC ✓ 仅暴露代理出口IP(全局模式)", run.stdout)
         self.assertEqual(server.mode, "global")
+
+    def test_tag_tun_down_and_cn_egress_never_falsely_report_webrtc_or_global_ok_or_pollute_lastip(self):
+        sock_file = self.root / "tag-mock-tundown.sock"
+        server = MockTagMihomoServer(sock_file)
+        server.mode = "global"
+        self.addCleanup(server.close)
+        text = with_process_paths(self.core.read_text(encoding="utf-8"),
+                                  'printf "101\\t/Applications/TAGv2.app/Contents/MacOS/mihomotag-serv\\n"')
+        self.core.write_text(text, encoding="utf-8")
+        env = dict(self.env, TAG_SOCKET_PATH=str(sock_file), PROXY_MODE="tag",
+                   COUNTRY_TARGET="JP", TZ_TARGET="Asia/Tokyo", LOCALE_TARGET="ja_JP")
+
+        base = self.home / ".claude-switcher"
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "config.env").write_text(
+            'PROXY_MODE="tag"\nPROXY_GROUP="IpEqual"\nCOUNTRY_TARGET="JP"\nTZ_TARGET="Asia/Tokyo"\nLOCALE_TARGET="ja_JP"\n',
+            encoding="utf-8",
+        )
+        (base / "lastip").write_text("106.178.135.114\n", encoding="utf-8")
+        # TUN is offline (no 198.18.*), bare-metal egress returns domestic CN IP, and stun-probe returns same CN IP.
+        self.stub("ifconfig", "echo 'inet 127.0.0.1'")
+        self.stub("readlink", "echo /var/db/timezone/zoneinfo/Asia/Tokyo")
+        self.stub("defaults", "echo ja_JP")
+        self.stub("networksetup", "echo 'IPv6: Off'")
+        self.stub("dig", "echo 160.79.104.10")
+        self.stub("curl", '''case "$*" in
+    *trace*) printf "ip=36.163.179.199\\nloc=CN\\n" ;;
+    *) printf "200" ;;
+esac''')
+        probe_marker = self.root / "stun-called"
+        (base / "stun-probe.py").write_text(
+            f"from pathlib import Path\nPath({str(probe_marker)!r}).write_text('1')\nprint('RESULT:36.163.179.199')\n",
+            encoding="utf-8",
+        )
+
+        run = subprocess.run(["/bin/bash", str(self.core), "checkdetail"],
+                             env=env, text=True, capture_output=True, timeout=10)
+        self.assertIn("TUN网卡=fail:不在线", run.stdout)
+        self.assertIn("出口IP=fail:36.163.179.199/CN(期望JP)", run.stdout)
+        # 1. WebRTC must FAIL (never green) and must NOT fire bare-metal STUN probes!
+        self.assertRegex(run.stdout, r"(?m)^WebRTC=fail:")
+        self.assertFalse(probe_marker.exists(), "TUN 离线时不得向公网直连发 STUN UDP 包")
+        # 2. 规则置顶 must FAIL (never green 全局模式(全部流量走代理) when TUN is offline)!
+        self.assertIn("规则置顶=fail:全局模式但隧道未就绪(流量未接管)", run.stdout)
+        # 3. Domestic CN IP must NOT overwrite proxy baseline `lastip`!
+        self.assertEqual((base / "lastip").read_text(encoding="utf-8").strip(), "106.178.135.114")
+
+    def test_tag_fix_recovers_disabled_tun_in_tagv2_verge_yaml(self):
+        sock_file = self.root / "tag-mock-tunfix.sock"
+        server = MockTagMihomoServer(sock_file)
+        server.mode = "global"
+        self.addCleanup(server.close)
+        text = with_process_paths(self.core.read_text(encoding="utf-8"),
+                                  'printf "101\\t/Applications/TAGv2.app/Contents/MacOS/mihomotag-serv\\n"')
+        self.core.write_text(text, encoding="utf-8")
+        env = dict(self.env, TAG_SOCKET_PATH=str(sock_file), PROXY_MODE="tag",
+                   COUNTRY_TARGET="JP", TZ_TARGET="Asia/Tokyo", LOCALE_TARGET="ja_JP")
+
+        tag_dir = self.home / "Library/Application Support/com.tag.lab.v2"
+        tag_dir.mkdir(parents=True, exist_ok=True)
+        verge_yaml = tag_dir / "verge.yaml"
+        verge_yaml.write_text("enable_tun_mode: false\nclash_core: mihomotag-serv\n", encoding="utf-8")
+
+        # ifconfig reports TUN up only AFTER verge.yaml has enable_tun_mode: true!
+        self.stub("ifconfig", f"grep -q '^enable_tun_mode: true' '{verge_yaml}' && echo 'inet 198.18.0.1' || echo 'inet 127.0.0.1'")
+        self.stub("osascript", "exit 0")
+        self.stub("open", "exit 0")
+        self.stub("sleep", "exit 0")
+        self.stub("readlink", "echo /var/db/timezone/zoneinfo/Asia/Tokyo")
+        self.stub("networksetup", "echo 'IPv6: Off'")
+        self.stub("defaults", "echo ja_JP")
+        self.stub("curl", '''case "$*" in
+    *trace*) printf "ip=106.178.135.114\\nloc=JP\\n" ;;
+    *) printf "200" ;;
+esac''')
+        base = self.home / ".claude-switcher"
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "config.env").write_text(
+            'PROXY_MODE="tag"\nPROXY_GROUP="IpEqual"\nCOUNTRY_TARGET="JP"\nTZ_TARGET="Asia/Tokyo"\nLOCALE_TARGET="ja_JP"\n',
+            encoding="utf-8",
+        )
+        (base / "stun-probe.py").write_text("print('RESULT:106.178.135.114')\n", encoding="utf-8")
+
+        run = subprocess.run(["/bin/bash", str(self.core), "fix"],
+                             env=env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("enable_tun_mode: true", verge_yaml.read_text(encoding="utf-8"))
+        self.assertIn("FIX:代理内核+TUN ✓(已恢复虚拟网卡开关)", run.stdout)
 
 
 class MockTagMihomoServer:

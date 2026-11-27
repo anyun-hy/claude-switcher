@@ -859,6 +859,9 @@ def observe_ip(now, mode):
     if current is None:
         print("fail:未获取到有效出口IP")
         return
+    if country == "CN":
+        print("fail:当前出口位于国内(CN)，未覆盖代理IP基线")
+        return
     if country:
         if profile.get("country") and profile["country"] != country:
             # Keep Cloudflare's country and discard the conflicting subregion,
@@ -2131,7 +2134,13 @@ proxy_name() {
 # 可 open -a 启动的客户端 App 名(sing-box/auto 无标准 App,返回空)
 proxy_app_name() {
     case "$PROXY_MODE" in
-        tag)          echo "TAG" ;;
+        tag)
+            if [ -d "/Applications/TAGv2.app" ]; then
+                echo "TAGv2"
+            else
+                echo "TAG"
+            fi
+            ;;
         clash-verge)  echo "Clash Verge" ;;
         flclash)      echo "FlClash" ;;
         bettbox)      echo "Bettbox" ;;
@@ -2608,8 +2617,14 @@ check() {
     fi
 
     if ! check_disabled "WebRTC"; then
-        wr=$(webrtc_status "$ip")
-        case "$wr" in fail:*) optional_failure "WebRTC:${wr#fail:}" ;; esac
+        if [ "$tcnt" -ne 1 ]; then
+            optional_failure "WebRTC:TUN未在线(未验证代理UDP)"
+        elif [ -z "$ip" ] || [ "$loc" != "$COUNTRY_TARGET" ]; then
+            optional_failure "WebRTC:出口异常(${loc:-未知},未验证代理UDP)"
+        else
+            wr=$(webrtc_status "$ip")
+            case "$wr" in fail:*) optional_failure "WebRTC:${wr#fail:}" ;; esac
+        fi
     fi
 
     guard_state=$(bodyguard_status)
@@ -2619,11 +2634,19 @@ check() {
         *) fails="$fails;保镖:状态无法验证" ;;
     esac
 
-    # 置顶规则:Clash Verge 验证运行内核;全局模式下全部流量走代理,规则不适用;其他客户端只看行为检测
+    # 置顶规则:Clash Verge 验证运行内核;全局模式下须同时满足代理与 TUN 就绪才算全部流量走代理;其他客户端看行为检测
     if [ "$PROXY_MODE" = "clash-verge" ]; then
-        [ "$(clash_mode)" = "global" ] || merge_ok || fails="$fails;运行中置顶规则未验证"
+        if [ "$(clash_mode)" = "global" ]; then
+            { [ "$tcnt" -eq 1 ] && proxy_alive "$processes" && [ -z "${others:-}" ]; } || fails="$fails;全局模式但隧道未就绪(流量未接管)"
+        else
+            merge_ok || fails="$fails;运行中置顶规则未验证"
+        fi
     elif [ "$PROXY_MODE" = "tag" ]; then
-        [ "$(tag_mode 2>/dev/null)" = "global" ] || route_ok || fails="$fails;置顶规则缺失(未命中:${ROUTE_MISSED# })"
+        if [ "$(tag_mode 2>/dev/null)" = "global" ]; then
+            { [ "$tcnt" -eq 1 ] && proxy_alive "$processes" && [ -z "${others:-}" ]; } || fails="$fails;全局模式但隧道未就绪(流量未接管)"
+        else
+            route_ok || fails="$fails;置顶规则缺失(未命中:${ROUTE_MISSED# })"
+        fi
     else
         route_ok || fails="$fails;置顶规则缺失(未命中:${ROUTE_MISSED# })"
     fi
@@ -2949,6 +2972,10 @@ checkdetail() {
     fi
     if check_disabled "WebRTC"; then
         optional_result "WebRTC" ok
+    elif [ "$tcnt" -ne 1 ]; then
+        optional_result "WebRTC" fail "TUN未在线(已跳过探测防暴露真实IP)"
+    elif [ -z "$ip" ] || [ "$loc" != "$COUNTRY_TARGET" ]; then
+        optional_result "WebRTC" fail "出口异常(${loc:-未知},未确认代理UDP)"
     else
         wr=$(webrtc_status "$ip")
         wrst=${wr%%:*}; wrdt=""
@@ -2957,10 +2984,14 @@ checkdetail() {
     fi
     echo "保镖=$(bodyguard_status)"
     if declare -F bodyguard_last_event >/dev/null; then bodyguard_last_event; fi
-    # 置顶规则:Clash Verge 验证运行内核;全局模式下规则不适用(全部流量已走代理)
+    # 置顶规则:Clash Verge 验证运行内核;全局模式下须同时满足代理与 TUN 就绪才算全部流量走代理
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         if [ "$(clash_mode)" = "global" ]; then
-            echo '规则置顶=ok:全局模式(全部流量走代理)'
+            if [ "$tcnt" -eq 1 ] && proxy_alive "$processes" && [ -z "${others:-}" ]; then
+                echo '规则置顶=ok:全局模式(全部流量走代理)'
+            else
+                echo '规则置顶=fail:全局模式但隧道未就绪(流量未接管)'
+            fi
         elif merge_ok; then
             echo '规则置顶=ok'
         else
@@ -2968,7 +2999,11 @@ checkdetail() {
         fi
     elif [ "$PROXY_MODE" = "tag" ]; then
         if [ "$(tag_mode 2>/dev/null)" = "global" ]; then
-            echo '规则置顶=ok:全局模式(全部流量走代理)'
+            if [ "$tcnt" -eq 1 ] && proxy_alive "$processes" && [ -z "${others:-}" ]; then
+                echo '规则置顶=ok:全局模式(全部流量走代理)'
+            else
+                echo '规则置顶=fail:全局模式但隧道未就绪(流量未接管)'
+            fi
         elif route_ok; then
             echo '规则置顶=ok:行为检测通过'
         else
@@ -3117,6 +3152,40 @@ fix() {
                 echo "FIX:代理内核/TUN ✗(请打开 Clash Verge 检查节点/线路)"
             fi
         fi
+    elif [ "$PROXY_MODE" = "tag" ]; then
+        app=$(proxy_app_name)
+        TAG_VERGE_YAML="$HOME/Library/Application Support/com.tag.lab.v2/verge.yaml"
+        if ! proxy_alive && [ -n "$app" ]; then
+            echo "FIX:正在启动 $app..."
+            open -a "$app" >/dev/null 2>&1
+        fi
+        # 若 TAGv2 配置中虚拟网卡已被重置关闭,无需空等 40 秒,先等最多 8 秒即进入恢复流程
+        tag_wait=40
+        [ -f "$TAG_VERGE_YAML" ] && grep -q '^enable_tun_mode: false' "$TAG_VERGE_YAML" && tag_wait=8
+        for i in $(seq 1 "$tag_wait"); do
+            proxy_alive && tun_up && break
+            sleep 1
+        done
+        if proxy_alive && tun_up; then
+            echo "FIX:代理内核+TUN ✓"
+        else
+            if [ -f "$TAG_VERGE_YAML" ] && grep -q '^enable_tun_mode: false' "$TAG_VERGE_YAML"; then
+                echo "FIX:检测到 TAG 虚拟网卡开关被关闭,正在恢复..."
+                [ -n "$app" ] && osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1
+                sleep 3
+                sed -i '' 's/^enable_tun_mode: false/enable_tun_mode: true/' "$TAG_VERGE_YAML"
+                [ -n "$app" ] && open -a "$app" >/dev/null 2>&1
+                for i in $(seq 1 40); do
+                    proxy_alive && tun_up && break
+                    sleep 1
+                done
+            fi
+            if proxy_alive && tun_up; then
+                echo "FIX:代理内核+TUN ✓(已恢复虚拟网卡开关)"
+            else
+                echo "FIX:代理内核/TUN ✗(请打开 ${app:-TAG} 开启虚拟网卡模式并检查节点)"
+            fi
+        fi
     else
         app=$(proxy_app_name)
         if ! proxy_alive && [ -n "$app" ]; then
@@ -3182,9 +3251,13 @@ ASEOF
         echo "FIX:地区格式 → $LOCALE_TARGET ✓"
     fi
 
-    # B2. 更新全局脚本并检查运行规则;写入失败或未加载均不能报成功。全局模式下规则不适用。
+    # B2. 更新全局脚本并检查运行规则;写入失败或未加载均不能报成功。全局模式下须同时满足 TUN 在线才算全部流量走代理。
     if [ "$PROXY_MODE" = "clash-verge" ] && [ "$(clash_mode)" = "global" ]; then
-        echo "FIX:全局模式,置顶规则不适用(全部流量已走代理) ✓"
+        if tun_up; then
+            echo "FIX:全局模式,置顶规则不适用(全部流量已走代理) ✓"
+        else
+            echo "FIX:置顶规则 ✗ 全局模式但 TUN 未在线(流量未接管)"
+        fi
     elif [ "$PROXY_MODE" = "clash-verge" ]; then
         echo "FIX:写入全局扩展脚本(保留已有 main 与无关配置)..."
         local rules_result
@@ -3211,7 +3284,11 @@ ASEOF
         local tmode
         tmode=$(tag_mode 2>/dev/null)
         if [ "$tmode" = "global" ]; then
-            echo "FIX:TAG 内核已处于全局模式(全部流量已走代理) ✓"
+            if tun_up; then
+                echo "FIX:TAG 内核已处于全局模式(全部流量已走代理) ✓"
+            else
+                echo "FIX:置顶规则 ✗ TAG 全局模式但 TUN 未在线(流量未接管)"
+            fi
         else
             echo "FIX:TAG 内核处于 ${tmode:-未知} 模式，正在同步为全局模式防 WebRTC 泄漏..."
             if tag_set_global; then
@@ -3228,14 +3305,26 @@ ASEOF
         echo "FIX:置顶规则 ✗ 请在 $(proxy_name) 中自行添加 DOMAIN-SUFFIX 置顶规则"
     fi
 
-    # C. 复测与日常审计共用判断，空结果、非零退出及无响应不会冒充代理成功。
-    local fix_failed=0
-    wrip=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2)
-    wr=$(webrtc_status "$wrip")
-    case "$wr" in
-        ok:*) echo "FIX:WebRTC ✓ ${wr#ok:}" ;;
-        *) echo "FIX:WebRTC ✗ ${wr#fail:}"; fix_failed=1 ;;
-    esac
+    # C. 复测与日常审计共用判断，空结果、非零退出、TUN 未在线及国家异常不会冒充代理成功。
+    local fix_failed=0 wrtrace wrip wrloc
+    if ! tun_up; then
+        echo "FIX:WebRTC ✗ TUN未在线(未验证代理UDP)"
+        fix_failed=1
+    else
+        wrtrace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+        wrip=$(printf '%s\n' "$wrtrace" | grep '^ip=' | cut -d= -f2)
+        wrloc=$(printf '%s\n' "$wrtrace" | grep '^loc=' | cut -d= -f2)
+        if [ -z "$wrip" ] || [ "$wrloc" != "$COUNTRY_TARGET" ]; then
+            echo "FIX:WebRTC ✗ 出口异常(${wrloc:-未知},期望$COUNTRY_TARGET)"
+            fix_failed=1
+        else
+            wr=$(webrtc_status "$wrip")
+            case "$wr" in
+                ok:*) echo "FIX:WebRTC ✓ ${wr#ok:}" ;;
+                *) echo "FIX:WebRTC ✗ ${wr#fail:}"; fix_failed=1 ;;
+            esac
+        fi
+    fi
 
     # D. 出口IP最终验证
     sleep 2
