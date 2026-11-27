@@ -123,6 +123,7 @@ struct ExitIPAlert: Equatable {
     let loc: String
     let targetLoc: String
     let disconnected: Bool
+    let disconnectIncomplete: Bool
 
     var dedupeKey: String { "\(reason)|\(before)|\(after)|\(loc)|\(targetLoc)" }
 }
@@ -744,13 +745,17 @@ final class VM: ObservableObject {
             let after = fields["after"] ?? ""
             let loc = fields["loc"] ?? "?"
             let targetLoc = fields["target_loc"] ?? ""
-            let disconnected = fields["disconnected"] == "1"
+            let disconnectedField = fields["disconnected"] ?? "0"
+            let disconnected = disconnectedField == "1" || disconnectedField == "partial"
+            let disconnectIncomplete = disconnectedField == "partial"
             let ipChanged = !before.isEmpty && !after.isEmpty && before != after
             let countryMismatch = loc != "?" && !targetLoc.isEmpty && loc != targetLoc
             guard ipChanged || countryMismatch else { return }
 
             let alert = ExitIPAlert(reason: reason, before: before, after: after,
-                                    loc: loc, targetLoc: targetLoc, disconnected: disconnected)
+                                    loc: loc, targetLoc: targetLoc,
+                                    disconnected: disconnected,
+                                    disconnectIncomplete: disconnectIncomplete)
             let isNewAnomaly = self.lastHandledExitIPKey != alert.dedupeKey
             // 若仍是同一未解决的异常且本次未再次断开 Claude，则不每轮重复刷新与弹窗，避免死循环。
             guard isNewAnomaly || disconnected else { return }
@@ -3110,9 +3115,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             titlePrefix = "检测到出口 IP 变化"
             detailLine = "出口 IP 已从 \(payload.before) 变为 \(payload.after)（国家/地区：\(payload.loc)）。"
         }
-        if payload.disconnected {
-            alert.messageText = "\(titlePrefix)，已自动断开 Claude"
-            alert.informativeText = "\(detailLine)\n\n为防止同一会话在新旧 IP 或跨区之间跳变触发风控，已自动关闭 Claude 桌面版与 CLI。请核对右侧「出口 IP 对比」与 14 项环境检查结果，确认安全后再重新启动。"
+        if payload.disconnectIncomplete {
+            alert.messageText = "\(titlePrefix)，仍有 Claude 残留进程"
+            alert.informativeText = "\(detailLine)\n\n已发送强制终止信号，但仍检测到残留进程。请立即手动彻底退出 Claude，再核对右侧「出口 IP 对比」与 14 项环境检查结果。"
+        } else if payload.disconnected {
+            alert.messageText = "\(titlePrefix)，已立即强制断开 Claude"
+            alert.informativeText = "\(detailLine)\n\n为防止同一会话在新旧 IP 或跨区之间跳变触发风控，已立即强制终止 Claude 桌面版、全部后台助手与 CLI。请核对右侧「出口 IP 对比」与 14 项环境检查结果，确认安全后再重新启动。"
         } else {
             alert.messageText = titlePrefix
             alert.informativeText = "\(detailLine)\n\n已自动重新执行环境检查，请留意当前节点与网络环境变化。"

@@ -112,21 +112,27 @@ class GuardExitIpTests(unittest.TestCase):
     def test_disconnects_verified_claude_main_and_helper_without_leaking_ip(self):
         self.stub("ifconfig", "echo 'inet 198.18.0.1'")
         self.stub("curl", "printf 'ip=106.178.149.35\\nloc=JP\\n'")
-        main_proc = subprocess.Popen(["/bin/sleep", "30"])
-        helper_proc = subprocess.Popen(["/bin/sleep", "30"])
+        # Simulate stubborn Electron/CLI processes that ignore SIGTERM; guard must SIGKILL immediately!
+        main_proc = subprocess.Popen(["/bin/sh", "-c", "trap '' TERM; exec /bin/sleep 30"])
+        helper_proc = subprocess.Popen(["/bin/sh", "-c", "trap '' TERM; exec /bin/sleep 30"])
+        builtin_cli_proc = subprocess.Popen(["/bin/sh", "-c", "trap '' TERM; exec /bin/sleep 30"])
         def cleanup_proc(proc):
             if proc.poll() is None:
                 proc.kill()
             proc.wait()
         self.addCleanup(cleanup_proc, main_proc)
         self.addCleanup(cleanup_proc, helper_proc)
+        self.addCleanup(cleanup_proc, builtin_cli_proc)
         self.process_paths.write_text(
             "321\t/usr/local/bin/sing-box\n"
             f"{main_proc.pid}\t/Applications/Claude.app/Contents/MacOS/Claude\n"
-            f"{helper_proc.pid}\t/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper\n",
+            f"{helper_proc.pid}\t/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper\n"
+            f"{builtin_cli_proc.pid}\t/Users/anyun/Library/Application Support/Claude/claude-code/2.1.331/claude\n",
             encoding="utf-8",
         )
+        t0 = time.time()
         res = self.run_core("guard-exit-ip")
+        elapsed = time.time() - t0
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         kv = self.parse_kv(res.stdout)
         self.assertEqual(kv.get("status"), "changed")
@@ -134,16 +140,14 @@ class GuardExitIpTests(unittest.TestCase):
         self.assertEqual(kv.get("before"), "106.178.150.201")
         self.assertEqual(kv.get("after"), "106.178.149.35")
         self.assertEqual(kv.get("disconnected"), "1")
-        # Both dummy Claude main and helper processes must have been terminated.
-        deadline = time.time() + 3
-        while time.time() < deadline and (main_proc.poll() is None or helper_proc.poll() is None):
-            time.sleep(0.05)
-        self.assertIsNotNone(main_proc.poll(), "Claude 主程序未被断开")
-        self.assertIsNotNone(helper_proc.poll(), "Claude 后台助手未被断开")
+        self.assertLess(elapsed, 4.0, f"应零等待立即 SIGKILL，不应拖延 {elapsed:.2f}s")
+        self.assertIsNotNone(main_proc.poll(), "忽略 SIGTERM 的 Claude 主程序未被 SIGKILL 彻底结束")
+        self.assertIsNotNone(helper_proc.poll(), "忽略 SIGTERM 的 Claude 后台助手未被 SIGKILL 彻底结束")
+        self.assertIsNotNone(builtin_cli_proc.poll(), "含空格路径下的内置 claude-code 未被 SIGKILL 彻底结束")
         # Privacy invariant: neither IP may appear in claude-switch.log.
         log_file = self.home / "Library/Logs/claude-switch.log"
         log_text = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
-        self.assertIn("已自动断开 Claude", log_text)
+        self.assertIn("已立即强制断开 Claude", log_text)
         self.assertNotIn("106.178.150.201", log_text)
         self.assertNotIn("106.178.149.35", log_text)
 

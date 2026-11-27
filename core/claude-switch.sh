@@ -4168,63 +4168,84 @@ quit_all_claude() {
     return 0
 }
 
-# 急停断开当前用户下的 Claude 桌面版（主程序与后台助手）及 Claude Code CLI。
-# 复用内核路径与 UID 双重校验，避免 pgrep/pkill -f 误伤；返回 0=已断开 1=未运行 2=部分失败。
+# 识别全部 Claude 桌面版（主程序与全部内部子进程/助手）及原生/内置 claude 可执行文件（按 \t 分隔，免疫路径空格）。
+guard_claude_targets() {
+    printf '%s\n' "$1" | LC_ALL=C awk -F '\t' '
+        NF == 2 && $1 ~ /^[1-9][0-9]*$/ && $2 ~ /^\// {
+            path = $2
+            name = path; sub(/^.*\//, "", name)
+            if (path ~ /\/Claude[.]app\/Contents\/MacOS\/Claude$/) {
+                printf "main\t%s\t%s\n", $1, path
+            } else if (path ~ /\/Claude[.]app\/Contents\//) {
+                printf "helper\t%s\t%s\n", $1, path
+            } else if (name == "claude" || name == "claude.exe") {
+                printf "cli\t%s\t%s\n", $1, path
+            }
+        }'
+}
+
+# 零等待立即强杀（SIGKILL）当前用户下的 Claude 桌面版（主程序与全部后台助手）及 Claude Code CLI。
+# IP/国家变化时绝不等优雅退出，避免 Claude 在新 IP 下继续发包或 Electron 拦截 SIGTERM 残留后台；
+# 返回 0=已全部彻底结束 1=原本未运行 2=发现进程但仍有残留。
 terminate_claude_for_guard() {
-    local uid paths targets kind pid path owner live found=0 failed=0 pass pids signaled=""
+    local uid paths targets kind pid path owner live found=0 round pass pids signaled="" still_alive=0
     uid=$(id -u) || return 2
     case "$uid" in
         ''|*[!0-9]*) return 2 ;;
     esac
-    if paths=$(macos_process_paths 2>/dev/null); then
-        targets=$(claude_desktop_processes "$paths" targets)
-        for pass in main helper; do
-            while IFS=$'\t' read -r kind pid path; do
-                [ "$kind" = "$pass" ] || continue
-                [ -n "$pid" ] || continue
-                owner=$(ps -p "$pid" -o uid= 2>/dev/null) || continue
-                [ "${owner//[[:space:]]/}" = "$uid" ] || continue
-                live=$(macos_process_paths "$pid" 2>/dev/null) || continue
-                [ "$live" = "$pid"$'\t'"$path" ] || continue
-                found=1
-                if kill -TERM "$pid" 2>/dev/null; then
+    # 两轮快速强杀：第 1 轮立刻 SIGKILL 全部主程序/助手/CLI；200ms 后重扫清掉并发瞬间拉起的子进程。
+    for round in 1 2; do
+        local round_hits=0
+        if paths=$(macos_process_paths 2>/dev/null); then
+            targets=$(guard_claude_targets "$paths")
+            for pass in main helper cli; do
+                while IFS=$'\t' read -r kind pid path; do
+                    [ "$kind" = "$pass" ] || continue
+                    [ -n "$pid" ] || continue
+                    local pinfo puid pstat
+                    pinfo=$(ps -p "$pid" -o uid=,stat= 2>/dev/null) || continue
+                    read -r puid pstat <<< "$pinfo"
+                    [ "$puid" = "$uid" ] || continue
+                    case "$pstat" in ''|Z*) continue ;; esac
+                    live=$(macos_process_paths "$pid" 2>/dev/null) || continue
+                    [ "$live" = "$pid"$'\t'"$path" ] || continue
+                    found=1
+                    round_hits=1
+                    kill -KILL "$pid" 2>/dev/null || true
                     signaled="${signaled:+$signaled }$pid"
-                else
-                    failed=1
-                fi
-            done <<< "$targets"
-        done
-    fi
-    pids=$(cli_pids "$uid")
-    for pid in $pids; do
-        [ -n "$pid" ] || continue
-        owner=$(ps -p "$pid" -o uid= 2>/dev/null) || continue
-        [ "${owner//[[:space:]]/}" = "$uid" ] || continue
-        found=1
-        if kill -TERM "$pid" 2>/dev/null; then
-            signaled="${signaled:+$signaled }$pid"
-        else
-            failed=1
+                done <<< "$targets"
+            done
         fi
-    done
-    [ "$found" -eq 1 ] || return 1
-    local i still_alive
-    for i in 1 2 3; do
-        still_alive=0
-        for pid in $signaled; do
-            if kill -0 "$pid" 2>/dev/null; then
-                still_alive=1
-                break
-            fi
+        pids=$(cli_pids "$uid")
+        for pid in $pids; do
+            [ -n "$pid" ] || continue
+            local pinfo puid pstat
+            pinfo=$(ps -p "$pid" -o uid=,stat= 2>/dev/null) || continue
+            read -r puid pstat <<< "$pinfo"
+            [ "$puid" = "$uid" ] || continue
+            case "$pstat" in ''|Z*) continue ;; esac
+            found=1
+            round_hits=1
+            kill -KILL "$pid" 2>/dev/null || true
+            signaled="${signaled:+$signaled }$pid"
         done
-        [ "$still_alive" -eq 0 ] && break
-        sleep 1
+        [ "$found" -eq 1 ] || return 1
+        [ "$round" -eq 1 ] && sleep 0.2
+        [ "$round" -eq 2 ] && [ "$round_hits" -eq 1 ] && sleep 0.2
     done
-    [ "$failed" -eq 0 ] && return 0 || return 2
+    for pid in $signaled; do
+        local pstate
+        pstate=$(ps -p "$pid" -o stat= 2>/dev/null | tr -d ' \t\r\n')
+        case "$pstate" in
+            ''|Z*) ;;
+            *) still_alive=1; break ;;
+        esac
+    done
+    [ "$still_alive" -eq 0 ] && return 0 || return 2
 }
 
 # 运行期轻量出口 IP 巡检:先校验代理与 TUN 在线，再对比当前出口 IP/国家与基线。
-# 若发生变动则按 UID 与内核路径急停 Claude 并通知界面重查；日志中不记录明文 IP。
+# 若发生变动则零等待立即 SIGKILL 断开 Claude 并通知界面重查；日志中不记录明文 IP。
 guard_exit_ip() {
     if [ -e "$NETWORK_PENDING" ] || [ -L "$NETWORK_PENDING" ] \
         || [ -e /var/run/local.claude-switcher.network-rebuild.lock ] \
@@ -4251,7 +4272,7 @@ guard_exit_ip() {
     if load_check_config && check_disabled "IP一致"; then
         ip_check_disabled=1
     fi
-    local baseline_ip="" trace current_ip current_loc country_mismatch=0 ip_changed=0 reason="" had_claude=0 term_rc=1
+    local baseline_ip="" trace current_ip current_loc country_mismatch=0 ip_changed=0 reason="" disconnected_val="0" term_rc=1
     if [ -f "$BASE/lastip" ] && [ ! -L "$BASE/lastip" ]; then
         baseline_ip=$(head -n 1 "$BASE/lastip" 2>/dev/null | tr -d ' \t\r\n')
     fi
@@ -4284,9 +4305,12 @@ guard_exit_ip() {
     fi
     terminate_claude_for_guard
     term_rc=$?
-    if [ "$term_rc" -eq 0 ] || [ "$term_rc" -eq 2 ]; then
-        had_claude=1
-        log "WARN:运行期检测到出口异常($reason,地区:${current_loc:-?}),已自动断开 Claude"
+    if [ "$term_rc" -eq 0 ]; then
+        disconnected_val="1"
+        log "WARN:运行期检测到出口异常($reason,地区:${current_loc:-?}),已立即强制断开 Claude"
+    elif [ "$term_rc" -eq 2 ]; then
+        disconnected_val="partial"
+        log "WARN:运行期检测到出口异常($reason,地区:${current_loc:-?}),强制断开后仍有 Claude 残留进程"
     elif [ "$ip_changed" -eq 1 ]; then
         log "WARN:后台检测到出口异常($reason,地区:${current_loc:-?})"
     fi
@@ -4296,7 +4320,7 @@ guard_exit_ip() {
     echo "after=$current_ip"
     echo "loc=${current_loc:-?}"
     echo "target_loc=$COUNTRY_TARGET"
-    echo "disconnected=$had_claude"
+    echo "disconnected=$disconnected_val"
     return 0
 }
 
